@@ -1,0 +1,16 @@
+# GUI相关
+PySide6>=6.5.0
+PySide6-Fluent-Widgets>=1.5.0
+
+# OCR识别
+easyocr>=1.7.0
+
+# 翻译
+deep-translator>=1.11.4
+
+# 其他依赖
+numpy>=1.24.0
+torch>=2.0.0
+torchvision>=0.15.0
+keyboard>=0.13.5
+Pillow>=10.0.0
