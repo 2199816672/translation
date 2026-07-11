@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from theme import Palette
+from config import SUPPORTED_TARGET_LANGS
 
 
 class HomePage(QWidget):
@@ -25,6 +26,8 @@ class HomePage(QWidget):
         super().__init__(parent)
         self.setObjectName("homePage")
         self._current_image_path = None
+        self._ocr_text_cache = ""
+        self._trans_text_cache = ""
         self._build_ui()
 
     def _build_ui(self):
@@ -144,7 +147,7 @@ class HomePage(QWidget):
         layout.addWidget(lang_label)
 
         self.lang_combo = QComboBox(self)
-        self.lang_combo.addItems(["中文", "英文", "日文", "韩文", "法文", "德文", "西班牙文", "俄文"])
+        self.lang_combo.addItems(list(SUPPORTED_TARGET_LANGS.keys()))
         self.lang_combo.setCurrentText("中文")
         self.lang_combo.setMinimumWidth(100)
         layout.addWidget(self.lang_combo)
@@ -154,9 +157,7 @@ class HomePage(QWidget):
         layout.addWidget(self.extract_btn)
 
         self.translate_btn = self._btn("翻译", kind="success")
-        self.translate_btn.clicked.connect(lambda: self.translateRequested.emit(
-            self.ocr_text.toPlainText()
-        ))
+        self.translate_btn.clicked.connect(self._on_translate)
         layout.addWidget(self.translate_btn)
 
         layout.addStretch(1)
@@ -194,11 +195,20 @@ class HomePage(QWidget):
 
     @Slot(str)
     def set_ocr_text(self, text):
+        self.ocr_text_cache = text
         self.ocr_text.setPlainText(text)
 
     @Slot(str)
     def set_trans_text(self, text):
+        self._trans_text_cache = text
         self.trans_text.setPlainText(text)
+
+    def _on_translate(self):
+        text = self.ocr_text.toPlainText()
+        if not text or not text.strip():
+            self.set_status("没有可翻译的文本", "#71717a")
+            return
+        self.translateRequested.emit(text)
 
     @Slot()
     def _copy_source(self):

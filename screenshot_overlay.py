@@ -4,16 +4,293 @@
 import os
 import textwrap
 
-from PySide6.QtCore import Qt, QRect, QPoint, QSize, Signal
+from PySide6.QtCore import Qt, QRect, QRectF, QPoint, QSize, Signal
 from PySide6.QtGui import (
-    QPainter, QColor, QPixmap, QPen, QFont, QFontMetrics, QCursor,
+    QPainter, QColor, QPixmap, QPen, QFont, QFontMetrics, QCursor, QTextOption,
+    QPainterPath,
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QFileDialog,
     QFrame, QTextEdit, QPushButton, QVBoxLayout, QHBoxLayout, QLabel,
+    QInputDialog, QColorDialog, QSlider,
 )
 
 from theme import Palette
+
+
+class EditWidget(QWidget):
+    """截图编辑工具栏 + 画布：画笔、橡皮、文字、颜色、撤销/重做。"""
+    TOOLBAR_H = 44
+    COLORS = ["#ef4444", "#3b82f6", "#22c55e", "#eab308", "#000000", "#ffffff"]
+
+    def __init__(self, pixmap, parent=None):
+        super().__init__(parent)
+        self._base = pixmap.copy()
+        self._canvas = pixmap.copy()
+        self._undo_stack = []
+        self._redo_stack = []
+        self._tool = "pen"
+        self._color = QColor("#ef4444")
+        self._pen_w = 3
+        self._eraser_w = 15
+        self._text_font_size = 14
+        self._drawing = False
+        self._last = QPoint()
+        self._eraser_pos = None
+        self._on_save_cb = None
+        self._on_cancel_cb = None
+        self._tool_btns = {}
+        self._color_btns = []
+        self._size_slider = None
+        self._init_ui()
+
+    def _init_ui(self):
+        w, h = self._base.width(), self._base.height()
+        self.setFixedSize(w, h + self.TOOLBAR_H)
+
+        tb = QWidget(self)
+        tb.setObjectName("editToolbar")
+        tb.setFixedHeight(self.TOOLBAR_H)
+        tb.setStyleSheet(f"""
+            #editToolbar {{ background: #1a1a1a; border-bottom: 1px solid #333; }}
+            QPushButton {{
+                background: #2a2a2e; color: #e4e4e7; border: 1px solid #3f3f46;
+                border-radius: 5px; padding: 4px 10px; font-size: 12px;
+                font-family: 'Microsoft YaHei'; min-height: 22px;
+            }}
+            QPushButton:hover {{ background: #3f3f46; }}
+            QPushButton:checked {{ background: #52525b; border-color: #71717a; color: #fafafa; }}
+            #colorBtn {{ border: 1px solid #555; border-radius: 4px; min-width: 20px; max-width: 20px; min-height: 20px; max-height: 20px; padding: 0; }}
+            QSlider {{ background: transparent; }}
+            QSlider::groove:horizontal {{ background: #3f3f46; height: 4px; border-radius: 2px; }}
+            QSlider::handle:horizontal {{ background: #e4e4e7; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; }}
+        """)
+        tb_layout = QHBoxLayout(tb)
+        tb_layout.setContentsMargins(8, 5, 8, 5)
+        tb_layout.setSpacing(5)
+
+        tools = [("画笔", "pen"), ("橡皮", "eraser"), ("文字", "text")]
+        for name, tool in tools:
+            btn = QPushButton(name)
+            btn.setCheckable(True)
+            btn.setChecked(tool == self._tool)
+            btn.clicked.connect(lambda checked, t=tool: self._set_tool(t))
+            tb_layout.addWidget(btn)
+            self._tool_btns[tool] = btn
+
+        # 动态尺寸标签 + 滑条（橡皮/文字共用位置）
+        self._size_label = QLabel("3")
+        self._size_label.setStyleSheet("color: #a1a1aa; border: none; background: transparent; font-size: 11px; min-width: 18px;")
+        tb_layout.addWidget(self._size_label)
+
+        self._size_slider = QSlider(Qt.Orientation.Horizontal)
+        self._size_slider.setRange(1, 50)
+        self._size_slider.setValue(3)
+        self._size_slider.setFixedWidth(80)
+        self._size_slider.valueChanged.connect(self._on_size_changed)
+        tb_layout.addWidget(self._size_slider)
+
+        tb_layout.addSpacing(4)
+        sep = QLabel("|")
+        sep.setStyleSheet("color: #555; border: none; background: transparent;")
+        tb_layout.addWidget(sep)
+        tb_layout.addSpacing(4)
+
+        for c in self.COLORS:
+            btn = QPushButton()
+            btn.setObjectName("colorBtn")
+            btn.setFixedSize(20, 20)
+            btn.setStyleSheet(f"background: {c}; border: 1px solid #555; border-radius: 4px;")
+            btn.clicked.connect(lambda checked, color=c: self._set_color(color))
+            tb_layout.addWidget(btn)
+            self._color_btns.append((btn, c))
+
+        custom_btn = QPushButton("…")
+        custom_btn.setObjectName("colorBtn")
+        custom_btn.setFixedSize(20, 20)
+        custom_btn.setStyleSheet("background: #666; border: 1px solid #555; border-radius: 4px; font-size: 11px;")
+        custom_btn.clicked.connect(self._pick_custom_color)
+        tb_layout.addWidget(custom_btn)
+
+        tb_layout.addStretch()
+
+        undo_btn = QPushButton("撤销")
+        undo_btn.clicked.connect(self.undo)
+        tb_layout.addWidget(undo_btn)
+        redo_btn = QPushButton("重做")
+        redo_btn.clicked.connect(self.redo)
+        tb_layout.addWidget(redo_btn)
+
+        tb_layout.addSpacing(8)
+
+        save_btn = QPushButton("保存")
+        save_btn.setStyleSheet("QPushButton{background:#22c55e;color:#000;border:1px solid #22c55e;font-weight:600;}"
+                              "QPushButton:hover{background:#16a34a;}")
+        save_btn.clicked.connect(self._save)
+        tb_layout.addWidget(save_btn)
+
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self._cancel)
+        tb_layout.addWidget(cancel_btn)
+
+        self._update_slider_for_tool()
+
+    def _on_size_changed(self, val):
+        if self._tool == "eraser":
+            self._eraser_w = val
+            self._size_label.setText(str(val))
+        elif self._tool == "text":
+            self._text_font_size = val
+            self._size_label.setText(str(val))
+        elif self._tool == "pen":
+            self._pen_w = max(1, val // 3)
+            self._size_label.setText(str(self._pen_w))
+
+    def _update_slider_for_tool(self):
+        if self._tool == "eraser":
+            self._size_slider.setRange(5, 50)
+            self._size_slider.setValue(self._eraser_w)
+            self._size_label.setText(str(self._eraser_w))
+        elif self._tool == "text":
+            self._size_slider.setRange(10, 36)
+            self._size_slider.setValue(self._text_font_size)
+            self._size_label.setText(str(self._text_font_size))
+        elif self._tool == "pen":
+            self._size_slider.setRange(1, 15)
+            self._size_slider.setValue(self._pen_w)
+            self._size_label.setText(str(self._pen_w))
+
+    def _set_tool(self, tool):
+        self._tool = tool
+        for t, btn in self._tool_btns.items():
+            btn.setChecked(t == tool)
+        self._update_slider_for_tool()
+        if tool == "eraser":
+            self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
+        else:
+            self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+
+    def _set_color(self, hex_color):
+        self._color = QColor(hex_color)
+
+    def _pick_custom_color(self):
+        c = QColorDialog.getColor(self._color, self, "选择颜色")
+        if c.isValid():
+            self._color = c
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.drawPixmap(0, self.TOOLBAR_H, self._canvas)
+        # 橡皮光标圆圈
+        if self._eraser_pos and self._tool == "eraser":
+            r = self._eraser_w
+            cx, cy = self._eraser_pos.x(), self._eraser_pos.y() + self.TOOLBAR_H
+            p.setPen(QPen(QColor(255, 255, 255, 200), 1.5, Qt.PenStyle.DashLine))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(cx - r, cy - r, r * 2, r * 2)
+        p.end()
+
+    def mousePressEvent(self, event):
+        if event.y() < self.TOOLBAR_H:
+            return
+        pos = QPoint(event.x(), event.y() - self.TOOLBAR_H)
+
+        if self._tool == "text":
+            text, ok = QInputDialog.getText(self, "输入文字", "请输入:")
+            if ok and text:
+                self._push_undo()
+                p = QPainter(self._canvas)
+                p.setPen(QPen(self._color))
+                p.setFont(QFont("Microsoft YaHei", self._text_font_size))
+                p.drawText(pos, text)
+                p.end()
+                self.update()
+            return
+
+        self._drawing = True
+        self._last = pos
+        self._push_undo()
+
+        if self._tool == "eraser":
+            img = self._base.toImage()
+            ix = min(max(pos.x(), 0), self._base.width() - 1)
+            iy = min(max(pos.y(), 0), self._base.height() - 1)
+            c = QColor(img.pixel(ix, iy))
+            p = QPainter(self._canvas)
+            p.setPen(QPen(c, self._eraser_w, Qt.PenStyle.SolidLine,
+                          Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p.drawPoint(pos)
+            p.end()
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        pos = QPoint(event.x(), event.y() - self.TOOLBAR_H)
+        # 橡皮光标追踪（即使未按下也绘制）
+        if self._tool == "eraser":
+            self._eraser_pos = pos
+            self.update()
+        if not self._drawing:
+            return
+        pos = QPoint(max(0, min(pos.x(), self._canvas.width() - 1)),
+                      max(0, min(pos.y(), self._canvas.height() - 1)))
+
+        p = QPainter(self._canvas)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self._tool == "pen":
+            p.setPen(QPen(self._color, self._pen_w, Qt.PenStyle.SolidLine,
+                          Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p.drawLine(self._last, pos)
+        elif self._tool == "eraser":
+            img = self._base.toImage()
+            ix = min(max(self._last.x(), 0), self._base.width() - 1)
+            iy = min(max(self._last.y(), 0), self._base.height() - 1)
+            c = QColor(img.pixel(ix, iy))
+            p.setPen(QPen(c, self._eraser_w, Qt.PenStyle.SolidLine,
+                          Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p.drawLine(self._last, pos)
+        p.end()
+        self._last = pos
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        self._drawing = False
+
+    def leaveEvent(self, event):
+        self._eraser_pos = None
+        self.update()
+
+    def _push_undo(self):
+        self._undo_stack.append(self._canvas.copy())
+        self._redo_stack.clear()
+        if len(self._undo_stack) > 50:
+            self._undo_stack.pop(0)
+
+    def undo(self):
+        if self._undo_stack:
+            self._redo_stack.append(self._canvas.copy())
+            self._canvas = self._undo_stack.pop()
+            self.update()
+
+    def redo(self):
+        if self._redo_stack:
+            self._undo_stack.append(self._canvas.copy())
+            self._canvas = self._redo_stack.pop()
+            self.update()
+
+    def _save(self):
+        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshots")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "temp_screenshot.png")
+        self._canvas.save(path)
+        if self._on_save_cb:
+            self._on_save_cb(path)
+        self.hide()
+
+    def _cancel(self):
+        if self._on_cancel_cb:
+            self._on_cancel_cb()
+        self.hide()
 
 
 class ScreenshotOverlay(QWidget):
@@ -28,12 +305,12 @@ class ScreenshotOverlay(QWidget):
     BTN_H = 30
     BTN_GAP = 6
     MENU_PAD = 12
-    ACTIONS = ["复制", "保存", "提取", "翻译", "取消"]
+    ACTIONS = ["复制", "保存", "提取", "翻译", "编辑", "取消"]
     POPUP_MAX_W = 360
     POPUP_PAD = 12
     POPUP_LINE_H = 22
 
-    def __init__(self, parent=None):
+    def __init__(self, auto_translate=False, parent=None):
         super().__init__(parent)
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
@@ -58,9 +335,10 @@ class ScreenshotOverlay(QWidget):
         self._showing_trans = False
         self._popup_rect = QRect()
         self._popup_close = QRect()
-        self._toggle_rect = QRect()
         self._extract_popup = None
         self._extract_text_edit = None
+        self._edit_widget = None
+        self._auto_translate = auto_translate
 
     # ── 截图启动 ──────────────────────────────────────────────
 
@@ -117,7 +395,9 @@ class ScreenshotOverlay(QWidget):
         self._trans_text = text
         self._showing_trans = True
         self._mode = "translate"
-        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._show_menu = True
+        self._hover_idx = -1
+        self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
         self.update()
 
     # ── 绘制 ─────────────────────────────────────────────────
@@ -136,6 +416,8 @@ class ScreenshotOverlay(QWidget):
         elif self._crop_rect and self._show_menu:
             self._draw_crop(p)
             self._draw_menu(p)
+            if self._mode == "translate":
+                self._draw_trans_overlay(p)
         elif self._crop_rect and self._mode == "extract":
             self._draw_crop(p)
         elif self._crop_rect and self._mode == "translate":
@@ -147,11 +429,15 @@ class ScreenshotOverlay(QWidget):
     def _draw_selecting(self, p):
         rect = QRect(self._start, self._end).normalized()
 
-        p.setClipRect(rect)
-        src = self._logical_to_pixmap(rect)
-        p.drawPixmap(rect, self._raw_pixmap, src)
-        p.setClipping(False)
+        # 用 QPainterPath 挖空选区——背景已由 paintEvent 画好，只需盖遮罩
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 120))
+        path = QPainterPath()
+        path.addRect(QRectF(0, 0, self.width(), self.height()))
+        path.addRect(QRectF(rect))
+        p.drawPath(path)
 
+        # 选区边框
         p.setPen(QPen(QColor("#ef4444"), 1))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRect(rect)
@@ -182,8 +468,20 @@ class ScreenshotOverlay(QWidget):
 
         mx = self._crop_rect.center().x() - total_w // 2
         my = self._crop_rect.bottom() + 10
+
+        # 下方放不下 → 尝试上方
         if my + total_h > self.height():
             my = self._crop_rect.top() - total_h - 10
+
+        # 上方也放不下（全屏/超长选区）→ 屏幕顶部居中
+        if my < 0:
+            my = 10
+            mx = self.width() // 2 - total_w // 2
+
+        if mx < 0:
+            mx = 0
+        if mx + total_w > self.width():
+            mx = self.width() - total_w
 
         bg = QRect(mx, my, total_w, total_h)
         p.setPen(QPen(QColor(Palette.BORDER), 1))
@@ -243,17 +541,6 @@ class ScreenshotOverlay(QWidget):
         for line in lines:
             p.drawText(cr.left() + pad, ty, line)
             ty += line_h
-
-        toggle_label = "查看原文" if self._showing_trans else "查看译文"
-        tw = fm.horizontalAdvance(toggle_label)
-        tr = QRect(cr.right() - tw - 14, cr.top() + 2, tw + 10, 22)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(Palette.SURFACE))
-        p.drawRoundedRect(tr, 5, 5)
-        p.setPen(QColor(Palette.TEXT))
-        p.setFont(QFont("Microsoft YaHei", 9))
-        p.drawText(tr, Qt.AlignmentFlag.AlignCenter, toggle_label)
-        self._toggle_rect = tr
 
         close_label = "×"
         cw = 20
@@ -319,7 +606,7 @@ class ScreenshotOverlay(QWidget):
         self._extract_text_edit.setReadOnly(True)
         self._extract_text_edit.setMinimumSize(300, 120)
         self._extract_text_edit.setMaximumSize(420, 500)
-        self._extract_text_edit.setWordWrapMode(QFontMetrics.WrapAtWordBoundaryOrOccurrence)
+        self._extract_text_edit.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
         layout.addWidget(self._extract_text_edit)
 
     def _show_extract_popup(self, text):
@@ -353,6 +640,36 @@ class ScreenshotOverlay(QWidget):
         self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
         self.update()
 
+    # ── 编辑模式 ─────────────────────────────────────────────
+
+    def _show_edit_widget(self):
+        image = self._crop_image()
+        if not image:
+            return
+        self._edit_widget = EditWidget(image, self)
+        self._edit_widget._on_save_cb = self._on_edit_save
+        self._edit_widget._on_cancel_cb = self._on_edit_cancel
+        cr = self._crop_rect
+        self._edit_widget.setGeometry(cr.x(), cr.y(), cr.width(),
+                                     cr.height() + EditWidget.TOOLBAR_H)
+        self._edit_widget.show()
+        self._edit_widget.raise_()
+        self._mode = "edit"
+
+    def _on_edit_save(self, path):
+        self._edit_widget = None
+        self.close()
+        if path:
+            self.screenshotTaken.emit(path)
+        self.finished.emit()
+
+    def _on_edit_cancel(self):
+        self._edit_widget = None
+        self._show_menu = True
+        self._hover_idx = -1
+        self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+        self.update()
+
     # ── 鼠标事件 ──────────────────────────────────────────────
 
     def mousePressEvent(self, event):
@@ -366,6 +683,11 @@ class ScreenshotOverlay(QWidget):
 
         pos = event.pos()
 
+        # 编辑模式：点击编辑区外关闭
+        if (self._mode == "edit" and self._edit_widget
+                and self._edit_widget.isVisible()):
+            return
+
         # 提取弹窗：点击弹窗外关闭并回到菜单
         if (self._mode == "extract" and self._extract_popup
                 and self._extract_popup.isVisible()):
@@ -377,16 +699,15 @@ class ScreenshotOverlay(QWidget):
             self._reset_mode()
             return
 
-        if self._mode == "translate" and hasattr(self, "_toggle_rect") and self._toggle_rect.contains(pos):
-            self._showing_trans = not self._showing_trans
-            self.update()
-            return
-
         if self._show_menu:
             for i, br in enumerate(self._menu_buttons):
                 if br.contains(pos):
                     self._handle_action(i)
                     return
+            return
+
+        if self._mode == "translate" and self._crop_rect and self._crop_rect.contains(pos):
+            self._toggle_trans()
             return
 
         if self._mode:
@@ -398,6 +719,12 @@ class ScreenshotOverlay(QWidget):
         self._crop_rect = None
         self._show_menu = False
         self.update()
+
+    def _toggle_trans(self):
+        """翻译模式下点击覆盖层，切换原文/译文。"""
+        if self._mode == "translate" and self._ocr_text:
+            self._showing_trans = not self._showing_trans
+            self.update()
 
     def mouseMoveEvent(self, event):
         pos = event.pos()
@@ -423,10 +750,17 @@ class ScreenshotOverlay(QWidget):
             if rect.width() < 5 or rect.height() < 5:
                 return
             self._crop_rect = rect
-            self._show_menu = True
             self._hover_idx = -1
             self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
-            self.update()
+
+            if self._auto_translate:
+                # 自动翻译：跳过菜单，直接翻译
+                path = self._save_to_temp()
+                if path:
+                    self.translateRequested.emit(path)
+            else:
+                self._show_menu = True
+                self.update()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
@@ -439,6 +773,9 @@ class ScreenshotOverlay(QWidget):
 
     def _reset_mode(self):
         self._hide_extract_popup()
+        if self._edit_widget:
+            self._edit_widget.hide()
+            self._edit_widget = None
         self._mode = None
         self._ocr_text = ""
         self._trans_text = ""
@@ -450,15 +787,18 @@ class ScreenshotOverlay(QWidget):
 
     def _cancel(self):
         self._hide_extract_popup()
+        if self._edit_widget:
+            self._edit_widget.hide()
+            self._edit_widget = None
         self.close()
         self.finished.emit()
 
     def _handle_action(self, idx):
         name = self.ACTIONS[idx]
-        self._show_menu = False
         self.setCursor(QCursor(Qt.CursorShape.WaitCursor))
 
         if name == "复制":
+            self._show_menu = False
             image = self._crop_image()
             if image:
                 QApplication.clipboard().setPixmap(image)
@@ -469,6 +809,7 @@ class ScreenshotOverlay(QWidget):
                 self.screenshotTaken.emit(path)
             self.finished.emit()
         elif name == "保存":
+            self._show_menu = False
             image = self._crop_image()
             if image:
                 save_path, _ = QFileDialog.getSaveFileName(
@@ -480,13 +821,25 @@ class ScreenshotOverlay(QWidget):
             self._show_menu = True
             self.update()
         elif name == "提取":
+            self._show_menu = False
             path = self._save_to_temp()
             if path:
                 self.extractRequested.emit(path)
         elif name == "翻译":
-            path = self._save_to_temp()
-            if path:
-                self.translateRequested.emit(path)
+            if self._mode == "translate" and self._ocr_text:
+                # 已有翻译结果 → 直接切换，不重新调用API
+                self._showing_trans = not self._showing_trans
+                self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+                self.update()
+            else:
+                # 首次翻译
+                self._show_menu = False
+                path = self._save_to_temp()
+                if path:
+                    self.translateRequested.emit(path)
+        elif name == "编辑":
+            self._show_menu = False
+            self._show_edit_widget()
         else:
             self._cancel()
 

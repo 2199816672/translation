@@ -74,18 +74,17 @@ class OCRRecognizer:
         """
         try:
             reader = self._init_reader()
-            
-            # 使用EasyOCR识别文字
             results = reader.readtext(image_path)
-            
-            # 提取文字并拼接
             text_list = [result[1] for result in results]
             full_text = '\n'.join(text_list)
-            
             return full_text
         except Exception as e:
-            print(f"OCR识别失败: {e}")
-            return ""
+            msg = str(e)
+            if "CUDA" in msg or "gpu" in msg.lower():
+                raise RuntimeError(f"GPU加速不可用: {msg}\n原因: 显卡驱动可能需要更新，或显存不足")
+            if "model" in msg.lower() or "download" in msg.lower():
+                raise RuntimeError(f"OCR模型加载失败: {msg}\n原因: 模型文件可能损坏，请删除 ~/.EasyOCR/model 后重试")
+            raise RuntimeError(f"OCR识别失败: {msg}")
 
     def recognize_with_positions(self, image_path):
         """

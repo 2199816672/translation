@@ -33,15 +33,31 @@ SUPPORTED_TARGET_LANGS = {
 
 # 翻译API配置
 TRANSLATION_APIS = {
+    # 免费 — 无需密钥
+    'Bing 微软 (免费)': 'bing_free',
+    'MyMemory (免费)': 'mymemory_free',
     'Google (免费)': 'google_free',
-    'Google': 'google',
-    'DeepL': 'deepl',
-    'MyMemory (免费)': 'youdao',
-    '百度翻译': 'baidu',
+    # 付费/需密钥
+    'DeepL (需密钥)': 'deepl',
+    '百度翻译 (需密钥)': 'baidu',
+    '腾讯翻译 (需密钥)': 'tencent',
+    '火山翻译 (需密钥)': 'volcengine',
+}
+
+# 免费API集合，用于判断是否需要密钥
+FREE_APIS = {
+    'bing_free', 'mymemory_free', 'google_free',
 }
 
 # 默认API设置
-DEFAULT_TRANSLATION_API = 'google_free'
+DEFAULT_TRANSLATION_API = 'bing_free'
+
+# 免费 API 可选密钥配置键
+FREE_API_KEY_FIELDS = {
+    'bing_free': 'bing_azure_key',
+    'mymemory_free': 'mymemory_api_key',
+    'google_free': 'google_cloud_key',
+}
 
 # 用户配置保存路径
 CONFIG_FILE = os.path.join(BASE_DIR, "user_config.json")

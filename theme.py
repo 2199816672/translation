@@ -58,6 +58,7 @@ _FONT = ", ".join(f"'{f}'" for f in FONT_FAMILIES) + ", sans-serif"
 
 def build_stylesheet() -> str:
     p = Palette
+    _check_svg = str(Path(__file__).parent / "assets" / "check.svg").replace("\\", "/")
     return f"""
 * {{
     font-family: {_FONT};
@@ -153,18 +154,23 @@ QComboBox {{
 }}
 QComboBox:hover {{ border-color: {p.BORDER_STRONG}; }}
 QComboBox:focus, QComboBox:on {{ border-color: {p.FOCUS}; }}
-QComboBox::drop-down {{ border: none; background: transparent; width: 28px; }}
+QComboBox::drop-down {{
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    border: none;
+    background: {p.BG_INPUT};
+    width: 28px;
+}}
 QComboBox::down-arrow {{
     image: none;
     border-left: 5px solid transparent;
     border-right: 5px solid transparent;
     border-top: 6px solid {p.TEXT_MUTED};
     width: 10px; height: 10px;
-    margin-right: 10px;
 }}
-QComboBox::item:selected {{
-    background: {p.SELECTION};
-    color: {p.TEXT_STRONG};
+QComboBox:on {{
+    border: 1px solid {p.FOCUS};
+    background: {p.BG_INPUT};
 }}
 QComboBox QFrame {{
     background: {p.SURFACE};
@@ -177,11 +183,22 @@ QComboBox QAbstractScrollArea {{
 QComboBox QScrollBar {{
     background: {p.SURFACE};
 }}
+QComboBox QAbstractItemView {{
+    background: {p.SURFACE};
+    color: {p.TEXT};
+    border: 1px solid {p.BORDER};
+    border-radius: 8px;
+    padding: 4px;
+    selection-background-color: {p.SELECTION};
+    selection-color: {p.TEXT_STRONG};
+    outline: none;
+}}
 QComboBox QAbstractItemView::item {{
     background: {p.SURFACE};
     color: {p.TEXT};
     padding: 4px;
     border: none;
+    min-height: 24px;
 }}
 QComboBox QAbstractItemView::item:selected {{
     background: {p.SELECTION};
@@ -245,6 +262,31 @@ QPushButton#segment {{
 }}
 QPushButton#segment:hover {{ color: {p.TEXT}; }}
 QPushButton#segment:checked {{ background: {p.SELECTION}; color: {p.TEXT_STRONG}; font-weight: 600; }}
+
+/* ---- 复选框 ---- */
+QCheckBox {{
+    color: {p.TEXT};
+    spacing: 8px;
+    font-size: 14px;
+}}
+QCheckBox::indicator {{
+    width: 18px;
+    height: 18px;
+    border: 1px solid {p.BORDER_STRONG};
+    border-radius: 4px;
+    background: {p.BG_INPUT};
+}}
+QCheckBox::indicator:hover {{ border-color: {p.FOCUS}; }}
+QCheckBox::indicator:checked {{
+    background: {p.PRIMARY};
+    border-color: {p.PRIMARY};
+    image: url({_check_svg});
+}}
+QCheckBox::indicator:checked:hover {{
+    background: {p.PRIMARY_HOVER};
+    border-color: {p.PRIMARY_HOVER};
+    image: url({_check_svg});
+}}
 """
 
 
