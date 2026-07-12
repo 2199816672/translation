@@ -13,7 +13,7 @@ from PySide6.QtWidgets import QSystemTrayIcon, QMenu, QApplication
 from config import (
     OCR_LANGUAGES, SUPPORTED_TARGET_LANGS, load_user_config,
 )
-from ocr_recognizer import get_ocr_instance
+from ocr_recognizer import get_ocr_instance, check_engine_available
 from translator import get_translator_instance, TranslationError
 from pages.home_page import HomePage
 from pages.settings_page import SettingsPage
@@ -165,10 +165,20 @@ class MainWindow(FluentWindow):
     # ── OCR 初始化 ──────────────────────────────────────────
 
     def _init_ocr_async(self):
+        engine = self.cfg.get("ocr_engine", "paddle")
+        if not check_engine_available(engine):
+            for fallback in ["easy", "windows"]:
+                if fallback != engine and check_engine_available(fallback):
+                    self._on_status(f"OCR引擎未安装，已切换到备用引擎", "#eab308")
+                    engine = fallback
+                    break
+            else:
+                self._on_status("OCR引擎未安装，请前往设置页安装", "#e5635f")
+                return
         self._on_status("正在初始化 OCR 模型...", "#eab308")
 
         def init():
-            ocr = get_ocr_instance(OCR_LANGUAGES)
+            ocr = get_ocr_instance(OCR_LANGUAGES, engine=engine)
             self.ocr = ocr
             self._sig_status.emit("就绪", "#4ade80")
 
@@ -436,8 +446,10 @@ class MainWindow(FluentWindow):
     @Slot()
     def _on_settings_saved(self):
         old_hotkey = self.cfg.get("hotkey", "ctrl+shift+a")
+        old_engine = self.cfg.get("ocr_engine", "paddle")
         self.cfg = load_user_config()
         new_hotkey = self.cfg.get("hotkey", "ctrl+shift+a")
+        new_engine = self.cfg.get("ocr_engine", "paddle")
         if old_hotkey != new_hotkey:
             try:
                 import keyboard
@@ -445,3 +457,5 @@ class MainWindow(FluentWindow):
                 keyboard.add_hotkey(new_hotkey, lambda: self.home.screenshotRequested.emit())
             except Exception as e:
                 self.settings.show_hotkey_error(str(e))
+        if old_engine != new_engine:
+            self._init_ocr_async()

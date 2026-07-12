@@ -14,6 +14,11 @@ if not os.path.exists(SCREENSHOT_DIR):
 
 # OCR配置
 OCR_LANGUAGES = ['ch_sim', 'en']  # 支持简体中文和英文
+OCR_ENGINE = 'windows'  # 默认OCR引擎：windows 或 easy
+SUPPORTED_OCR_ENGINES = {
+    'windows': 'Windows 系统自带',
+    'easy': 'EasyOCR (推荐，识别更准)',
+}
 
 # 翻译配置
 TRANSLATE_SOURCE_LANG = 'auto'  # 自动检测源语言

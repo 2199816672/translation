@@ -7,12 +7,13 @@ import os
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget,
+    QPushButton, QProgressBar, QScrollArea, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from config import (
     CONFIG_FILE, DEFAULT_TRANSLATION_API, TRANSLATION_APIS, FREE_APIS,
-    FREE_API_KEY_FIELDS, load_user_config, save_user_config,
+    FREE_API_KEY_FIELDS, OCR_ENGINE, SUPPORTED_OCR_ENGINES,
+    load_user_config, save_user_config,
 )
 from widgets import HotKeyInput, FlatCheckBox
 
@@ -241,6 +242,52 @@ class SettingsPage(QScrollArea):
         layout.addWidget(trans_section)
         layout.addWidget(self._api_container)
 
+        # ---- OCR 设置 ----
+        ocr_section = _Section("OCR 设置")
+
+        self.ocr_engine_combo = QComboBox()
+        ocr_engine_names = list(SUPPORTED_OCR_ENGINES.values())
+        self.ocr_engine_combo.addItems(ocr_engine_names)
+        current_engine = self._cfg.get("ocr_engine", OCR_ENGINE)
+        for engine_key, engine_name in SUPPORTED_OCR_ENGINES.items():
+            if engine_key == current_engine:
+                self.ocr_engine_combo.setCurrentText(engine_name)
+                break
+        ocr_section.add("OCR 引擎:", self.ocr_engine_combo,
+                        tip="选择文字识别引擎，切换后需保存生效")
+
+        ocr_tip = QLabel("💡 Windows 自带：开箱即用，无需下载，速度快\n"
+                         "   EasyOCR：识别更准确，首次需下载约 100MB 模型")
+        ocr_tip.setObjectName("caption")
+        ocr_tip.setWordWrap(True)
+        ocr_section.grid.addWidget(ocr_tip, ocr_section._row, 0, 1, 2)
+        ocr_section._row += 1
+
+        self.ocr_status_label = QLabel()
+        self.ocr_status_label.setObjectName("caption")
+        self.ocr_status_label.setWordWrap(True)
+        ocr_section.grid.addWidget(self.ocr_status_label, ocr_section._row, 0, 1, 2)
+        ocr_section._row += 1
+
+        self.ocr_install_btn = QPushButton("安装")
+        self.ocr_install_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.ocr_install_btn.clicked.connect(self._install_ocr_engine)
+        self.ocr_install_btn.setVisible(False)
+        ocr_section.grid.addWidget(self.ocr_install_btn, ocr_section._row, 0, 1, 2)
+        ocr_section._row += 1
+
+        self.ocr_progress = QProgressBar()
+        self.ocr_progress.setVisible(False)
+        self.ocr_progress.setTextVisible(True)
+        self.ocr_progress.setRange(0, 0)
+        ocr_section.grid.addWidget(self.ocr_progress, ocr_section._row, 0, 1, 2)
+        ocr_section._row += 1
+
+        self.ocr_engine_combo.currentTextChanged.connect(self._on_ocr_engine_changed)
+        self._refresh_ocr_status()
+
+        layout.addWidget(ocr_section)
+
         # ---- 常规设置 ----
         general_section = _Section("常规设置")
 
@@ -335,6 +382,103 @@ class SettingsPage(QScrollArea):
         else:
             self._api_container.setVisible(False)
 
+    def _get_selected_engine_key(self):
+        display_name = self.ocr_engine_combo.currentText()
+        for key, name in SUPPORTED_OCR_ENGINES.items():
+            if name == display_name:
+                return key
+        return OCR_ENGINE
+
+    def _refresh_ocr_status(self):
+        from ocr_recognizer import check_engine_available
+        engine = self._get_selected_engine_key()
+        if check_engine_available(engine):
+            self.ocr_status_label.setText("已安装 ✓")
+            self.ocr_status_label.setStyleSheet("color: #4ade80;")
+            self.ocr_install_btn.setVisible(False)
+        elif engine == 'windows':
+            self.ocr_status_label.setText("需要安装 winrt 包，或检查系统是否已安装对应语言包")
+            self.ocr_status_label.setStyleSheet("color: #eab308;")
+            self.ocr_install_btn.setVisible(True)
+            self.ocr_install_btn.setText("安装 winrt")
+        else:
+            engine_name = SUPPORTED_OCR_ENGINES.get(engine, engine)
+            self.ocr_status_label.setText(f"未安装 {engine_name}，请先安装再使用")
+            self.ocr_status_label.setStyleSheet("color: #e5635f;")
+            self.ocr_install_btn.setVisible(True)
+            self.ocr_install_btn.setText("安装")
+
+    def _on_ocr_engine_changed(self, _text):
+        self._refresh_ocr_status()
+
+    def _install_ocr_engine(self):
+        from ocr_recognizer import install_engine_with_progress
+        engine = self._get_selected_engine_key()
+        self.ocr_install_btn.setEnabled(False)
+        self.ocr_install_btn.setText("安装中...")
+        self.ocr_status_label.setText("正在安装，请稍候...")
+        self.ocr_status_label.setStyleSheet("color: #eab308;")
+        self.ocr_progress.setVisible(True)
+        self.ocr_progress.setRange(0, 0)
+        self.ocr_progress.setFormat("准备中...")
+
+        import threading
+
+        def on_progress(line):
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, lambda l=line: self._update_install_progress(l))
+
+        def do_install():
+            ok, msg = install_engine_with_progress(engine, on_progress)
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, lambda: self._on_install_result(ok, msg))
+
+        threading.Thread(target=do_install, daemon=True).start()
+
+    def _update_install_progress(self, line):
+        line = line.strip()
+        if not line:
+            return
+        if "Downloading" in line or "下载" in line:
+            self.ocr_progress.setRange(0, 0)
+            self.ocr_status_label.setText(f"正在下载: {line[:80]}")
+        elif "Installing" in line or "安装" in line or "Installing collected" in line:
+            self.ocr_progress.setRange(0, 0)
+            self.ocr_status_label.setText(f"正在安装: {line[:80]}")
+        elif "Collecting" in line or "Downloading" in line:
+            self.ocr_progress.setRange(0, 0)
+            self.ocr_status_label.setText(f"正在下载依赖: {line[:80]}")
+        elif "Successfully" in line:
+            self.ocr_progress.setRange(0, 100)
+            self.ocr_progress.setValue(100)
+            self.ocr_progress.setFormat("安装完成")
+            self.ocr_status_label.setText("安装完成 ✓")
+            self.ocr_status_label.setStyleSheet("color: #4ade80;")
+        elif "ERROR" in line or "Failed" in line:
+            self.ocr_progress.setRange(0, 100)
+            self.ocr_progress.setValue(0)
+            self.ocr_status_label.setText(f"错误: {line[:100]}")
+            self.ocr_status_label.setStyleSheet("color: #e5635f;")
+        else:
+            self.ocr_status_label.setText(line[:100])
+
+    def _on_install_result(self, ok, msg):
+        self.ocr_install_btn.setEnabled(True)
+        self.ocr_progress.setVisible(False)
+        if ok:
+            self.ocr_install_btn.setText("安装")
+            self._refresh_ocr_status()
+            from qfluentwidgets import InfoBar, InfoBarPosition
+            InfoBar.success("安装成功", "OCR 引擎已安装，保存设置后生效",
+                          duration=3000, position=InfoBarPosition.TOP, parent=self)
+        else:
+            self.ocr_install_btn.setText("重试安装")
+            self.ocr_status_label.setText(f"安装失败: {msg[:100]}")
+            self.ocr_status_label.setStyleSheet("color: #e5635f;")
+            from qfluentwidgets import InfoBar, InfoBarPosition
+            InfoBar.error("安装失败", msg[:200], duration=5000,
+                        position=InfoBarPosition.TOP, parent=self)
+
     def _save(self):
         api_name = self.api_combo.currentText()
         if api_name in TRANSLATION_APIS:
@@ -359,6 +503,17 @@ class SettingsPage(QScrollArea):
         self._cfg["auto_copy_target"] = "source" if self.auto_copy_combo.currentText() == "原文" else "translation"
         self._cfg["minimize_to_tray"] = self.minimize_to_tray_check.isChecked()
         self._cfg["auto_check_update"] = self.auto_check_update_check.isChecked()
+
+        # OCR 引擎
+        old_engine = self._cfg.get("ocr_engine", OCR_ENGINE)
+        new_engine = self._get_selected_engine_key()
+        if old_engine != new_engine:
+            self._cfg["ocr_engine"] = new_engine
+            try:
+                from ocr_recognizer import reset_ocr_instance
+                reset_ocr_instance()
+            except Exception:
+                pass
 
         # 开机自启动
         try:
