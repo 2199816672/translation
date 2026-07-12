@@ -3,3 +3,8 @@ __pycache__/
 user_config.json
 PROJECT_MEMORY.md
 screenshot_old.py
+screenshots/
+dist/
+build/
+*.spec
+*.zip
