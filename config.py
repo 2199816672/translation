@@ -85,7 +85,10 @@ def save_user_config(config):
 # 加载保存的配置
 user_config = load_user_config()
 
-# GUI配置
+APP_VERSION = "1.1.1"
+BILIBILI_DYNAMIC_URL = "https://space.bilibili.com/382966397/dynamic"
+GITHUB_REPO = "2199816672/translation"
+
 WINDOW_TITLE = "截图翻译工具"
 WINDOW_SIZE = "900x700"
 FONT_FAMILY = "Microsoft YaHei"

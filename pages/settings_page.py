@@ -263,6 +263,17 @@ class SettingsPage(QScrollArea):
         general_section.add("自启动:", self.autostart_check,
                            tip="开机后自动启动并最小化到托盘")
 
+        self.auto_check_update_check = FlatCheckBox("启动时自动检测更新")
+        self.auto_check_update_check.setChecked(self._cfg.get("auto_check_update", True))
+        general_section.add("自动更新检测:", self.auto_check_update_check,
+                           tip="每次启动时自动检查是否有新版本")
+
+        self.check_update_btn = QPushButton("检查更新")
+        self.check_update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.check_update_btn.clicked.connect(self._check_update)
+        general_section.add("手动检测:", self.check_update_btn,
+                           tip="手动检查是否有新版本")
+
         info = QLabel(
             "免费翻译（可选填自己的 API 密钥）:\n"
             "  Bing 微软 — 国内可用，可填 Azure 密钥\n"
@@ -347,6 +358,7 @@ class SettingsPage(QScrollArea):
         self._cfg["auto_copy"] = self.auto_copy_check.isChecked()
         self._cfg["auto_copy_target"] = "source" if self.auto_copy_combo.currentText() == "原文" else "translation"
         self._cfg["minimize_to_tray"] = self.minimize_to_tray_check.isChecked()
+        self._cfg["auto_check_update"] = self.auto_check_update_check.isChecked()
 
         # 开机自启动
         try:
@@ -390,3 +402,33 @@ class SettingsPage(QScrollArea):
             position=InfoBarPosition.TOP,
             parent=self,
         )
+
+    def _check_update(self):
+        """手动检查更新。"""
+        from check_update import check_update_async, BILIBILI_DYNAMIC_URL
+        from PySide6.QtCore import QTimer
+
+        self.check_update_btn.setEnabled(False)
+        self.check_update_btn.setText("检测中...")
+
+        def _on_result(result):
+            def _show():
+                self.check_update_btn.setEnabled(True)
+                self.check_update_btn.setText("检查更新")
+                if result["error"]:
+                    InfoBar.warning("检测失败", result["error"], duration=4000,
+                                    position=InfoBarPosition.TOP, parent=self)
+                elif result["has_update"]:
+                    InfoBar.info(
+                        "发现新版本",
+                        f"当前 v{result['current']} → 最新 {result['latest']}\n"
+                        f"请前往作者B站动态下载最新版：\n{BILIBILI_DYNAMIC_URL}",
+                        duration=10000,
+                        position=InfoBarPosition.TOP, parent=self,
+                    )
+                else:
+                    InfoBar.success("已是最新", f"当前版本 v{result['current']} 已是最新",
+                                    duration=3000, position=InfoBarPosition.TOP, parent=self)
+            QTimer.singleShot(0, _show)
+
+        check_update_async(_on_result)

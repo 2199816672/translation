@@ -82,6 +82,7 @@ class MainWindow(FluentWindow):
         self._wire()
         self._init_ocr_async()
         self._setup_hotkey()
+        self._auto_check_update()
 
         if start_minimized or self.cfg.get("start_minimized", False):
             QTimer.singleShot(0, self._minimize_to_tray)
@@ -182,6 +183,25 @@ class MainWindow(FluentWindow):
             keyboard.add_hotkey(hotkey, lambda: self.home.screenshotRequested.emit())
         except Exception as e:
             self.settings.show_hotkey_error(str(e))
+
+    def _auto_check_update(self):
+        if not self.cfg.get("auto_check_update", True):
+            return
+        from check_update import check_update_async, BILIBILI_DYNAMIC_URL
+        def _on_result(result):
+            def _show():
+                if result["error"]:
+                    return
+                if result["has_update"]:
+                    InfoBar.info(
+                        "发现新版本",
+                        f"当前 v{result['current']} → 最新 {result['latest']}\n"
+                        f"请前往作者B站动态下载最新版：\n{BILIBILI_DYNAMIC_URL}",
+                        duration=10000,
+                        position=InfoBarPosition.TOP, parent=self,
+                    )
+            QTimer.singleShot(2000, _show)
+        check_update_async(_on_result)
 
     # ── 系统托盘 ────────────────────────────────────────────
 

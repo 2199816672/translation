@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from theme import Palette
-from config import SUPPORTED_TARGET_LANGS
+from config import SUPPORTED_TARGET_LANGS, APP_VERSION
 
 
 class HomePage(QWidget):
@@ -41,7 +41,7 @@ class HomePage(QWidget):
         title = QLabel("截图翻译", self)
         title.setObjectName("pageTitle")
         header.addWidget(title)
-        ver = QLabel("v1.0.0", self)
+        ver = QLabel(f"v{APP_VERSION}", self)
         ver.setObjectName("caption")
         ver.setStyleSheet(f"color: {Palette.TEXT_MUTED}; font-size: 12px; border: none; background: transparent;")
         header.addWidget(ver)
