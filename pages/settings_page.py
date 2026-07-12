@@ -405,30 +405,26 @@ class SettingsPage(QScrollArea):
 
     def _check_update(self):
         """手动检查更新。"""
-        from check_update import check_update_async, BILIBILI_DYNAMIC_URL
-        from PySide6.QtCore import QTimer
+        from check_update import UpdateChecker, BILIBILI_DYNAMIC_URL
+        from qfluentwidgets import InfoBar, InfoBarPosition
 
         self.check_update_btn.setEnabled(False)
         self.check_update_btn.setText("检测中...")
 
-        def _on_result(result):
-            def _show():
-                self.check_update_btn.setEnabled(True)
-                self.check_update_btn.setText("检查更新")
-                if result["error"]:
-                    InfoBar.warning("检测失败", result["error"], duration=4000,
-                                    position=InfoBarPosition.TOP, parent=self)
-                elif result["has_update"]:
-                    InfoBar.info(
-                        "发现新版本",
-                        f"当前 v{result['current']} → 最新 {result['latest']}\n"
-                        f"请前往作者B站动态下载最新版：\n{BILIBILI_DYNAMIC_URL}",
-                        duration=10000,
-                        position=InfoBarPosition.TOP, parent=self,
-                    )
-                else:
-                    InfoBar.success("已是最新", f"当前版本 v{result['current']} 已是最新",
-                                    duration=3000, position=InfoBarPosition.TOP, parent=self)
-            QTimer.singleShot(0, _show)
+        checker = UpdateChecker()
+        self._update_checker = checker
 
-        check_update_async(_on_result)
+        def _on_result(result):
+            self.check_update_btn.setEnabled(True)
+            self.check_update_btn.setText("检查更新")
+            if result["error"]:
+                InfoBar.warning("检测失败", result["error"], duration=4000,
+                                position=InfoBarPosition.TOP, parent=self)
+            elif result["has_update"]:
+                self.window()._show_update_dialog(
+                    result["current"], result["latest"], BILIBILI_DYNAMIC_URL)
+            else:
+                InfoBar.success("已是最新", f"当前版本 v{result['current']} 已是最新",
+                                duration=3000, position=InfoBarPosition.TOP, parent=self)
+
+        checker.check(_on_result)

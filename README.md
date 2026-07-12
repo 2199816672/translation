@@ -51,6 +51,7 @@ trans/
 ├── main_window.py         # FluentWindow 主窗口 + 信号调度 + 系统托盘
 ├── theme.py               # Palette + QSS 样式（Zinc 暗色）
 ├── config.py              # 配置管理（API、语言、用户配置）
+├── check_update.py        # 版本更新检测（gh CLI + HTTP）
 ├── free_translator.py     # 免费翻译引擎（Bing/MyMemory/Google）
 ├── translator.py          # 多翻译 API 封装 + 错误诊断
 ├── ocr_recognizer.py      # EasyOCR 封装

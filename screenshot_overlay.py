@@ -305,7 +305,7 @@ class ScreenshotOverlay(QWidget):
     BTN_H = 30
     BTN_GAP = 6
     MENU_PAD = 12
-    ACTIONS = ["复制", "保存", "提取", "翻译", "编辑", "取消"]
+    ACTIONS = ["复制", "保存", "提取", "翻译", "取消"]
     POPUP_MAX_W = 360
     POPUP_PAD = 12
     POPUP_LINE_H = 22
@@ -316,6 +316,7 @@ class ScreenshotOverlay(QWidget):
             Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMouseTracking(True)
         self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
 
         self._start = QPoint()
@@ -485,7 +486,7 @@ class ScreenshotOverlay(QWidget):
 
         bg = QRect(mx, my, total_w, total_h)
         p.setPen(QPen(QColor(Palette.BORDER), 1))
-        p.setBrush(QColor(Palette.SURFACE))
+        p.setBrush(QColor(22, 22, 24, 128))
         p.drawRoundedRect(bg, 10, 10)
 
         self._menu_buttons.clear()
@@ -494,10 +495,15 @@ class ScreenshotOverlay(QWidget):
             br = QRect(bx, by, self.BTN_W, self.BTN_H)
             self._menu_buttons.append(br)
             if i == self._hover_idx:
-                p.setBrush(QColor(Palette.SURFACE_HOVER))
                 p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(59, 130, 246, 80))
                 p.drawRoundedRect(br, 6, 6)
-            p.setPen(QColor(Palette.TEXT_STRONG) if i == 0 else QColor(Palette.TEXT))
+                indicator = QRect(br.x(), br.y() + 4, 3, br.height() - 8)
+                p.setBrush(QColor(59, 130, 246))
+                p.drawRoundedRect(indicator, 2, 2)
+                p.setPen(QColor("#3b82f6"))
+            else:
+                p.setPen(QColor(Palette.TEXT))
             p.setFont(QFont("Microsoft YaHei", 11))
             p.drawText(br, Qt.AlignmentFlag.AlignCenter, label)
             bx += self.BTN_W + self.BTN_GAP

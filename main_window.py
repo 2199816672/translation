@@ -187,21 +187,69 @@ class MainWindow(FluentWindow):
     def _auto_check_update(self):
         if not self.cfg.get("auto_check_update", True):
             return
-        from check_update import check_update_async, BILIBILI_DYNAMIC_URL
+        from check_update import UpdateChecker, BILIBILI_DYNAMIC_URL
+
         def _on_result(result):
-            def _show():
-                if result["error"]:
-                    return
-                if result["has_update"]:
-                    InfoBar.info(
-                        "发现新版本",
-                        f"当前 v{result['current']} → 最新 {result['latest']}\n"
-                        f"请前往作者B站动态下载最新版：\n{BILIBILI_DYNAMIC_URL}",
-                        duration=10000,
-                        position=InfoBarPosition.TOP, parent=self,
-                    )
-            QTimer.singleShot(2000, _show)
-        check_update_async(_on_result)
+            if result["error"]:
+                from qfluentwidgets import InfoBar, InfoBarPosition
+                InfoBar.warning(
+                    "版本检测失败",
+                    result["error"],
+                    duration=4000,
+                    position=InfoBarPosition.TOP, parent=self.home,
+                )
+                return
+            if result["has_update"]:
+                self._show_update_dialog(result["current"], result["latest"],
+                                         BILIBILI_DYNAMIC_URL)
+            else:
+                from qfluentwidgets import InfoBar, InfoBarPosition
+                InfoBar.success(
+                    "已是最新版本",
+                    f"当前版本 v{result['current']} 已是最新",
+                    duration=3000,
+                    position=InfoBarPosition.TOP, parent=self.home,
+                )
+
+        checker = UpdateChecker()
+        self._update_checker = checker
+        checker.check(_on_result)
+
+    def _show_update_dialog(self, current, latest, url):
+        from qfluentwidgets import MessageBoxBase, SubtitleLabel, PrimaryPushButton
+        from PySide6.QtWidgets import QLabel
+        from PySide6.QtGui import QDesktopServices
+        from PySide6.QtCore import QUrl
+
+        dialog = MessageBoxBase(self)
+        dialog.setWindowTitle("发现新版本")
+
+        title = SubtitleLabel(f"新版本 {latest} 可用", dialog)
+        dialog.viewLayout.addWidget(title)
+
+        info_label = SubtitleLabel(
+            f"当前版本 v{current} → 最新 {latest}",
+            dialog,
+        )
+        dialog.viewLayout.addWidget(info_label)
+
+        link_label = QLabel(dialog)
+        link_label.setText(
+            f'<a href="{url}" style="color: #3b82f6; text-decoration: underline;">'
+            '点击前往作者B站动态下载最新版</a>'
+        )
+        link_label.setOpenExternalLinks(True)
+        link_label.setStyleSheet("QLabel { font-size: 14px; }")
+        dialog.viewLayout.addWidget(link_label)
+
+        dialog.yesButton.setText("我知道了")
+        go_btn = PrimaryPushButton("立刻前往", dialog.buttonGroup)
+        dialog.buttonLayout.insertWidget(0, go_btn)
+        dialog.cancelButton.hide()
+
+        go_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(url)))
+
+        dialog.exec()
 
     # ── 系统托盘 ────────────────────────────────────────────
 
