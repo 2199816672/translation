@@ -116,6 +116,7 @@ class WindowsOCRRecognizer:
             img = cv2.imread(str(image_path))
             if img is None:
                 raise RuntimeError(f"无法读取图片: {image_path}")
+            h_img = img.shape[0]
             ret, buf = cv2.imencode(".png", img)
             data = buf.tobytes()
             stream = wss.InMemoryRandomAccessStream()
@@ -124,12 +125,26 @@ class WindowsOCRRecognizer:
             decoder = wimg.BitmapDecoder.create_async(stream).get()
             bitmap = decoder.get_software_bitmap_async().get()
             result = self._engine.recognize_async(bitmap).get()
-            text_list = []
+            lines_with_y = []
             for line in result.lines:
                 text = line.text.strip()
-                if text:
-                    text_list.append(text)
-            return '\n'.join(text_list)
+                if not text:
+                    continue
+                y = 0
+                if line.words:
+                    y = line.words[0].bounding_rect.y
+                lines_with_y.append((text, y))
+            if not lines_with_y:
+                return ""
+            lines_with_y.sort(key=lambda x: x[1])
+            avg_h = max(1, (lines_with_y[-1][1] - lines_with_y[0][1]) / max(1, len(lines_with_y) - 1))
+            parts = [lines_with_y[0][0]]
+            for i in range(1, len(lines_with_y)):
+                gap = lines_with_y[i][1] - lines_with_y[i-1][1]
+                if gap > avg_h * 1.6:
+                    parts.append("\n")
+                parts.append(lines_with_y[i][0])
+            return '\n'.join(parts)
         except Exception as e:
             raise RuntimeError(f"Windows OCR识别失败: {e}\n提示: 请在系统设置中安装对应语言包")
 
@@ -185,8 +200,27 @@ class EasyOCRRecognizer:
         try:
             reader = self._init_reader()
             results = reader.readtext(image_path)
-            text_list = [result[1] for result in results]
-            return '\n'.join(text_list)
+            if not results:
+                return ""
+            items = []
+            for r in results:
+                text = r[1].strip()
+                if not text:
+                    continue
+                bbox = r[0]
+                y = (bbox[0][1] + bbox[2][1]) / 2
+                items.append((text, y))
+            if not items:
+                return ""
+            items.sort(key=lambda x: x[1])
+            avg_h = max(1, (items[-1][1] - items[0][1]) / max(1, len(items) - 1))
+            parts = [items[0][0]]
+            for i in range(1, len(items)):
+                gap = items[i][1] - items[i-1][1]
+                if gap > avg_h * 1.6:
+                    parts.append("\n")
+                parts.append(items[i][0])
+            return '\n'.join(parts)
         except Exception as e:
             msg = str(e)
             if "CUDA" in msg or "gpu" in msg.lower():

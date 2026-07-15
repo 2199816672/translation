@@ -36,6 +36,19 @@ SUPPORTED_TARGET_LANGS = {
     '俄文': 'ru',
 }
 
+# 支持的源语言
+SUPPORTED_SOURCE_LANGS = {
+    '自动检测': 'auto',
+    '中文': 'zh-CN',
+    '英文': 'en',
+    '日文': 'ja',
+    '韩文': 'ko',
+    '法文': 'fr',
+    '德文': 'de',
+    '西班牙文': 'es',
+    '俄文': 'ru',
+}
+
 # 翻译API配置
 TRANSLATION_APIS = {
     # 免费 — 无需密钥
@@ -90,7 +103,7 @@ def save_user_config(config):
 # 加载保存的配置
 user_config = load_user_config()
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 BILIBILI_DYNAMIC_URL = "https://space.bilibili.com/382966397/dynamic"
 GITHUB_REPO = "2199816672/translation"
 

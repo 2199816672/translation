@@ -11,12 +11,13 @@ from qfluentwidgets import FluentIcon, FluentWindow, InfoBar, InfoBarPosition
 from PySide6.QtWidgets import QSystemTrayIcon, QMenu, QApplication
 
 from config import (
-    OCR_LANGUAGES, SUPPORTED_TARGET_LANGS, load_user_config,
+    OCR_LANGUAGES, SUPPORTED_TARGET_LANGS, SUPPORTED_SOURCE_LANGS, load_user_config,
 )
 from ocr_recognizer import get_ocr_instance, check_engine_available
 from translator import get_translator_instance, TranslationError
 from pages.home_page import HomePage
 from pages.settings_page import SettingsPage
+from pages.doc_page import DocPage
 from screenshot_overlay import ScreenshotOverlay, FullscreenCapture
 
 
@@ -59,6 +60,8 @@ def _get_autostart():
 class MainWindow(FluentWindow):
     _sig_ocr_done = Signal(str, str)
     _sig_trans_done = Signal(str)
+    _sig_doc_trans_done = Signal(str)
+    _sig_overlay_trans_done = Signal(list)
     _sig_status = Signal(str, str)
 
     def __init__(self, start_minimized=False):
@@ -68,11 +71,15 @@ class MainWindow(FluentWindow):
         self.translator = get_translator_instance()
         self._overlay = None
         self._ocr_target = None
+        self._last_trans_text = ""
+        self._last_trans_result = ""
 
         self.home = HomePage(self)
+        self.doc = DocPage(self)
         self.settings = SettingsPage(self)
 
         self.addSubInterface(self.home, FluentIcon.GAME, "翻译")
+        self.addSubInterface(self.doc, FluentIcon.DOCUMENT, "文档翻译")
         self.addSubInterface(self.settings, FluentIcon.SETTING, "设置")
 
         self.setWindowTitle(APP_NAME)
@@ -93,12 +100,18 @@ class MainWindow(FluentWindow):
         self.home.translateRequested.connect(self._on_home_translate)
         self.home.extractRequested.connect(self._on_home_extract)
         self.settings.saved.connect(self._on_settings_saved)
+        self.doc.translateRequested.connect(self._on_doc_translate)
         self._sig_ocr_done.connect(self._on_ocr_done)
         self._sig_trans_done.connect(self._on_trans_done)
+        self._sig_doc_trans_done.connect(self._on_doc_trans_done)
+        self._sig_overlay_trans_done.connect(self._on_overlay_trans_done)
         self._sig_status.connect(self._on_status)
 
     def _sync_target_lang(self):
-        """从主页语言下拉框同步目标语言到翻译器。"""
+        """从主页语言下拉框同步源语言和目标语言到翻译器。"""
+        src_text = self.home.src_lang_combo.currentText()
+        src_code = SUPPORTED_SOURCE_LANGS.get(src_text, 'auto')
+        self.translator.set_source_lang(src_code)
         combo_text = self.home.lang_combo.currentText()
         lang_code = SUPPORTED_TARGET_LANGS.get(combo_text, "zh-CN")
         self.translator.set_target_lang(lang_code)
@@ -296,7 +309,6 @@ class MainWindow(FluentWindow):
 
     def _minimize_to_tray(self):
         self.hide()
-        self._tray.showMessage(APP_NAME, "已最小化到系统托盘", QSystemTrayIcon.MessageIcon.Information, 1500)
 
     def _restore_from_tray(self):
         self.showNormal()
@@ -365,19 +377,48 @@ class MainWindow(FluentWindow):
         threading.Thread(target=run, daemon=True).start()
 
     def _do_translate_overlay(self, text):
+        if text == self._last_trans_text and self._last_trans_result:
+            paras = [p.strip() for p in self._last_trans_result.split("\n\n") if p.strip()]
+            if not paras:
+                paras = [self._last_trans_result]
+            self._sig_overlay_trans_done.emit(paras)
+            return
         self._on_status("正在翻译...", "#eab308")
         self._sync_target_lang()
 
         def run():
             try:
-                result = self.translator.translate(text)
-                self._sig_trans_done.emit(result)
+                paras = [p.strip() for p in text.split("\n\n") if p.strip()]
+                if not paras:
+                    paras = [text.strip()] if text.strip() else []
+                results = []
+                for para in paras:
+                    try:
+                        tr = self.translator.translate(para)
+                        results.append(tr)
+                    except Exception:
+                        results.append(para)
+                self._last_trans_text = text
+                self._last_trans_result = "\n\n".join(results)
+                self._sig_overlay_trans_done.emit(results)
             except TranslationError as e:
                 self._sig_status.emit(str(e), "#e5635f")
             except Exception as e:
                 self._sig_status.emit(f"翻译失败: {e}", "#e5635f")
 
         threading.Thread(target=run, daemon=True).start()
+
+    @Slot(list)
+    def _on_overlay_trans_done(self, paragraphs):
+        if self._overlay and self._overlay.isVisible():
+            self._overlay.show_trans_paragraphs(paragraphs, self._overlay_ocr_text)
+        full_text = "\n\n".join(paragraphs)
+        self.home.set_trans_text(full_text)
+        if paragraphs:
+            self._on_status("翻译完成", "#4ade80")
+        else:
+            self._on_status("翻译结果为空，请检查网络或更换翻译API", "#eab308")
+        self._auto_copy(full_text, "trans")
 
     # ── 全屏截图 ────────────────────────────────────────────
 
@@ -413,12 +454,17 @@ class MainWindow(FluentWindow):
         threading.Thread(target=run, daemon=True).start()
 
     def _do_translate_home(self, text):
+        if text == self._last_trans_text and self._last_trans_result:
+            self._sig_trans_done.emit(self._last_trans_result)
+            return
         self._on_status("正在翻译...", "#eab308")
         self._sync_target_lang()
 
         def run():
             try:
                 result = self.translator.translate(text)
+                self._last_trans_text = text
+                self._last_trans_result = result
                 self._sig_trans_done.emit(result)
             except TranslationError as e:
                 self._sig_status.emit(str(e), "#e5635f")
@@ -442,6 +488,31 @@ class MainWindow(FluentWindow):
         self._do_ocr_home(self.home._current_image_path, target="home_extract")
 
     # ── 设置保存 ────────────────────────────────────────────
+
+    @Slot(str)
+    def _on_doc_translate(self, text):
+        src_text = self.doc.src_lang_combo.currentText()
+        src_code = SUPPORTED_SOURCE_LANGS.get(src_text, 'auto')
+        self.translator.set_source_lang(src_code)
+        combo_text = self.doc.lang_combo.currentText()
+        lang_code = SUPPORTED_TARGET_LANGS.get(combo_text, "zh-CN")
+        self.translator.set_target_lang(lang_code)
+
+        def run():
+            try:
+                result = self.translator.translate(text)
+                self._sig_doc_trans_done.emit(result)
+            except TranslationError as e:
+                self._sig_status.emit(str(e), "#e5635f")
+            except Exception as e:
+                self._sig_status.emit(f"翻译失败: {e}", "#e5635f")
+
+        threading.Thread(target=run, daemon=True).start()
+
+    @Slot(str)
+    def _on_doc_trans_done(self, text):
+        self.doc.set_translated_text(text)
+        self._auto_copy(text, "trans")
 
     @Slot()
     def _on_settings_saved(self):

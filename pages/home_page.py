@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from theme import Palette
-from config import SUPPORTED_TARGET_LANGS, APP_VERSION
+from config import SUPPORTED_TARGET_LANGS, SUPPORTED_SOURCE_LANGS, APP_VERSION
 
 
 class HomePage(QWidget):
@@ -89,7 +89,7 @@ class HomePage(QWidget):
         right_layout.addWidget(ocr_title)
 
         self.ocr_text = QTextEdit(self)
-        self.ocr_text.setReadOnly(True)
+        self.ocr_text.setPlaceholderText("识别文本将显示在这里，你可以直接编辑...")
         self.ocr_text.setMinimumHeight(100)
         right_layout.addWidget(self.ocr_text, 1)
 
@@ -141,6 +141,16 @@ class HomePage(QWidget):
         layout.addWidget(self.fullscreen_btn)
 
         layout.addSpacing(16)
+
+        src_lang_label = QLabel("从:", self)
+        src_lang_label.setObjectName("fieldLabel")
+        layout.addWidget(src_lang_label)
+
+        self.src_lang_combo = QComboBox(self)
+        self.src_lang_combo.addItems(list(SUPPORTED_SOURCE_LANGS.keys()))
+        self.src_lang_combo.setCurrentText("自动检测")
+        self.src_lang_combo.setMinimumWidth(100)
+        layout.addWidget(self.src_lang_combo)
 
         lang_label = QLabel("翻译到:", self)
         lang_label.setObjectName("fieldLabel")

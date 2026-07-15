@@ -50,6 +50,8 @@ class _Section(QFrame):
 
 class SettingsPage(QScrollArea):
     saved = Signal()
+    _sig_install_progress = Signal(str)
+    _sig_install_result = Signal(bool, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -59,6 +61,8 @@ class SettingsPage(QScrollArea):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         self._cfg = load_user_config()
+        self._sig_install_progress.connect(self._update_install_progress)
+        self._sig_install_result.connect(self._on_install_result)
         self._build_ui()
 
     def _build_ui(self):
@@ -425,13 +429,11 @@ class SettingsPage(QScrollArea):
         import threading
 
         def on_progress(line):
-            from PySide6.QtCore import QTimer
-            QTimer.singleShot(0, lambda l=line: self._update_install_progress(l))
+            self._sig_install_progress.emit(line.strip())
 
         def do_install():
             ok, msg = install_engine_with_progress(engine, on_progress)
-            from PySide6.QtCore import QTimer
-            QTimer.singleShot(0, lambda: self._on_install_result(ok, msg))
+            self._sig_install_result.emit(ok, msg)
 
         threading.Thread(target=do_install, daemon=True).start()
 
