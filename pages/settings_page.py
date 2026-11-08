@@ -295,7 +295,7 @@ class SettingsPage(QScrollArea):
         # ---- 常规设置 ----
         general_section = _Section("常规设置")
 
-        self.hotkey_entry = HotKeyInput(self._cfg.get("hotkey", "ctrl+shift+a"))
+        self.hotkey_entry = HotKeyInput(self._cfg.get("hotkey") or "ctrl+shift+a")
         self.hotkey_entry.setMinimumWidth(200)
         general_section.add("截图快捷键:", self.hotkey_entry,
                            tip="点击后按下你想设置的快捷键组合")
@@ -499,7 +499,10 @@ class SettingsPage(QScrollArea):
         self._cfg["tencent_secret_key"] = self.tencent_secret_key.text().strip()
         self._cfg["volcengine_app_id"] = self.volcengine_appid.text().strip()
         self._cfg["volcengine_token"] = self.volcengine_token.text().strip()
-        self._cfg["hotkey"] = self.hotkey_entry.value()
+        # 用户未录入新快捷键时保留原值，避免把快捷键清空
+        hotkey_value = self.hotkey_entry.value()
+        if hotkey_value:
+            self._cfg["hotkey"] = hotkey_value
         self._cfg["auto_translate"] = self.auto_translate_check.isChecked()
         self._cfg["auto_copy"] = self.auto_copy_check.isChecked()
         self._cfg["auto_copy_target"] = "source" if self.auto_copy_combo.currentText() == "原文" else "translation"

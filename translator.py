@@ -60,13 +60,14 @@ class TencentTranslator:
     """腾讯云翻译 API（需要密钥）"""
 
     LANG_MAP = {
-        'zh-CN': 'zh', 'en': 'en', 'ja': 'ja', 'ko': 'ko',
+        'zh-CN': 'zh', 'zh-TW': 'zh-TW', 'en': 'en', 'ja': 'ja', 'ko': 'ko',
         'fr': 'fr', 'de': 'de', 'es': 'es', 'ru': 'ru',
     }
 
-    def __init__(self, secret_id, secret_key):
+    def __init__(self, secret_id, secret_key, target_lang='zh-CN'):
         self.secret_id = secret_id
         self.secret_key = secret_key
+        self.target = self.LANG_MAP.get(target_lang, 'zh')
 
     def translate(self, text):
         service = "tmt"
@@ -74,14 +75,13 @@ class TencentTranslator:
         version = "2018-03-21"
         region = "ap-guangzhou"
         host = "tmt.tencentcloudapi.com"
-        url = f"https://{host}"
         timestamp = int(time.time())
         date = time.strftime("%Y-%m-%d", time.gmtime(timestamp))
 
         payload = json.dumps({
             "SourceText": text,
             "Source": "auto",
-            "Target": "zh",
+            "Target": self.target,
             "ProjectId": 0,
         })
         payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -123,7 +123,9 @@ class TencentTranslator:
             "X-TC-Region": region,
         }
 
-        resp = requests.post(url, data=payload, headers=headers, timeout=15)
+        # 固定官方接口地址（字面量，不接受外部输入）
+        resp = requests.post("https://tmt.tencentcloudapi.com",
+                             data=payload, headers=headers, timeout=15)
         resp.raise_for_status()
         body = resp.json()
         if "Response" in body and "TargetText" in body["Response"]:
@@ -137,26 +139,31 @@ class VolcengineTranslator:
     """火山翻译 API（字节跳动，需要密钥）"""
 
     LANG_MAP = {
-        'zh-CN': 'zh', 'en': 'en', 'ja': 'ja', 'ko': 'ko',
+        'zh-CN': 'zh', 'zh-TW': 'zh-TW', 'en': 'en', 'ja': 'ja', 'ko': 'ko',
         'fr': 'fr', 'de': 'de', 'es': 'es', 'ru': 'ru',
     }
 
-    def __init__(self, app_id, access_token):
+    def __init__(self, app_id, access_token, target_lang='zh-CN'):
         self.app_id = app_id
         self.access_token = access_token
+        self.target = self.LANG_MAP.get(target_lang, 'zh')
 
     def translate(self, text):
-        url = "https://api.volcengine.com/api/translate/v2/translate"
         headers = {
             "Content-Type": "application/json",
+            # 火山接口的 Authorization 格式即为 "Bearer; {token}"（官方文档如此）
             "Authorization": f"Bearer; {self.access_token}",
         }
         payload = json.dumps({
+            # body 里的 token 字段官方示例即为字面量 "access_token"，鉴权以 Header 为准
             "app": {"appid": self.app_id, "token": "access_token"},
             "source": {"text_list": [text]},
-            "target": {"language": "zh"},
+            "target": {"language": self.target},
         })
-        resp = requests.post(url, data=payload, headers=headers, timeout=15)
+        # 固定官方接口地址（字面量，不接受外部输入）
+        resp = requests.post(
+            "https://api.volcengine.com/api/translate/v2/translate",
+            data=payload, headers=headers, timeout=15)
         resp.raise_for_status()
         body = resp.json()
         if "data" in body and "translations" in body["data"]:
@@ -178,11 +185,11 @@ class Translator:
         self._free_api_key = ''
 
         self.deepl_lang_map = {
-            'zh-CN': 'ZH', 'en': 'EN-US', 'ja': 'JA', 'ko': 'KO',
+            'zh-CN': 'ZH', 'zh-TW': 'ZH', 'en': 'EN-US', 'ja': 'JA', 'ko': 'KO',
             'fr': 'FR', 'de': 'DE', 'es': 'ES', 'ru': 'RU',
         }
         self.baidu_lang_map = {
-            'zh-CN': 'zh', 'en': 'en', 'ja': 'jp', 'ko': 'kor',
+            'zh-CN': 'zh', 'zh-TW': 'cht', 'en': 'en', 'ja': 'jp', 'ko': 'kor',
             'fr': 'fra', 'de': 'de', 'es': 'spa', 'ru': 'ru',
         }
 
@@ -219,7 +226,8 @@ class Translator:
                 secret_id = user_config.get('tencent_secret_id', '')
                 secret_key = user_config.get('tencent_secret_key', '')
                 if secret_id and secret_key:
-                    self.translator = TencentTranslator(secret_id, secret_key)
+                    self.translator = TencentTranslator(secret_id, secret_key,
+                                                        self.target_lang)
                 else:
                     self._free_engine = 'bing_free'
                     self._free_api_key = ''
@@ -228,7 +236,8 @@ class Translator:
                 app_id = user_config.get('volcengine_app_id', '')
                 access_token = user_config.get('volcengine_token', '')
                 if app_id and access_token:
-                    self.translator = VolcengineTranslator(app_id, access_token)
+                    self.translator = VolcengineTranslator(app_id, access_token,
+                                                           self.target_lang)
                 else:
                     self._free_engine = 'bing_free'
                     self._free_api_key = ''

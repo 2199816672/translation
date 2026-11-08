@@ -1,11 +1,14 @@
 """版本更新检测模块。"""
+import ipaddress
 import json
-import subprocess
-import urllib.request
-import urllib.error
 import re
+import socket
+import subprocess
 import threading
 import queue
+import urllib.request
+import urllib.error
+from urllib.parse import urlsplit
 
 from config import APP_VERSION, GITHUB_REPO, BILIBILI_DYNAMIC_URL
 
@@ -24,35 +27,71 @@ def _parse_version(v):
 
 
 def _fetch_via_gh():
-    """通过 gh CLI 获取最新 release tag（国内可用，走 SSH）。"""
-    r = subprocess.run(
-        ["gh", "release", "view", "--repo", GITHUB_REPO, "--json", "tagName,url"],
-        capture_output=True, text=True, timeout=15,
-    )
+    """通过 gh CLI 获取最新 release tag（国内可用，走 SSH）。gh 不存在/出错返回 None。"""
+    try:
+        r = subprocess.run(
+            ["gh", "release", "view", "--repo", GITHUB_REPO, "--json", "tagName,url"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None, None
     if r.returncode != 0:
         return None, None
-    data = json.loads(r.stdout)
+    try:
+        data = json.loads(r.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None, None
     return data.get("tagName", ""), data.get("url", "")
+
+
+# 更新检查固定访问 GitHub 官方 API，域名白名单
+_UPDATE_API_HOST = "https://api.github.com/"
+_ALLOWED_HOST = "api.github.com"
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """禁止跟随重定向，避免被跳转到非白名单地址。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _validate_api_url(url):
+    """校验更新检测地址：仅 HTTPS + 官方域名 + 解析结果必须为公网 IP。"""
+    parts = urlsplit(url)
+    if parts.scheme != "https":
+        raise RuntimeError("非法的更新检测地址：仅允许 HTTPS")
+    if parts.hostname != _ALLOWED_HOST:
+        raise RuntimeError("非法的更新检测地址：域名不在白名单")
+    # 解析并阻断私网 / 环回 / 链路本地地址（防 DNS rebinding 指向内网）
+    infos = socket.getaddrinfo(parts.hostname, 443, type=socket.SOCK_STREAM)
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if not ip.is_global:
+            raise RuntimeError("更新检测地址解析到非公网 IP，已拒绝")
 
 
 def _fetch_via_http():
     """通过 HTTP 直连 GitHub API 获取（海外可用）。"""
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github.v3+json"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    url = _UPDATE_API_HOST + "repos/" + GITHUB_REPO + "/releases/latest"
+    _validate_api_url(url)
+    req = urllib.request.Request(
+        url, headers={"Accept": "application/vnd.github.v3+json"})
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+    with opener.open(req, timeout=10) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     return data.get("tag_name", ""), data.get("html_url", "")
 
 
 def _fetch_latest_release():
-    """先尝试 gh CLI，失败再 HTTP。"""
+    """先尝试 gh CLI，失败（未安装/超时/出错）再 HTTP。"""
     tag, url = _fetch_via_gh()
     if tag:
         return tag, url
     tag, url = _fetch_via_http()
     if tag:
         return tag, url
-    raise RuntimeError("无法获取版本信息")
+    raise RuntimeError("无法获取版本信息（gh CLI 与 GitHub API 均不可用）")
 
 
 def check_update():

@@ -53,9 +53,7 @@ class FlatCheckBox(QCheckBox):
         fm = self.fontMetrics()
         w = fm.horizontalAdvance(self.text()) + 28
         return QSize(w, 28)
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QKeySequence, QKeyEvent
-from PySide6.QtWidgets import QLineEdit
+
 
 _MODIFIER_MAP = {
     Qt.Key.Key_Control: "ctrl",
@@ -87,7 +85,9 @@ class HotKeyInput(QLineEdit):
     def __init__(self, initial="", parent=None):
         super().__init__(parent)
         self.setReadOnly(True)
-        self._keys = []
+        # _keys 必须与初始值同步，否则 value() 会返回空、保存时清空快捷键
+        self._keys = [p.strip().lower() for p in initial.split("+") if p.strip()] \
+            if initial else []
         self._modifiers = set()
         self._capturing = False
         self.setMinimumWidth(200)
@@ -120,6 +120,11 @@ class HotKeyInput(QLineEdit):
             self.setText(" + ".join(sorted(self._modifiers)) + " + …")
             return
 
+        # 录入过程中按 ESC 取消，恢复原值
+        if key == Qt.Key.Key_Escape and not self._modifiers:
+            self._cancel_capture()
+            return
+
         # 忽略单独按下修饰键
         if key in (0, Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Meta):
             return
@@ -141,6 +146,18 @@ class HotKeyInput(QLineEdit):
         self.setText(self._format(result))
         self.setStyleSheet("")
         self.hotkeyChanged.emit(result)
+
+    def _cancel_capture(self):
+        """取消录入，恢复显示原快捷键。"""
+        self._capturing = False
+        self._modifiers.clear()
+        self.setText(self._format("+".join(self._keys)))
+        self.setStyleSheet("")
+
+    def focusOutEvent(self, event):
+        if self._capturing:
+            self._cancel_capture()
+        super().focusOutEvent(event)
 
     def keyReleaseEvent(self, event):
         super().keyReleaseEvent(event)

@@ -5,11 +5,6 @@ import os
 import subprocess
 import sys
 
-try:
-    import torch
-except (OSError, ModuleNotFoundError):
-    pass
-
 
 def check_engine_available(engine):
     """检查指定OCR引擎是否可用"""
@@ -188,9 +183,16 @@ class EasyOCRRecognizer:
     def _init_reader(self):
         if self.reader is None:
             import easyocr
+            # 仅在有 CUDA 时启用 GPU，否则无显卡机器会直接报错
+            try:
+                import torch
+                use_gpu = torch.cuda.is_available()
+            except Exception:
+                use_gpu = False
             if not self.model_exists:
                 print("EasyOCR: 开始下载模型文件...")
-            self.reader = easyocr.Reader(self.languages, gpu=True, download_enabled=True)
+            self.reader = easyocr.Reader(self.languages, gpu=use_gpu,
+                                          download_enabled=True)
             if not self.model_exists:
                 print("EasyOCR: 模型下载完成！")
                 self.model_exists = True

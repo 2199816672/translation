@@ -3,6 +3,7 @@
 """
 import os
 import json
+from pathlib import Path
 
 # 项目根目录
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -27,6 +28,7 @@ TRANSLATE_TARGET_LANG = 'zh-CN'  # 目标语言：中文
 # 支持的目标语言
 SUPPORTED_TARGET_LANGS = {
     '中文': 'zh-CN',
+    '中文(繁体)': 'zh-TW',
     '英文': 'en',
     '日文': 'ja',
     '韩文': 'ko',
@@ -40,6 +42,7 @@ SUPPORTED_TARGET_LANGS = {
 SUPPORTED_SOURCE_LANGS = {
     '自动检测': 'auto',
     '中文': 'zh-CN',
+    '中文(繁体)': 'zh-TW',
     '英文': 'en',
     '日文': 'ja',
     '韩文': 'ko',
@@ -86,15 +89,19 @@ def load_user_config():
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 return json.load(f)
-        except:
+        except (json.JSONDecodeError, OSError, ValueError):
             return {}
     return {}
 
 def save_user_config(config):
-    """保存用户配置"""
+    """保存用户配置（路径固定为程序目录下的 user_config.json）。"""
+    path = Path(CONFIG_FILE).resolve()
+    if path.parent != Path(BASE_DIR).resolve():
+        raise RuntimeError("非法的配置路径")
     try:
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
+        path.write_text(
+            json.dumps(config, ensure_ascii=False, indent=2),
+            encoding='utf-8')
         return True
     except Exception as e:
         print(f"保存配置失败: {e}")
@@ -103,7 +110,7 @@ def save_user_config(config):
 # 加载保存的配置
 user_config = load_user_config()
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 BILIBILI_DYNAMIC_URL = "https://space.bilibili.com/382966397/dynamic"
 GITHUB_REPO = "2199816672/translation"
 

@@ -150,6 +150,7 @@ class HomePage(QWidget):
         self.src_lang_combo.addItems(list(SUPPORTED_SOURCE_LANGS.keys()))
         self.src_lang_combo.setCurrentText("自动检测")
         self.src_lang_combo.setMinimumWidth(100)
+        self.src_lang_combo.setMaxVisibleItems(6)  # 最多显示 6 项，超出滚动
         layout.addWidget(self.src_lang_combo)
 
         lang_label = QLabel("翻译到:", self)
@@ -160,6 +161,7 @@ class HomePage(QWidget):
         self.lang_combo.addItems(list(SUPPORTED_TARGET_LANGS.keys()))
         self.lang_combo.setCurrentText("中文")
         self.lang_combo.setMinimumWidth(100)
+        self.lang_combo.setMaxVisibleItems(6)  # 最多显示 6 项，超出滚动
         layout.addWidget(self.lang_combo)
 
         self.extract_btn = self._btn("提取文字")

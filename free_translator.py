@@ -3,6 +3,8 @@
 - BingFreeTranslator: 逆向 cn.bing.com / 或用 Azure Cognitive Services 密钥
 - MyMemoryFreeTranslator: api.mymemory.translated.net / 或用 API 密钥
 - GoogleFreeTranslator: deep_translator / 或用 Google Cloud API 密钥
+
+失败时直接抛出异常（由 translator.py 统一诊断），绝不把原文当作译文返回。
 """
 import json
 import re
@@ -19,12 +21,12 @@ _HEADERS = {
 }
 
 _LANG_MAP_BING = {
-    "auto": "auto-detect", "zh-CN": "zh-Hans", "en": "en",
+    "auto": "auto-detect", "zh-CN": "zh-Hans", "zh-TW": "zh-Hant", "en": "en",
     "ja": "ja", "ko": "ko", "fr": "fr", "de": "de", "es": "es", "ru": "ru",
 }
 
 _LANG_MAP_MYMEMORY = {
-    "auto": "en", "zh-CN": "zh-CN", "en": "en",
+    "auto": "en", "zh-CN": "zh-CN", "zh-TW": "zh-TW", "en": "en",
     "ja": "ja", "ko": "ko", "fr": "fr", "de": "de", "es": "es", "ru": "ru",
 }
 
@@ -32,6 +34,12 @@ _LANG_MAP_MYMEMORY = {
 def _split_text(text, max_len):
     parts, cur = [], ""
     for line in text.split("\n"):
+        # 单行超长时按字符硬切分，否则 API 会拒绝请求
+        while len(line) + (1 if cur else 0) > max_len:
+            room = max_len - len(cur) - 1 if cur else max_len
+            parts.append(cur + "\n" + line[:room] if cur else line[:room])
+            line = line[room:]
+            cur = ""
         if len(cur) + len(line) + 1 > max_len:
             if cur:
                 parts.append(cur)
@@ -104,20 +112,17 @@ class BingFreeTranslator:
             headers["Ocp-Apim-Subscription-Region"] = self.region
         results = []
         for chunk in _split_text(text, self.MAX_LEN):
-            try:
-                resp = requests.post(
-                    url, headers=headers,
-                    json=[{"Text": chunk}],
-                    timeout=15,
-                )
-                resp.raise_for_status()
-                body = resp.json()
-                if body and "translations" in body[0]:
-                    results.append(body[0]["translations"][0]["text"])
-                else:
-                    results.append(chunk)
-            except Exception:
-                results.append(chunk)
+            resp = requests.post(
+                url, headers=headers,
+                json=[{"Text": chunk}],
+                timeout=15,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            if body and "translations" in body[0]:
+                results.append(body[0]["translations"][0]["text"])
+            else:
+                raise RuntimeError("Azure 翻译返回异常")
         return "\n".join(results)
 
     def _translate_reverse(self, text, from_lang, to_lang):
@@ -126,32 +131,29 @@ class BingFreeTranslator:
         bing_to = _LANG_MAP_BING.get(to_lang, "zh-Hans")
         results = []
         for chunk in _split_text(text, self.MAX_LEN):
-            try:
-                url = (
-                    f"https://{self._subdomain}.bing.com/ttranslatev3?isVertical=1"
-                    f"&IG={self._ig}&IID={self._iid}"
-                )
-                resp = self.session.post(
-                    url,
-                    data={
-                        "fromLang": bing_from, "to": bing_to,
-                        "text": chunk,
-                        "token": self._token, "key": self._key,
-                    },
-                    headers={
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "Referer": f"https://{self._subdomain}.bing.com/translator",
-                    },
-                    timeout=15,
-                )
-                resp.raise_for_status()
-                body = resp.json()
-                if "translations" in body[0]:
-                    results.append(body[0]["translations"][0]["text"])
-                else:
-                    results.append(chunk)
-            except Exception:
-                results.append(chunk)
+            url = (
+                f"https://{self._subdomain}.bing.com/ttranslatev3?isVertical=1"
+                f"&IG={self._ig}&IID={self._iid}"
+            )
+            resp = self.session.post(
+                url,
+                data={
+                    "fromLang": bing_from, "to": bing_to,
+                    "text": chunk,
+                    "token": self._token, "key": self._key,
+                },
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": f"https://{self._subdomain}.bing.com/translator",
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            if body and "translations" in body[0]:
+                results.append(body[0]["translations"][0]["text"])
+            else:
+                raise RuntimeError("必应翻译返回异常，可能是接口临时不可用")
         return "\n".join(results)
 
 
@@ -166,29 +168,26 @@ class MyMemoryFreeTranslator:
     def translate(self, text, from_lang="auto", to_lang="zh-CN"):
         if not text or not text.strip():
             return ""
-        src = _LANG_MAP_MYMEMORY.get(from_lang, "auto")
+        src = _LANG_MAP_MYMEMORY.get(from_lang, "en")
         results = []
         for chunk in _split_text(text, self.MAX_LEN):
-            try:
-                params = {
-                    "q": chunk,
-                    "langpair": f"{src}|{to_lang}",
-                }
-                if self.api_key:
-                    params["de"] = self.api_key
-                resp = requests.get(
-                    "https://api.mymemory.translated.net/get",
-                    params=params, timeout=15,
-                )
-                resp.raise_for_status()
-                body = resp.json()
-                translated = body.get("responseData", {}).get("translatedText", "")
-                if translated:
-                    results.append(translated)
-                else:
-                    results.append(chunk)
-            except Exception:
-                results.append(chunk)
+            params = {
+                "q": chunk,
+                "langpair": f"{src}|{to_lang}",
+            }
+            if self.api_key:
+                params["key"] = self.api_key
+            resp = requests.get(
+                "https://api.mymemory.translated.net/get",
+                params=params, timeout=15,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            translated = body.get("responseData", {}).get("translatedText", "")
+            if translated:
+                results.append(translated)
+            else:
+                raise RuntimeError("MyMemory 返回空结果")
         return "\n".join(results)
 
 
@@ -213,23 +212,20 @@ class GoogleFreeTranslator:
         url = "https://translation.googleapis.com/language/translate/v2"
         results = []
         for chunk in _split_text(text, self.MAX_LEN):
-            try:
-                resp = requests.post(
-                    url,
-                    params={"key": self.api_key},
-                    json={"q": chunk, "target": to_lang, "source": source} if source
-                         else {"q": chunk, "target": to_lang},
-                    timeout=15,
-                )
-                resp.raise_for_status()
-                body = resp.json()
-                data = body.get("data", {}).get("translations", [])
-                if data:
-                    results.append(data[0].get("translatedText", chunk))
-                else:
-                    results.append(chunk)
-            except Exception:
-                results.append(chunk)
+            resp = requests.post(
+                url,
+                params={"key": self.api_key},
+                json={"q": chunk, "target": to_lang, "source": source} if source
+                     else {"q": chunk, "target": to_lang},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            data = body.get("data", {}).get("translations", [])
+            if data:
+                results.append(data[0].get("translatedText", chunk))
+            else:
+                raise RuntimeError("Google Cloud 翻译返回空结果")
         return "\n".join(results)
 
     def _translate_free(self, text, from_lang, to_lang):
@@ -240,10 +236,7 @@ class GoogleFreeTranslator:
             translator = GoogleTranslator(source=source, target=to_lang)
             results = []
             for chunk in _split_text(text, self.MAX_LEN):
-                try:
-                    results.append(translator.translate(chunk))
-                except Exception:
-                    results.append(chunk)
+                results.append(translator.translate(chunk))
             return "\n".join(results)
         except Exception:
             fallback = MyMemoryFreeTranslator()

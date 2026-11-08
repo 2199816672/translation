@@ -4,7 +4,10 @@ user_config.json
 PROJECT_MEMORY.md
 screenshot_old.py
 screenshots/
+converted/
 dist/
 build/
 *.spec
 *.zip
+.mimosa/
+.zcode/

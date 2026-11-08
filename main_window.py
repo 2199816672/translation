@@ -11,7 +11,8 @@ from qfluentwidgets import FluentIcon, FluentWindow, InfoBar, InfoBarPosition
 from PySide6.QtWidgets import QSystemTrayIcon, QMenu, QApplication
 
 from config import (
-    OCR_LANGUAGES, SUPPORTED_TARGET_LANGS, SUPPORTED_SOURCE_LANGS, load_user_config,
+    OCR_LANGUAGES, OCR_ENGINE, SUPPORTED_TARGET_LANGS, SUPPORTED_SOURCE_LANGS,
+    load_user_config,
 )
 from ocr_recognizer import get_ocr_instance, check_engine_available
 from translator import get_translator_instance, TranslationError
@@ -61,8 +62,11 @@ class MainWindow(FluentWindow):
     _sig_ocr_done = Signal(str, str)
     _sig_trans_done = Signal(str)
     _sig_doc_trans_done = Signal(str)
-    _sig_overlay_trans_done = Signal(list)
+    _sig_doc_sub_trans_done = Signal(list)
+    _sig_doc_sub_progress = Signal(int, int)
+    _sig_overlay_trans_done = Signal(list, int)
     _sig_status = Signal(str, str)
+    _sig_error = Signal(str)
 
     def __init__(self, start_minimized=False):
         super().__init__()
@@ -71,6 +75,7 @@ class MainWindow(FluentWindow):
         self.translator = get_translator_instance()
         self._overlay = None
         self._ocr_target = None
+        self._overlay_ocr_text = ""
         self._last_trans_text = ""
         self._last_trans_result = ""
 
@@ -79,7 +84,7 @@ class MainWindow(FluentWindow):
         self.settings = SettingsPage(self)
 
         self.addSubInterface(self.home, FluentIcon.GAME, "翻译")
-        self.addSubInterface(self.doc, FluentIcon.DOCUMENT, "文档翻译")
+        self.addSubInterface(self.doc, FluentIcon.DOCUMENT, "文档处理")
         self.addSubInterface(self.settings, FluentIcon.SETTING, "设置")
 
         self.setWindowTitle(APP_NAME)
@@ -104,8 +109,11 @@ class MainWindow(FluentWindow):
         self._sig_ocr_done.connect(self._on_ocr_done)
         self._sig_trans_done.connect(self._on_trans_done)
         self._sig_doc_trans_done.connect(self._on_doc_trans_done)
+        self._sig_doc_sub_trans_done.connect(self._on_doc_sub_trans_done)
+        self._sig_doc_sub_progress.connect(self.doc.set_sub_progress)
         self._sig_overlay_trans_done.connect(self._on_overlay_trans_done)
         self._sig_status.connect(self._on_status)
+        self._sig_error.connect(self._on_error)
 
     def _sync_target_lang(self):
         """从主页语言下拉框同步源语言和目标语言到翻译器。"""
@@ -122,6 +130,13 @@ class MainWindow(FluentWindow):
     def _on_status(self, text, color):
         self.home.set_status(text)
         self.home.status_dot.setStyleSheet(f"color: {color}; font-size: 14px;")
+
+    @Slot(str)
+    def _on_error(self, msg):
+        """后台任务失败：更新状态栏，并清除截图覆盖层上的等待提示。"""
+        self._on_status(msg, "#e5635f")
+        if self._overlay and self._overlay.isVisible():
+            self._overlay.show_error(msg)
 
     def _auto_copy(self, text, stage):
         """根据设置自动复制到剪贴板。stage='ocr' 或 'trans'。"""
@@ -149,6 +164,11 @@ class MainWindow(FluentWindow):
         elif target == "overlay_translate":
             self._overlay_ocr_text = text
             self.home.set_ocr_text(text)
+            if not text.strip():
+                self._on_status("未识别到文字", "#71717a")
+                if self._overlay and self._overlay.isVisible():
+                    self._overlay.show_error("未识别到文字")
+                return
             self._on_status("识别完成，正在翻译...", "#eab308")
             self._do_translate_overlay(text)
         elif target == "home":
@@ -161,6 +181,7 @@ class MainWindow(FluentWindow):
                 self._on_status("未识别到文字", "#71717a")
         elif target == "home_extract":
             self.home.set_ocr_text(text)
+            self._auto_copy(text, "ocr")
             self._on_status("识别完成" if text.strip() else "未识别到文字",
                             "#4ade80" if text.strip() else "#71717a")
 
@@ -178,9 +199,9 @@ class MainWindow(FluentWindow):
     # ── OCR 初始化 ──────────────────────────────────────────
 
     def _init_ocr_async(self):
-        engine = self.cfg.get("ocr_engine", "paddle")
+        engine = self.cfg.get("ocr_engine", OCR_ENGINE)
         if not check_engine_available(engine):
-            for fallback in ["easy", "windows"]:
+            for fallback in ["windows", "easy"]:
                 if fallback != engine and check_engine_available(fallback):
                     self._on_status(f"OCR引擎未安装，已切换到备用引擎", "#eab308")
                     engine = fallback
@@ -200,7 +221,7 @@ class MainWindow(FluentWindow):
     # ── 快捷键 ──────────────────────────────────────────────
 
     def _setup_hotkey(self):
-        hotkey = self.cfg.get("hotkey", "ctrl+shift+a")
+        hotkey = self.cfg.get("hotkey") or "ctrl+shift+a"
         try:
             import keyboard
             keyboard.add_hotkey(hotkey, lambda: self.home.screenshotRequested.emit())
@@ -372,7 +393,7 @@ class MainWindow(FluentWindow):
                 self._sig_ocr_done.emit(text, target)
             except Exception as e:
                 msg = str(e)
-                self._sig_status.emit(msg, "#e5635f")
+                self._sig_error.emit(msg)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -381,7 +402,7 @@ class MainWindow(FluentWindow):
             paras = [p.strip() for p in self._last_trans_result.split("\n\n") if p.strip()]
             if not paras:
                 paras = [self._last_trans_result]
-            self._sig_overlay_trans_done.emit(paras)
+            self._sig_overlay_trans_done.emit(paras, 0)
             return
         self._on_status("正在翻译...", "#eab308")
         self._sync_target_lang()
@@ -392,30 +413,37 @@ class MainWindow(FluentWindow):
                 if not paras:
                     paras = [text.strip()] if text.strip() else []
                 results = []
+                failed = 0
                 for para in paras:
                     try:
                         tr = self.translator.translate(para)
                         results.append(tr)
                     except Exception:
+                        failed += 1
                         results.append(para)
+                if paras and failed == len(paras):
+                    raise TranslationError(
+                        "全部段落翻译失败，请检查网络或更换翻译API")
                 self._last_trans_text = text
                 self._last_trans_result = "\n\n".join(results)
-                self._sig_overlay_trans_done.emit(results)
+                self._sig_overlay_trans_done.emit(results, failed)
             except TranslationError as e:
-                self._sig_status.emit(str(e), "#e5635f")
+                self._sig_error.emit(str(e))
             except Exception as e:
-                self._sig_status.emit(f"翻译失败: {e}", "#e5635f")
+                self._sig_error.emit(f"翻译失败: {e}")
 
         threading.Thread(target=run, daemon=True).start()
 
-    @Slot(list)
-    def _on_overlay_trans_done(self, paragraphs):
+    @Slot(list, int)
+    def _on_overlay_trans_done(self, paragraphs, failed=0):
         if self._overlay and self._overlay.isVisible():
             self._overlay.show_trans_paragraphs(paragraphs, self._overlay_ocr_text)
         full_text = "\n\n".join(paragraphs)
         self.home.set_trans_text(full_text)
-        if paragraphs:
+        if paragraphs and failed == 0:
             self._on_status("翻译完成", "#4ade80")
+        elif paragraphs and failed:
+            self._on_status(f"翻译完成（{failed} 个段落失败，已保留原文）", "#eab308")
         else:
             self._on_status("翻译结果为空，请检查网络或更换翻译API", "#eab308")
         self._auto_copy(full_text, "trans")
@@ -425,16 +453,14 @@ class MainWindow(FluentWindow):
     @Slot()
     def _start_fullscreen(self):
         self._on_status("正在全屏截图...", "#eab308")
-
-        def capture():
-            path = FullscreenCapture.capture()
-            if path:
-                self.home.set_image(path)
-                self._do_ocr_home(path)
-            else:
-                self._sig_status.emit("截图失败", "#e5635f")
-
-        threading.Thread(target=capture, daemon=True).start()
+        # grabWindow/剪贴板属于 Qt GUI 调用，必须在主线程执行（很快，不卡界面）；
+        # 后续 OCR 由 _do_ocr_home 在后台线程完成
+        path = FullscreenCapture.capture()
+        if not path:
+            self._on_status("截图失败", "#e5635f")
+            return
+        self.home.set_image(path)
+        self._do_ocr_home(path)
 
     # ── 主页 OCR + 翻译 ────────────────────────────────────
 
@@ -449,7 +475,7 @@ class MainWindow(FluentWindow):
                 text = self.ocr.recognize(image_path)
                 self._sig_ocr_done.emit(text, target)
             except Exception as e:
-                self._sig_status.emit(str(e), "#e5635f")
+                self._sig_error.emit(str(e))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -467,9 +493,9 @@ class MainWindow(FluentWindow):
                 self._last_trans_result = result
                 self._sig_trans_done.emit(result)
             except TranslationError as e:
-                self._sig_status.emit(str(e), "#e5635f")
+                self._sig_error.emit(str(e))
             except Exception as e:
-                self._sig_status.emit(f"翻译失败: {e}", "#e5635f")
+                self._sig_error.emit(f"翻译失败: {e}")
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -498,16 +524,60 @@ class MainWindow(FluentWindow):
         lang_code = SUPPORTED_TARGET_LANGS.get(combo_text, "zh-CN")
         self.translator.set_target_lang(lang_code)
 
+        entries = getattr(self.doc, "subtitle_entries", None)
+        if entries:
+            self._translate_subtitle_entries(entries)
+            return
+
         def run():
             try:
                 result = self.translator.translate(text)
                 self._sig_doc_trans_done.emit(result)
             except TranslationError as e:
-                self._sig_status.emit(str(e), "#e5635f")
+                self._sig_error.emit(str(e))
             except Exception as e:
-                self._sig_status.emit(f"翻译失败: {e}", "#e5635f")
+                self._sig_error.emit(f"翻译失败: {e}")
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _translate_subtitle_entries(self, entries):
+        """字幕逐条翻译：保留时间轴，失败条目保留原文。"""
+        def run():
+            total = len(entries)
+            translated = []
+            failed = 0
+            last_error = ""
+            for i, e in enumerate(entries, 1):
+                line = e.get('text', '')
+                out = line
+                if line.strip():
+                    try:
+                        out = self.translator.translate(line)
+                    except Exception as ex:
+                        failed += 1
+                        last_error = str(ex)
+                    out = out if out is not None else line
+                translated.append({
+                    'start': e['start'], 'end': e['end'], 'text': out,
+                })
+                if i % 5 == 0 or i == total:
+                    self._sig_doc_sub_progress.emit(i, total)
+            if total and failed == total:
+                self._sig_error.emit(
+                    last_error or "字幕翻译失败，请检查网络或翻译API")
+                return
+            if failed:
+                self._sig_status.emit(
+                    f"字幕翻译完成（{failed}/{total} 条失败，已保留原文）",
+                    "#eab308")
+            self._sig_doc_sub_trans_done.emit(translated)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    @Slot(list)
+    def _on_doc_sub_trans_done(self, entries):
+        self.doc.set_translated_subtitle(entries)
+        self._auto_copy(self.doc.trans_text.toPlainText(), "trans")
 
     @Slot(str)
     def _on_doc_trans_done(self, text):
@@ -516,11 +586,11 @@ class MainWindow(FluentWindow):
 
     @Slot()
     def _on_settings_saved(self):
-        old_hotkey = self.cfg.get("hotkey", "ctrl+shift+a")
-        old_engine = self.cfg.get("ocr_engine", "paddle")
+        old_hotkey = self.cfg.get("hotkey") or "ctrl+shift+a"
+        old_engine = self.cfg.get("ocr_engine", OCR_ENGINE)
         self.cfg = load_user_config()
-        new_hotkey = self.cfg.get("hotkey", "ctrl+shift+a")
-        new_engine = self.cfg.get("ocr_engine", "paddle")
+        new_hotkey = self.cfg.get("hotkey") or "ctrl+shift+a"
+        new_engine = self.cfg.get("ocr_engine", OCR_ENGINE)
         if old_hotkey != new_hotkey:
             try:
                 import keyboard

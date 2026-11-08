@@ -15,9 +15,15 @@ SUPPORTED_EXTENSIONS = {
     '.jpeg': '图片',
     '.bmp': '图片',
     '.gif': '图片',
+    '.srt': 'SRT 字幕',
+    '.vtt': 'WebVTT 字幕',
+    '.ass': 'ASS 字幕',
+    '.ssa': 'SSA 字幕',
+    '.lrc': 'LRC 歌词',
 }
 
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.gif'}
+SUBTITLE_EXTENSIONS = {'.srt', '.vtt', '.ass', '.ssa', '.lrc'}
 
 
 def get_file_type(path):
@@ -43,6 +49,8 @@ def parse_file(path):
         return _parse_xlsx(path)
     elif ext in IMAGE_EXTENSIONS:
         return _parse_image(path)
+    elif ext in SUBTITLE_EXTENSIONS:
+        return _parse_subtitle(path)
     else:
         raise ValueError(f"不支持的文件格式: {ext}")
 
@@ -130,6 +138,15 @@ def _parse_image(path):
         return ocr.recognize(path)
     except Exception as e:
         raise RuntimeError(f"图片 OCR 识别失败: {e}")
+
+
+def _parse_subtitle(path):
+    """字幕文件 -> 每条一行的纯文本（供翻译与预览）。"""
+    from subtitle import parse_subtitle, subtitle_to_plain_text
+    entries = parse_subtitle(path)
+    if not entries:
+        raise RuntimeError("字幕文件没有可用的条目")
+    return subtitle_to_plain_text(entries)
 
 
 def format_file_size(size_bytes):
