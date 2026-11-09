@@ -1,40 +1,116 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""应用入口：Fluent 暗色主题、创建主窗口并进入事件循环。"""
+"""应用入口：暗色主题、单实例、创建主窗口并进入事件循环。
+
+一键升级的关键在这里：安装包必须等 GUI 事件循环完全退出后才启动，否则
+Inno Setup 的 CloseApplications 会和仍在运行的旧 exe 抢文件。
+"""
 import os
 import sys
 
 
+def _acquire_single_instance():
+    """避免多开导致全局热键重复注册、user_config.json 互相覆盖。"""
+    from PySide6.QtCore import QLockFile
+    global _instance_lock
+    try:
+        lock = QLockFile(os.path.join(
+            os.environ.get("TEMP", os.path.expanduser("~")),
+            "TranslationTool.lock"))
+        # 使用默认过期策略：崩溃残留的锁不会永久阻止启动
+        if lock.tryLock(0):
+            _instance_lock = lock
+            return True
+        return False
+    except Exception:
+        return True
+
+
+_instance_lock = None
+
+
 def run():
-    from PySide6.QtWidgets import QApplication
+    smoke = "--smoke-test" in sys.argv
+    from PySide6.QtWidgets import QApplication, QMessageBox
     from PySide6.QtGui import QIcon
-    from PySide6.QtCore import QSize
 
     from theme import apply_theme
+    from app_paths import resource_path
 
     try:
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("trans.screenshot.translator")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "trans.screenshot.translator")
     except Exception:
         pass
 
     app = QApplication.instance() or QApplication(sys.argv)
+    # 托盘常驻：仅当显式 quit() 才退出，避免主窗口隐藏/销毁后 app 自动退出
+    app.setQuitOnLastWindowClosed(False)
 
-    # 加载应用图标
-    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "app_icon.png")
-    if os.path.exists(icon_path):
-        app_icon = QIcon(icon_path)
-        app.setWindowIcon(app_icon)
+    if not smoke and not _acquire_single_instance():
+        QMessageBox.information(
+            None, "翻译工具",
+            "翻译工具已经在运行中。\n请检查系统托盘，或先关闭已有窗口。")
+        return 0
+
+    icon_path = resource_path("assets/app_icon.png")
+    if icon_path.is_file():
+        app.setWindowIcon(QIcon(str(icon_path)))
 
     start_minimized = "--minimized" in sys.argv
 
-    from main_window import MainWindow
-    window = MainWindow(start_minimized=start_minimized)
-    apply_theme(app, window)
-    if not start_minimized:
+    try:
+        from main_window import MainWindow
+        window = MainWindow(start_minimized=start_minimized)
+        apply_theme(app, window)
+    except Exception as exc:
+        # --windowed 打包后没有控制台，启动失败必须让用户看得见
+        QMessageBox.critical(None, "启动失败",
+                             f"程序初始化失败：{exc}\n\n"
+                             "可尝试重启程序，或重新安装最新版。")
+        return 1
+
+    # 打包自检参数：构造完主窗口就退出并写一份诊断日志，用来验证
+    # 冻结后资源路径 / 依赖 / 配置目录都正确（普通用户不会用到）。
+    if smoke:
+        from PySide6.QtCore import QTimer
+        import tempfile
+        from pathlib import Path
+        import importlib.util
+        try:
+            modules = ["PySide6", "qfluentwidgets", "faster_whisper",
+                       "av", "ctranslate2", "sounddevice", "soundcard",
+                       "winrt", "cv2", "PIL", "docx", "pptx", "fitz"]
+            available = [m for m in modules if importlib.util.find_spec(m)]
+            Path(tempfile.gettempdir(), "TranslationTool-smoke.log").write_text(
+                "OK\n"
+                f"frozen={getattr(sys, 'frozen', False)}\n"
+                f"app_dir={resource_path('assets').parent}\n"
+                f"config={os.path.abspath(__import__('config').CONFIG_FILE)}\n"
+                f"modules={','.join(available)}\n",
+                encoding="utf-8")
+        except Exception as exc:
+            print(f"smoke log failed: {exc}", file=sys.stderr)
+        QTimer.singleShot(1500, app.quit)
+    else:
+        # 先 show 再按需最小化：托盘不可用时窗口必须留在任务栏
         window.show()
-    sys.exit(app.exec())
+
+    ret = app.exec()
+
+    # 应用内升级：GUI 事件循环已退出，此时启动安装包最安全。
+    # /RESTARTAPP=1 由 installer.iss 检测，静默安装完成后自动拉起新版本。
+    try:
+        from updater import consume_pending_install, launch_installer
+        pending = consume_pending_install()
+        if pending:
+            launch_installer(pending, restart=True)
+    except Exception as exc:
+        print(f"启动升级安装包失败: {exc}", file=sys.stderr)
+
+    return ret
 
 
 if __name__ == "__main__":
-    run()
+    sys.exit(run())

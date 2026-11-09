@@ -62,6 +62,7 @@ _GROUPED_EXTS = {'.jpg', '.jpeg', '.bmp', '.gif', '.vtt', '.ass', '.ssa', '.lrc'
 
 class DocPage(QWidget):
     translateRequested = Signal(str)
+    polishRequested = Signal(str, str)  # (kind, text)
     clearRequested = Signal()
     _sig_parse_done = Signal(str)
     _sig_parse_error = Signal(str)
@@ -73,6 +74,8 @@ class DocPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("docPage")
+        # 普通 QWidget 需要显式开启才会绘制 QSS 的 background
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._current_file = None
         self._parsed_text = ""
         self._translated_text = ""
@@ -183,6 +186,13 @@ class DocPage(QWidget):
         self.translate_btn = self._btn("翻译", kind="primary")
         self.translate_btn.clicked.connect(self._on_translate)
         action_bar.addWidget(self.translate_btn)
+
+        self.polish_btn = self._btn("AI 润色", kind="ghost")
+        self.polish_btn.setToolTip(
+            "用 AI 把译文改得更通顺（只改表达，不增删原意）\n"
+            "字幕会逐条润色并保留时间轴；通道在「设置 → AI 润色」选择")
+        self.polish_btn.clicked.connect(self._on_polish)
+        action_bar.addWidget(self.polish_btn)
 
         self.copy_src_btn = self._btn("复制原文")
         self.copy_src_btn.clicked.connect(self._copy_source)
@@ -527,6 +537,28 @@ class DocPage(QWidget):
     def set_sub_progress(self, done, total):
         self.set_status(f"正在逐条翻译字幕 ({done}/{total})...", "#eab308")
 
+    def _on_polish(self):
+        text = self.trans_text.toPlainText().strip()
+        if not text:
+            self.set_status("没有可润色的译文，请先翻译", "#71717a")
+            return
+        self.polish_btn.setEnabled(False)
+        self.polish_btn.setText("润色中…")
+        self.set_status("AI 润色中…", "#eab308")
+        self.polishRequested.emit("translation", text)
+
+    def set_polished_text(self, text):
+        self._translated_text = text
+        self.trans_text.setPlainText(text)
+        self.polish_btn.setEnabled(True)
+        self.polish_btn.setText("AI 润色")
+        self.set_status("AI 润色完成", "#4ade80")
+        self._maybe_export()
+
+    def finish_polish(self):
+        self.polish_btn.setEnabled(True)
+        self.polish_btn.setText("AI 润色")
+
     def set_translated_text(self, text):
         self._translated_text = text
         self.trans_text.setPlainText(text)
@@ -541,6 +573,8 @@ class DocPage(QWidget):
         text = "\n".join(e['text'].replace('\n', ' ') for e in entries)
         self._translated_text = text
         self.trans_text.setPlainText(text)
+        self.polish_btn.setEnabled(True)
+        self.polish_btn.setText("AI 润色")
         self.set_status(f"字幕翻译完成（{len(entries)} 条，已保留时间轴）", "#4ade80")
         self._maybe_export()
 

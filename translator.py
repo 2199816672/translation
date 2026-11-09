@@ -5,6 +5,7 @@ from deep_translator import DeeplTranslator, BaiduTranslator
 from deep_translator.exceptions import RequestError
 import sys
 import os
+import re
 import hashlib
 import hmac
 import time
@@ -169,7 +170,10 @@ class VolcengineTranslator:
         if "data" in body and "translations" in body["data"]:
             translations = body["data"]["translations"]
             if translations:
-                return translations[0].get("text", text)
+                trans = (translations[0] or {}).get("text", "")
+                if trans:
+                    return trans
+                raise TranslationError("火山翻译返回空结果")
         if "message" in body:
             raise Exception(f"火山翻译: {body['message']}")
         raise Exception("火山翻译返回异常")
@@ -184,6 +188,7 @@ class Translator:
         self._free_engine = None
         self._free_api_key = ''
 
+        self._free_region = ''
         self.deepl_lang_map = {
             'zh-CN': 'ZH', 'zh-TW': 'ZH', 'en': 'EN-US', 'ja': 'JA', 'ko': 'KO',
             'fr': 'FR', 'de': 'DE', 'es': 'ES', 'ru': 'RU',
@@ -199,6 +204,9 @@ class Translator:
                 # 获取用户可能填写的 API key
                 key_field = FREE_API_KEY_FIELDS.get(self.api_type)
                 user_key = user_config.get(key_field, '') if key_field else ''
+                # Azure 区域仅对 bing_free + 密钥（Azure）生效
+                self._free_region = user_config.get(
+                    'bing_azure_region', '') if self.api_type == 'bing_free' else ''
                 invalidate_free_translator(self.api_type)
                 self._free_engine = self.api_type
                 self._free_api_key = user_key
@@ -207,7 +215,12 @@ class Translator:
                 target = self.deepl_lang_map.get(self.target_lang, 'ZH')
                 api_key = user_config.get('deepl_api_key', '')
                 if api_key:
-                    self.translator = DeeplTranslator(api_key=api_key, target=target)
+                    # DeepL 免费版密钥（通常以 :fx 结尾）必须走免费端点，否则 403
+                    use_free = api_key.rstrip().endswith(':fx') or bool(
+                        user_config.get('deepl_use_free_api'))
+                    self.translator = DeeplTranslator(
+                        api_key=api_key, target=target,
+                        use_free_api=bool(use_free))
                 else:
                     self._free_engine = 'bing_free'
                     self._free_api_key = ''
@@ -258,10 +271,45 @@ class Translator:
 
         return self._translate_paid(text)
 
+    def translate_paragraph(self, paragraph):
+        """整段翻译：段内的硬换行先合并，过长时按句末标点分块再拼接。
+
+        相比逐行翻译，整段保留句子上下文，译文更通顺；分块保证不超出
+        免费接口的长度限制。
+        """
+        from text_segment import chunk_text, flatten_text
+
+        joined = flatten_text(paragraph)
+        chunks = chunk_text(joined)
+        if not chunks:
+            return ""
+        joiner = "" if str(self.target_lang).startswith(("zh", "ja", "ko")) else " "
+        results = []
+        for chunk in chunks:
+            translated = self.translate(chunk)
+            if translated:
+                results.append(translated.strip())
+        return joiner.join(results)
+
+    def translate_document(self, text):
+        """按自然段翻译整篇文本，保持原文的空行 / 单换行结构。"""
+        from text_segment import split_paragraphs
+
+        if not text or not text.strip():
+            return ""
+        paragraphs = split_paragraphs(text)
+        if not paragraphs:
+            return ""
+        # 原文用空行分段就还它空行，否则保持单换行，避免排版被改乱
+        separator = "\n\n" if re.search(r"\n\s*\n", text) else "\n"
+        return separator.join(self.translate_paragraph(p) for p in paragraphs)
+
     def _translate_free(self, text):
-        free_t = get_free_translator(self._free_engine, api_key=self._free_api_key)
+        free_t = get_free_translator(
+            self._free_engine, api_key=self._free_api_key,
+            region=self._free_region)
         if not free_t:
-            return text
+            raise TranslationError("翻译引擎初始化失败，请检查网络或 API 设置")
         paragraphs = text.split('\n')
         results = []
         for p in paragraphs:

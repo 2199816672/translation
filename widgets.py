@@ -5,6 +5,8 @@ from PySide6.QtCore import Qt, QRect, QRectF, QSize, Signal
 from PySide6.QtGui import QKeySequence, QKeyEvent, QPainter, QColor, QPen
 from PySide6.QtWidgets import QLineEdit, QCheckBox, QSizePolicy
 
+from theme import Palette
+
 
 class FlatCheckBox(QCheckBox):
     """带 √ 的扁平复选框，不依赖 QSS indicator。"""
@@ -23,26 +25,34 @@ class FlatCheckBox(QCheckBox):
         y = (self.height() - size) // 2
         indicator = QRect(0, y, size, size)
 
-        # 背景 + 边框
-        if self.isChecked():
+        pal = Palette
+        enabled = self.isEnabled()
+        # 背景 + 边框（禁用态与可用态区分开，避免误点）
+        if not enabled:
+            p.setPen(QPen(QColor(pal.TEXT_DISABLED), 1))
+            p.setBrush(QColor(pal.SURFACE))
+            p.drawRoundedRect(QRectF(indicator), 3.5, 3.5)
+            p.setPen(QColor(pal.TEXT_DISABLED))
+        elif self.isChecked():
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor("#3b82f6"))
+            p.setBrush(QColor(pal.ACCENT))
             p.drawRoundedRect(QRectF(indicator), 3.5, 3.5)
             # 画 √
-            pen = QPen(QColor("#ffffff"), 2.0, Qt.PenStyle.SolidLine,
+            pen = QPen(QColor(pal.PRIMARY_TEXT), 2.0, Qt.PenStyle.SolidLine,
                        Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
             p.setPen(pen)
             p.drawLine(indicator.x() + 3, indicator.y() + 8,
                        indicator.x() + 7, indicator.y() + 12)
             p.drawLine(indicator.x() + 7, indicator.y() + 12,
                        indicator.x() + 13, indicator.y() + 4)
+            p.setPen(QColor(pal.TEXT))
         else:
-            p.setPen(QPen(QColor("#52525b"), 1))
-            p.setBrush(QColor("#161618"))
+            p.setPen(QPen(QColor(pal.BORDER_STRONG), 1))
+            p.setBrush(QColor(pal.BG_INPUT))
             p.drawRoundedRect(QRectF(indicator), 3.5, 3.5)
+            p.setPen(QColor(pal.TEXT))
 
         # 文字
-        p.setPen(QColor("#e4e4e7"))
         p.setFont(self.font())
         text_x = indicator.width() + 8
         p.drawText(text_x, 0, self.width() - text_x, self.height(),
@@ -120,9 +130,14 @@ class HotKeyInput(QLineEdit):
             self.setText(" + ".join(sorted(self._modifiers)) + " + …")
             return
 
-        # 录入过程中按 ESC 取消，恢复原值
-        if key == Qt.Key.Key_Escape and not self._modifiers:
+        # 录入过程中按 ESC 取消，恢复原值（带修饰键也要能取消）
+        if key == Qt.Key.Key_Escape:
             self._cancel_capture()
+            return
+
+        # Delete / Backspace 清空该快捷键（默认都是空，用户要能主动清掉）
+        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self.clear_hotkey()
             return
 
         # 忽略单独按下修饰键
@@ -166,8 +181,18 @@ class HotKeyInput(QLineEdit):
         return "+".join(self._keys) if self._keys else ""
 
     def setValue(self, combo):
-        self._keys = combo.split("+") if combo else []
+        self._keys = [p.strip().lower() for p in combo.split("+")
+                      if p.strip()] if combo else []
         self.setText(self._format(combo))
+
+    def clear_hotkey(self):
+        """清空快捷键（支持点击右侧「清除」按钮或录入时按 Delete）。"""
+        self._capturing = False
+        self._modifiers.clear()
+        self._keys = []
+        self.setText("")
+        self.setStyleSheet("")
+        self.hotkeyChanged.emit("")
 
     def _format(self, combo):
         if not combo:

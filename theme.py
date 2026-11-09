@@ -8,18 +8,21 @@
 """
 from pathlib import Path
 
+from app_paths import resource_path
+
 
 class Palette:
     # 画布 / 表面（近黑中性灰，zinc 系）
     BG = "#0b0b0d"
-    BG_INPUT = "#161618"
+    BG_INPUT = "#202027"
     SURFACE = "#161618"
     SURFACE_HOVER = "#202024"
     SELECTION = "#2e2e33"
-    BORDER = "#2a2a2e"
-    BORDER_STRONG = "#3f3f46"
-    BORDER_SOFT = "#1b1b1e"
-    FOCUS = "#52525b"
+    # 边框色提亮：卡片与输入框在深色背景上要能明显看出轮廓
+    BORDER = "#4a4a55"
+    BORDER_STRONG = "#676775"
+    BORDER_SOFT = "#26262c"
+    FOCUS = "#8a8a9a"
     # 文本
     TEXT = "#e4e4e7"
     TEXT_STRONG = "#fafafa"
@@ -58,7 +61,9 @@ _FONT = ", ".join(f"'{f}'" for f in FONT_FAMILIES) + ", sans-serif"
 
 def build_stylesheet() -> str:
     p = Palette
-    _check_svg = str(Path(__file__).parent / "assets" / "check.svg").replace("\\", "/")
+    _assets = resource_path("assets")
+    _check_svg = str(_assets / "check.svg").replace("\\", "/")
+    _chevron_svg = str(_assets / "chevron-down.svg").replace("\\", "/")
     return f"""
 * {{
     font-family: {_FONT};
@@ -76,8 +81,14 @@ QToolTip {{
 }}
 
 /* ---- 内容画布 ---- */
-#homePage, #settingsContainer {{
+#homePage, #docPage, #settingsContainer, #avPage {{
     background: {p.BG};
+}}
+/* 滚动区自身透明，露出页面底色；不要写成实例级 stylesheet，
+   否则会向下传播覆盖所有子控件的主题色 */
+QScrollArea {{
+    background: transparent;
+    border: none;
 }}
 
 /* ---- 卡片 / 分组 ---- */
@@ -85,6 +96,22 @@ QFrame#card {{
     background: {p.SURFACE};
     border: 1px solid {p.BORDER};
     border-radius: 12px;
+}}
+QFrame#card:hover {{
+    border-color: {p.BORDER_STRONG};
+}}
+
+/* ---- 设置页右侧导航栏 ---- */
+QFrame#settingsNav {{
+    background: {p.SURFACE};
+    border: none;
+    border-left: 1px solid {p.BORDER_SOFT};
+}}
+QLabel#navHeader {{
+    color: {p.TEXT_MUTED};
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 1px;
 }}
 
 /* ---- 文本层级 ---- */
@@ -94,6 +121,14 @@ QLabel#fieldLabel {{ color: {p.TEXT}; font-size: 13px; }}
 QLabel#statTitle {{ color: {p.TEXT_MUTED}; font-size: 12px; }}
 QLabel#statValue {{ color: {p.TEXT_STRONG}; font-size: 26px; font-weight: 700; }}
 QLabel#caption {{ color: {p.TEXT_MUTED}; font-size: 12px; }}
+QLabel#recommend {{
+    color: #93c5fd;
+    font-size: 12px;
+    background: rgba(96, 165, 250, 0.10);
+    border: 1px solid rgba(96, 165, 250, 0.28);
+    border-radius: 6px;
+    padding: 4px 8px;
+}}
 QLabel#imagePreview {{
     background: {p.BG_INPUT};
     border: 1px dashed {p.BORDER};
@@ -133,7 +168,7 @@ QPushButton[kind="success"]:hover {{ background: #22c55e; border-color: #22c55e;
 QLineEdit {{
     background: {p.BG_INPUT};
     color: {p.TEXT};
-    border: 1px solid {p.BORDER};
+    border: 1px solid {p.BORDER_STRONG};
     border-radius: 8px;
     padding: 7px 10px;
     selection-background-color: {p.SELECTION};
@@ -144,29 +179,39 @@ QLineEdit:focus {{ border: 1px solid {p.FOCUS}; }}
 QLineEdit:disabled {{ color: {p.TEXT_DISABLED}; }}
 
 /* ---- 下拉框 ---- */
+/* 右侧 padding 给箭头留位，避免长文本压到箭头下；与按钮统一高度 */
 QComboBox {{
     background: {p.BG_INPUT};
     color: {p.TEXT};
-    border: 1px solid {p.BORDER};
+    border: 1px solid {p.BORDER_STRONG};
     border-radius: 8px;
-    padding: 7px 10px;
-    min-height: 20px;
+    padding: 6px 34px 6px 10px;
+    font-size: 14px;
 }}
-QComboBox:hover {{ border-color: {p.BORDER_STRONG}; }}
+QComboBox:hover {{ border-color: {p.FOCUS}; }}
 QComboBox:focus, QComboBox:on {{ border-color: {p.FOCUS}; }}
+QComboBox:disabled {{
+    color: {p.TEXT_DISABLED};
+    border-color: {p.BORDER_SOFT};
+    background: {p.SURFACE};
+}}
 QComboBox::drop-down {{
-    subcontrol-origin: padding;
+    subcontrol-origin: border;
     subcontrol-position: center right;
     border: none;
-    background: {p.BG_INPUT};
+    background: transparent;
     width: 28px;
 }}
+/* Qt 的 QSS 不支持用 transparent 边框画三角形，会渲染成实心白块；改用 SVG。
+   靠右定位交给 ::drop-down，这里只画图标。切勿再给 ::down-arrow 补任何带
+   伪状态的重复规则（例如 :disabled::down-arrow）：Qt 会把那条 image 当作
+   第二个箭头画在框正中央，且正常状态下也会出现「中间大 V + 右侧小 v」。
+   disabled 状态会继承本规则的 image，本来就不需要另写。 */
 QComboBox::down-arrow {{
-    image: none;
-    border-left: 5px solid transparent;
-    border-right: 5px solid transparent;
-    border-top: 6px solid {p.TEXT_MUTED};
-    width: 10px; height: 10px;
+    image: url({_chevron_svg});
+    width: 12px;
+    height: 12px;
+    border: none;
 }}
 QComboBox:on {{
     border: 1px solid {p.FOCUS};
@@ -196,9 +241,8 @@ QComboBox QAbstractItemView {{
 QComboBox QAbstractItemView::item {{
     background: {p.SURFACE};
     color: {p.TEXT};
-    padding: 4px;
+    padding: 5px 8px;
     border: none;
-    min-height: 24px;
 }}
 QComboBox QAbstractItemView::item:selected {{
     background: {p.SELECTION};
@@ -217,15 +261,12 @@ QComboBox QTreeView::item:selected {{
     background: {p.SELECTION};
     color: {p.TEXT_STRONG};
 }}
-QComboBox {{
-    font-size: 14px;
-}}
 
 /* ---- 文本编辑区 ---- */
 QTextEdit {{
     background: {p.BG_INPUT};
     color: {p.TEXT};
-    border: 1px solid {p.BORDER};
+    border: 1px solid {p.BORDER_STRONG};
     border-radius: 8px;
     padding: 8px;
     selection-background-color: {p.SELECTION};
@@ -233,6 +274,21 @@ QTextEdit {{
     font-size: 13px;
 }}
 QTextEdit:focus {{ border: 1px solid {p.FOCUS}; }}
+
+/* ---- 进度条 ---- */
+QProgressBar {{
+    background: {p.BG_INPUT};
+    border: 1px solid {p.BORDER};
+    border-radius: 6px;
+    height: 8px;
+    text-align: center;
+    color: {p.TEXT_MUTED};
+    font-size: 11px;
+}}
+QProgressBar::chunk {{
+    background: {p.PRIMARY};
+    border-radius: 5px;
+}}
 
 /* ---- 滚动条 ---- */
 QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
@@ -255,7 +311,7 @@ QPushButton#segment {{
     background: transparent;
     border: none;
     border-radius: 6px;
-    padding: 6px 18px;
+    padding: 6px 12px;
     color: {p.TEXT_MUTED};
     font-size: 13px;
     min-height: 22px;
@@ -290,6 +346,64 @@ QCheckBox::indicator:checked:hover {{
 """
 
 
+def install_combo_wheel_filter(app) -> None:
+    """全局禁用「鼠标滚轮改变下拉框选项」——滚动页面时极易误触。
+
+    用应用级事件过滤器统一处理，覆盖所有页面 / 浮层里的 QComboBox；
+    下拉列表展开时仍允许滚轮浏览选项，并把外层滚动区的滚动保留下来。
+    """
+    from PySide6.QtCore import QEvent, QObject
+    from PySide6.QtWidgets import (QAbstractScrollArea, QApplication,
+                                  QComboBox)
+
+    class _ComboWheelFilter(QObject):
+        @staticmethod
+        def _combo_of(obj):
+            cur = obj
+            while cur is not None:
+                if isinstance(cur, QComboBox):
+                    return cur
+                cur = cur.parent()
+            return None
+
+        @staticmethod
+        def _scroll_of(widget):
+            cur = widget.parent()
+            while cur is not None:
+                if isinstance(cur, QAbstractScrollArea):
+                    return cur
+                cur = cur.parent()
+            return None
+
+        def eventFilter(self, obj, event):
+            if event.type() != QEvent.Type.Wheel:
+                return False
+            combo = self._combo_of(obj)
+            if combo is None or not combo.isEnabled():
+                return False
+            try:
+                if combo.view() is not None and combo.view().isVisible():
+                    return False    # 展开的列表要能滚
+            except Exception:
+                pass
+            # 滚轮仍然可以滚动外层页面，只是不能改选项
+            scroll = self._scroll_of(combo)
+            if scroll is not None:
+                try:
+                    vp = scroll.viewport()
+                    sb = scroll.verticalScrollBar()
+                    if vp is not None and sb is not None and sb.isVisible():
+                        QApplication.sendEvent(vp, event)
+                except Exception:
+                    pass
+            return True             # 吞掉，绝不让 QComboBox 改值
+
+    if getattr(app, '_combo_wheel_filter', None) is None:
+        filt = _ComboWheelFilter(app)
+        app.installEventFilter(filt)
+        app._combo_wheel_filter = filt   # 保持引用，避免被 GC
+
+
 def apply_theme(app, window=None) -> None:
     """设置默认字体、Fluent 暗色 + 中性主题色，套用扁平 QSS。"""
     from PySide6.QtGui import QFont
@@ -302,6 +416,7 @@ def apply_theme(app, window=None) -> None:
     setTheme(Theme.DARK)
     setThemeColor(Palette.THEME)
     app.setStyleSheet(build_stylesheet())
+    install_combo_wheel_filter(app)
     if window is not None:
         try:
             window.setMicaEffectEnabled(False)

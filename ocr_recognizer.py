@@ -5,6 +5,8 @@ import os
 import subprocess
 import sys
 
+from subprocess_util import check_call_quiet, pip_cmd, popen_quiet
+
 
 def check_engine_available(engine):
     """检查指定OCR引擎是否可用"""
@@ -32,14 +34,18 @@ def install_engine(engine):
     pkg = packages.get(engine)
     if not pkg:
         return False, f"{engine} 无法安装"
+    cmd, hint = pip_cmd(pkg.split())
+    if cmd is None:
+        return False, hint
     try:
-        subprocess.check_call(
-            [sys.executable, '-m', 'pip', 'install'] + pkg.split(),
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        )
+        check_call_quiet(cmd, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.PIPE)
         return True, "安装成功"
     except subprocess.CalledProcessError as e:
-        return False, f"安装失败: {e.stderr.decode(errors='ignore')[-200:]}"
+        detail = e.stderr or b""
+        if isinstance(detail, bytes):
+            detail = detail.decode(errors="ignore")
+        return False, f"安装失败: {str(detail)[-200:]}"
 
 
 def install_engine_with_progress(engine, on_progress=None):
@@ -51,11 +57,13 @@ def install_engine_with_progress(engine, on_progress=None):
     pkg = packages.get(engine)
     if not pkg:
         return False, f"{engine} 无法安装"
-    cmd = [sys.executable, '-m', 'pip', 'install'] + pkg.split()
+    cmd, hint = pip_cmd(pkg.split())
+    if cmd is None:
+        return False, hint
     try:
-        proc = subprocess.Popen(
+        proc = popen_quiet(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding='utf-8', errors='replace',
+            text=True,
         )
         last_lines = []
         while True:
@@ -79,26 +87,55 @@ def install_engine_with_progress(engine, on_progress=None):
 # ── Windows 系统 OCR 后端 ─────────────────────────────────────
 
 class WindowsOCRRecognizer:
+    # 用户所选语言（PaddleOCR 命名）→ Windows BCP-47 语言码
+    _LANG_TO_BCP47 = {
+        'ch_sim': 'zh-cn', 'ch_tra': 'zh-hant', 'en': 'en', 'ja': 'ja',
+        'ko': 'ko', 'fr': 'fr', 'de': 'de', 'es': 'es', 'ru': 'ru',
+        'pt': 'pt', 'it': 'it', 'ar': 'ar', 'th': 'th', 'vi': 'vi',
+    }
+
     def __init__(self, languages=None):
         if languages is None:
             languages = ['ch_sim', 'en']
         self.languages = languages
         self._engine = None
+        self._lang_code = ''
         self._init_engine()
 
     def _init_engine(self):
         import winrt.windows.media.ocr as wocr
         import winrt.windows.globalization as wgl
         self._wocr = wocr
-        lang_code = 'zh-cn' if 'ch_sim' in self.languages else 'en'
-        lang = wgl.Language(lang_code)
-        self._engine = wocr.OcrEngine.try_create_from_language(lang)
-        if not self._engine:
-            self._engine = wocr.OcrEngine.try_create_from_language(wgl.Language('zh-cn'))
+
+        # 按用户所选语言，逐一尝试创建对应语言的引擎（日/韩/法等不再退化成英文）
+        codes = []
+        for lang in self.languages or ['ch_sim', 'en']:
+            code = self._LANG_TO_BCP47.get(lang)
+            if code and code not in codes:
+                codes.append(code)
+        if not codes:
+            codes = ['en', 'zh-cn']
+
+        self._engine = None
+        chosen = None
+        for code in codes:
+            eng = wocr.OcrEngine.try_create_from_language(wgl.Language(code))
+            if eng:
+                self._engine = eng
+                chosen = code
+                break
+        # 兜底：连英文/中文都没有（极少见）再尝试一次英文
+        if self._engine is None:
+            eng = wocr.OcrEngine.try_create_from_language(wgl.Language('en'))
+            if eng:
+                self._engine = eng
+                chosen = 'en'
+
         if self._engine:
-            print(f"Windows OCR 已初始化: {lang_code}")
+            self._lang_code = chosen
+            print(f"Windows OCR 已初始化: {chosen}")
         else:
-            print("Windows OCR 初始化失败，语言可能不受支持")
+            print("Windows OCR 初始化失败，语言可能未安装对应语言包")
 
     def recognize(self, image_path):
         if self._engine is None:
@@ -140,6 +177,51 @@ class WindowsOCRRecognizer:
                     parts.append("\n")
                 parts.append(lines_with_y[i][0])
             return '\n'.join(parts)
+        except Exception as e:
+            raise RuntimeError(f"Windows OCR识别失败: {e}\n提示: 请在系统设置中安装对应语言包")
+
+    def recognize_blocks(self, image_path):
+        """返回带位置的行块 [{text,x,y,w,h}]，坐标为传入图片的原图像素。
+
+        与 recognize() 并存：后者保持纯字符串接口，供主页 / 文档解析使用。
+        """
+        if self._engine is None:
+            raise RuntimeError("Windows OCR 引擎未初始化，请检查系统是否安装了对应语言包")
+        try:
+            import winrt.windows.graphics.imaging as wimg
+            import winrt.windows.storage.streams as wss
+            import cv2
+
+            img = cv2.imread(str(image_path))
+            if img is None:
+                raise RuntimeError(f"无法读取图片: {image_path}")
+            ret, buf = cv2.imencode(".png", img)
+            stream = wss.InMemoryRandomAccessStream()
+            stream.write_async(buf.tobytes()).get()
+            stream.seek(0)
+            decoder = wimg.BitmapDecoder.create_async(stream).get()
+            bitmap = decoder.get_software_bitmap_async().get()
+            result = self._engine.recognize_async(bitmap).get()
+            blocks = []
+            for line in result.lines:
+                text = (line.text or "").strip()
+                if not text:
+                    continue
+                words = list(line.words or [])
+                if words:
+                    rects = [w.bounding_rect for w in words]
+                    x = min(r.x for r in rects)
+                    y = min(r.y for r in rects)
+                    x2 = max(r.x + r.width for r in rects)
+                    y2 = max(r.y + r.height for r in rects)
+                else:
+                    x = y = 0.0
+                    x2 = y2 = 1.0
+                blocks.append({"text": text, "x": float(x), "y": float(y),
+                               "w": max(1.0, float(x2 - x)),
+                               "h": max(1.0, float(y2 - y))})
+            blocks.sort(key=lambda b: (b["y"], b["x"]))
+            return blocks
         except Exception as e:
             raise RuntimeError(f"Windows OCR识别失败: {e}\n提示: 请在系统设置中安装对应语言包")
 
@@ -230,6 +312,28 @@ class EasyOCRRecognizer:
             if "model" in msg.lower() or "download" in msg.lower():
                 raise RuntimeError(f"OCR模型加载失败: {msg}\n原因: 模型文件可能损坏，请删除 ~/.EasyOCR/model 后重试")
             raise RuntimeError(f"EasyOCR识别失败: {msg}")
+
+    def recognize_blocks(self, image_path):
+        """返回带位置的文本块 [{text,x,y,w,h}]，坐标为传入图片的原图像素。"""
+        try:
+            reader = self._init_reader()
+            results = reader.readtext(image_path) or []
+            blocks = []
+            for r in results:
+                text = (r[1] or "").strip()
+                if not text:
+                    continue
+                pts = r[0]
+                xs = [float(p[0]) for p in pts]
+                ys = [float(p[1]) for p in pts]
+                x, y = min(xs), min(ys)
+                blocks.append({"text": text, "x": x, "y": y,
+                               "w": max(1.0, max(xs) - x),
+                               "h": max(1.0, max(ys) - y)})
+            blocks.sort(key=lambda b: (b["y"], b["x"]))
+            return blocks
+        except Exception as e:
+            raise RuntimeError(f"EasyOCR识别失败: {e}")
 
 
 # ── 全局单例 ──────────────────────────────────────────────────

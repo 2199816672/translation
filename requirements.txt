@@ -23,6 +23,20 @@ pymupdf>=1.24.0
 reportlab>=4.0.0
 docx2pdf>=0.1.8
 
+# 音视频字幕识别（本地模型，也可在页面内一键安装）
+faster-whisper>=1.0.0
+huggingface-hub>=0.23.0
+zhconv>=1.4.3
+# 以下两项由 faster-whisper 传递带入，但 probe_duration / 打包命令会直接用到，
+# 显式声明以免传递依赖变化时静默失效
+av>=10.0.0
+ctranslate2>=4.0.0
+
+# 实时字幕：麦克风采集 + 电脑内部声音（WASAPI 环回）
+# soundcard 也可在「设置 → 实时字幕」里一键安装
+sounddevice>=0.4.6
+soundcard>=0.2.2
+
 # 可选：EasyOCR（识别更准，需下载模型）
 # easyocr>=1.7.0
 # torch>=2.0.0

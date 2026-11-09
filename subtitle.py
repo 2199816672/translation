@@ -278,3 +278,36 @@ def serialize_subtitle(entries, fmt):
 def subtitle_to_plain_text(entries):
     """字幕条目 -> 每条一行的纯文本（供翻译/预览）。"""
     return '\n'.join(e['text'].replace('\n', ' ') for e in entries)
+
+
+def compose_entries(entries, translations, mode, fmt='.srt'):
+    """按导出模式组合字幕条目：mode ∈ {source, both, target}。
+
+    - source：只导出原文
+    - target：只导出译文（缺译文时回退原文）
+    - both：原文+译文；LRC 单行格式用 "原文 / 译文"，其余格式换行显示
+    """
+    if mode not in ('source', 'both', 'target'):
+        raise ValueError(f"未知的导出模式: {mode}")
+    result = []
+    trs = translations or []
+    for i, e in enumerate(entries):
+        orig = e['text']
+        trans = trs[i] if i < len(trs) and trs[i] else ''
+        if mode == 'target':
+            text = trans or orig
+        elif mode == 'both':
+            if not trans:
+                text = orig
+            elif fmt == '.lrc':
+                text = f"{orig.replace(chr(10), ' ')} / {trans.replace(chr(10), ' ')}"
+            else:
+                text = f"{orig}\n{trans}"
+        else:
+            text = orig
+        result.append({
+            'start': e['start'],
+            'end': e['end'],
+            'text': text,
+        })
+    return result

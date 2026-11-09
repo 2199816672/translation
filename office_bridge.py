@@ -14,6 +14,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from subprocess_util import run_quiet
+
 
 def _find_soffice():
     """定位 LibreOffice soffice.exe，未装返回 None。"""
@@ -66,7 +68,7 @@ def docx_to_pdf_bytes(src, progress_cb=None):
             in_copy = os.path.join(tmp, 'input.docx')
             shutil.copyfile(src, in_copy)
             try:
-                subprocess.run(
+                run_quiet(
                     [exe, '--headless', '--convert-to', 'pdf',
                      '--outdir', tmp, in_copy],
                     check=True, timeout=120,

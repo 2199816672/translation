@@ -1,141 +1,65 @@
-"""版本更新检测模块。"""
-import ipaddress
-import json
-import re
-import socket
-import subprocess
-import threading
-import queue
-import urllib.request
-import urllib.error
-from urllib.parse import urlsplit
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""版本更新检测（兼容层）。
 
-from config import APP_VERSION, GITHUB_REPO, BILIBILI_DYNAMIC_URL
+完整的检查 / 下载 / 一键升级逻辑已移到 :mod:`updater`。本文件保留旧接口，
+供外部脚本与历史调用继续使用；界面代码请直接用 ``updater`` +
+``update_dialog``，才能拿到安装包资产并一键升级。
+"""
+import queue
+import threading
+
+from config import APP_VERSION, BILIBILI_DYNAMIC_URL, GITHUB_REPO
+from updater import (  # noqa: F401  (保持旧 import 可用)
+    API_URL, RELEASES_URL, ReleaseInfo, UpdateError, UpdateCancelled,
+    fetch_latest_release, is_newer, version_tuple, check_update as _check,
+    installer_url, safe_download_path, download_file, verify_download,
+    queue_install, launch_installer,
+)
 
 
 def _parse_version(v):
-    """将 'v1.1.0' 或 '1.1.0' 解析为 (1, 1, 0)。"""
-    v = v.strip().lstrip("vV")
-    parts = v.split(".")
-    result = []
-    for p in parts:
-        m = re.match(r"\d+", p)
-        result.append(int(m.group()) if m else 0)
-    while len(result) < 3:
-        result.append(0)
-    return tuple(result[:3])
-
-
-def _fetch_via_gh():
-    """通过 gh CLI 获取最新 release tag（国内可用，走 SSH）。gh 不存在/出错返回 None。"""
-    try:
-        r = subprocess.run(
-            ["gh", "release", "view", "--repo", GITHUB_REPO, "--json", "tagName,url"],
-            capture_output=True, text=True, timeout=15,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return None, None
-    if r.returncode != 0:
-        return None, None
-    try:
-        data = json.loads(r.stdout)
-    except (json.JSONDecodeError, ValueError):
-        return None, None
-    return data.get("tagName", ""), data.get("url", "")
-
-
-# 更新检查固定访问 GitHub 官方 API，域名白名单
-_UPDATE_API_HOST = "https://api.github.com/"
-_ALLOWED_HOST = "api.github.com"
-
-
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """禁止跟随重定向，避免被跳转到非白名单地址。"""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-def _validate_api_url(url):
-    """校验更新检测地址：仅 HTTPS + 官方域名 + 解析结果必须为公网 IP。"""
-    parts = urlsplit(url)
-    if parts.scheme != "https":
-        raise RuntimeError("非法的更新检测地址：仅允许 HTTPS")
-    if parts.hostname != _ALLOWED_HOST:
-        raise RuntimeError("非法的更新检测地址：域名不在白名单")
-    # 解析并阻断私网 / 环回 / 链路本地地址（防 DNS rebinding 指向内网）
-    infos = socket.getaddrinfo(parts.hostname, 443, type=socket.SOCK_STREAM)
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if not ip.is_global:
-            raise RuntimeError("更新检测地址解析到非公网 IP，已拒绝")
-
-
-def _fetch_via_http():
-    """通过 HTTP 直连 GitHub API 获取（海外可用）。"""
-    url = _UPDATE_API_HOST + "repos/" + GITHUB_REPO + "/releases/latest"
-    _validate_api_url(url)
-    req = urllib.request.Request(
-        url, headers={"Accept": "application/vnd.github.v3+json"})
-    opener = urllib.request.build_opener(_NoRedirectHandler())
-    with opener.open(req, timeout=10) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    return data.get("tag_name", ""), data.get("html_url", "")
-
-
-def _fetch_latest_release():
-    """先尝试 gh CLI，失败（未安装/超时/出错）再 HTTP。"""
-    tag, url = _fetch_via_gh()
-    if tag:
-        return tag, url
-    tag, url = _fetch_via_http()
-    if tag:
-        return tag, url
-    raise RuntimeError("无法获取版本信息（gh CLI 与 GitHub API 均不可用）")
+    """旧接口：把 'v1.4.0' 解析成 (1, 4, 0, 0)。"""
+    return version_tuple(v)
 
 
 def check_update():
-    """
-    同步检测更新。
-    返回 dict:
-      {"has_update": bool, "current": str, "latest": str, "url": str, "error": str|None}
-    """
-    current = APP_VERSION
-    try:
-        latest, url = _fetch_latest_release()
-        if not latest:
-            return {"has_update": False, "current": current, "latest": "",
-                    "url": "", "error": "无法获取版本信息"}
-        cur_tuple = _parse_version(current)
-        lat_tuple = _parse_version(latest)
-        has_update = lat_tuple > cur_tuple
-        return {"has_update": has_update, "current": current,
-                "latest": latest, "url": url, "error": None}
-    except Exception as e:
-        return {"has_update": False, "current": current, "latest": "",
-                "url": "", "error": f"检测失败：{e}"}
+    """同步检测，返回 dict（含 has_update / latest / url / error / info）。"""
+    return _check()
 
 
 class UpdateChecker:
-    """线程安全的版本检测器，通过 queue + QTimer 回到主线程。"""
+    """线程安全的版本检测器，通过 queue + QTimer 回到主线程。
 
-    def __init__(self):
+    相比旧版：timer 有 parent 不会在窗口销毁后残留，重复调用 check() 不会
+    叠加线程 / 覆盖回调，callback 只会执行一次。
+    """
+
+    def __init__(self, parent=None):
         from PySide6.QtCore import QTimer
         self._q = queue.Queue()
         self._callback = None
-        self._timer = QTimer()
+        self._busy = False
+        self._timer = QTimer(parent)
         self._timer.setInterval(50)
         self._timer.timeout.connect(self._poll)
 
     def check(self, callback):
         """异步检测，callback(result) 在主线程调用。"""
+        if self._busy:
+            return False
+        self._busy = True
         self._callback = callback
         self._timer.start()
         threading.Thread(target=self._run, daemon=True).start()
+        return True
 
     def _run(self):
-        result = check_update()
-        self._q.put(result)
+        try:
+            self._q.put(check_update())
+        except Exception as exc:
+            self._q.put({"has_update": False, "current": APP_VERSION,
+                         "latest": "", "url": "", "error": f"检测失败：{exc}"})
 
     def _poll(self):
         try:
@@ -143,6 +67,7 @@ class UpdateChecker:
         except queue.Empty:
             return
         self._timer.stop()
-        if self._callback:
-            self._callback(result)
-            self._callback = None
+        self._busy = False
+        callback, self._callback = self._callback, None
+        if callback:
+            callback(result)

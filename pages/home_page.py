@@ -12,19 +12,26 @@ from PySide6.QtWidgets import (
 )
 
 from theme import Palette
-from config import SUPPORTED_TARGET_LANGS, SUPPORTED_SOURCE_LANGS, APP_VERSION
+from config import (SUPPORTED_TARGET_LANGS, SUPPORTED_SOURCE_LANGS,
+                    APP_VERSION, SUBTITLE_AUDIO_SOURCES,
+                    get_subtitle_settings, save_user_config)
 
 
 class HomePage(QWidget):
     screenshotRequested = Signal()
     fullscreenRequested = Signal()
+    liveTranslateRequested = Signal()
+    subtitleRequested = Signal()
     translateRequested = Signal(str)
+    polishRequested = Signal(str, str)  # (kind, text)
     extractRequested = Signal()
     clearRequested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("homePage")
+        # 普通 QWidget 需要显式开启才会绘制 QSS 的 background
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._current_image_path = None
         self._ocr_text_cache = ""
         self._trans_text_cache = ""
@@ -38,7 +45,7 @@ class HomePage(QWidget):
         # Header
         header = QHBoxLayout()
         header.setSpacing(10)
-        title = QLabel("截图翻译", self)
+        title = QLabel("翻译", self)
         title.setObjectName("pageTitle")
         header.addWidget(title)
         ver = QLabel(f"v{APP_VERSION}", self)
@@ -117,6 +124,33 @@ class HomePage(QWidget):
         self.copy_trans_btn.clicked.connect(self._copy_translation)
         action_bar.addWidget(self.copy_trans_btn)
 
+        self.polish_btn = self._btn("AI 润色", kind="ghost")
+        self.polish_btn.setToolTip(
+            "用 AI 把译文改得更通顺（只改表达，不增删原意）\n"
+            "润色通道在「设置 → AI 润色」中选择")
+        self.polish_btn.clicked.connect(self._on_polish)
+        action_bar.addWidget(self.polish_btn)
+
+        source_label = QLabel("字幕音源:", self)
+        source_label.setObjectName("fieldLabel")
+        action_bar.addWidget(source_label)
+
+        self.subtitle_source_combo = QComboBox(self)
+        for label, key in SUBTITLE_AUDIO_SOURCES.items():
+            self.subtitle_source_combo.addItem(label, key)
+        current = str(get_subtitle_settings().get(
+            'subtitle_audio_source') or 'mic')
+        idx = self.subtitle_source_combo.findData(current)
+        self.subtitle_source_combo.setCurrentIndex(max(0, idx))
+        self.subtitle_source_combo.setMinimumWidth(104)
+        self.subtitle_source_combo.setMaxVisibleItems(4)
+        self.subtitle_source_combo.setToolTip(
+            "麦克风：听你说话；电脑内部声音：听视频 / 音乐 / 会议声音\n"
+            "内部声音需要 WASAPI 环回组件，设置页可一键安装")
+        self.subtitle_source_combo.currentIndexChanged.connect(
+            self._on_subtitle_source_changed)
+        action_bar.addWidget(self.subtitle_source_combo)
+
         action_bar.addStretch(1)
 
         self.clear_btn = self._btn("清空", kind="ghost")
@@ -139,6 +173,23 @@ class HomePage(QWidget):
         self.fullscreen_btn = self._btn("全屏截图")
         self.fullscreen_btn.clicked.connect(self.fullscreenRequested.emit)
         layout.addWidget(self.fullscreen_btn)
+
+        self.live_btn = self._btn("实时翻译", kind="ghost")
+        self.live_btn.setToolTip(
+            "框选一块屏幕区域后持续自动识别并翻译，译文直接叠加在选区上\n"
+            "适合看视频 / 直播 / 游戏；拖选区边缘缩放、拖控制条移动\n"
+            "使用当前「翻译到」语言，不做 AI 润色以保证速度")
+        self.live_btn.clicked.connect(self.liveTranslateRequested.emit)
+        layout.addWidget(self.live_btn)
+
+        self.subtitle_btn = self._btn("实时字幕", kind="ghost")
+        self.subtitle_btn.setToolTip(
+            "实时听写麦克风或电脑内部声音，直接在默认区域显示字幕框\n"
+            "字幕框可拖动 / 四角缩放，位置会被记住；关掉字幕框后仍继续识别，\n"
+            "结果同步显示在这页的「识别文本」和「翻译结果」里\n"
+            "再次点这个按钮（运行中会变成「停止实时字幕」）即可彻底停止")
+        self.subtitle_btn.clicked.connect(self.subtitleRequested.emit)
+        layout.addWidget(self.subtitle_btn)
 
         layout.addSpacing(16)
 
@@ -176,6 +227,70 @@ class HomePage(QWidget):
 
         return card
 
+    # ── 实时字幕快捷入口 ────────────────────────────────────
+
+    def subtitle_audio_source(self):
+        return str(self.subtitle_source_combo.currentData() or 'mic')
+
+    def set_subtitle_running(self, running):
+        """实时字幕运行中：主页按钮变成「停止」，状态一眼可见。"""
+        self.subtitle_btn.setText("停止实时字幕" if running else "实时字幕")
+        self.subtitle_btn.setProperty(
+            "kind", "danger" if running else "ghost")
+        # 改了动态属性要重新抛光样式
+        self.subtitle_btn.style().unpolish(self.subtitle_btn)
+        self.subtitle_btn.style().polish(self.subtitle_btn)
+
+    # ── 实时字幕：同步显示到本页两个文本框 ──────────────────
+
+    @staticmethod
+    def _append_line(edit, text, limit=200):
+        """追加一行并限制总行数，避免长时间听写把文本框撑爆。"""
+        from PySide6.QtGui import QTextCursor
+        text = str(text or '').strip()
+        if not text:
+            return
+        cur = edit.textCursor()
+        cur.movePosition(QTextCursor.MoveOperation.End)
+        if edit.toPlainText():
+            cur.insertText("\n")
+        cur.insertText(text)
+        edit.setTextCursor(cur)
+        doc = edit.document()
+        extra = doc.blockCount() - limit
+        if extra > 0:
+            cur = edit.textCursor()
+            cur.movePosition(QTextCursor.MoveOperation.Start)
+            cur.movePosition(QTextCursor.MoveOperation.Down,
+                             QTextCursor.MoveMode.KeepAnchor, extra)
+            cur.removeSelectedText()
+        edit.ensureCursorVisible()
+
+    def append_caption_source(self, text):
+        self._append_line(self.ocr_text, text)
+
+    def append_caption_translation(self, text):
+        self._append_line(self.trans_text, text)
+
+    def clear_caption_text(self):
+        """新会话 / 清空字幕：只清字幕正文，不动其它控件。"""
+        self.ocr_text.clear()
+        self.trans_text.clear()
+
+    def set_subtitle_audio_source(self, value):
+        """设置页保存后同步这里，避免两处状态打架（不发信号、不重复写盘）。"""
+        idx = self.subtitle_source_combo.findData(value)
+        if idx < 0 or idx == self.subtitle_source_combo.currentIndex():
+            return
+        self.subtitle_source_combo.blockSignals(True)
+        self.subtitle_source_combo.setCurrentIndex(idx)
+        self.subtitle_source_combo.blockSignals(False)
+
+    def _on_subtitle_source_changed(self):
+        # 只写这一个键，绝不整份覆盖（会抹掉别的页面刚保存的密钥）
+        save_user_config(
+            {'subtitle_audio_source': self.subtitle_audio_source()})
+
     def _btn(self, text, kind=None, parent=None):
         b = QPushButton(text, parent or self)
         if kind:
@@ -205,15 +320,47 @@ class HomePage(QWidget):
         )
         self.image_label.setPixmap(scaled)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # 窗口缩放后按比例重算预览图，避免停留在旧尺寸
+        path = getattr(self, "_current_image_path", None)
+        if path and os.path.exists(path):
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, lambda: self.set_image(path))
+
     @Slot(str)
     def set_ocr_text(self, text):
-        self.ocr_text_cache = text
+        self._ocr_text_cache = text
         self.ocr_text.setPlainText(text)
 
     @Slot(str)
     def set_trans_text(self, text):
         self._trans_text_cache = text
         self.trans_text.setPlainText(text)
+        self.polish_btn.setEnabled(True)
+        self.polish_btn.setText("AI 润色")
+
+    def _on_polish(self):
+        text = self.trans_text.toPlainText().strip()
+        if not text:
+            self.set_status("没有可润色的译文", "#71717a")
+            return
+        self.polish_btn.setEnabled(False)
+        self.polish_btn.setText("润色中…")
+        self.set_status("AI 润色中…", "#eab308")
+        self.polishRequested.emit("translation", text)
+
+    @Slot(str)
+    def set_polished_text(self, text):
+        self._trans_text_cache = text
+        self.trans_text.setPlainText(text)
+        self.polish_btn.setEnabled(True)
+        self.polish_btn.setText("AI 润色")
+        self.set_status("AI 润色完成", "#4ade80")
+
+    def finish_polish(self):
+        self.polish_btn.setEnabled(True)
+        self.polish_btn.setText("AI 润色")
 
     def _on_translate(self):
         text = self.ocr_text.toPlainText()

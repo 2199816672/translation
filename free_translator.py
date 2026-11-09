@@ -246,19 +246,24 @@ class GoogleFreeTranslator:
 _free_instances = {}
 
 
-def get_free_translator(api_type, api_key=None):
-    """获取免费翻译器实例。api_key 不为空时优先使用用户密钥。"""
-    if api_type not in _free_instances:
+def get_free_translator(api_type, api_key=None, region=None):
+    """获取免费翻译器实例。api_key / region 不为空时优先使用用户配置。"""
+    cache_key = f"{api_type}:{api_key}:{region}"
+    if cache_key not in _free_instances:
         mapping = {
             "bing_free": BingFreeTranslator,
             "mymemory_free": MyMemoryFreeTranslator,
             "google_free": GoogleFreeTranslator,
         }
         cls = mapping.get(api_type, MyMemoryFreeTranslator)
-        _free_instances[api_type] = cls(api_key=api_key)
-    return _free_instances[api_type]
+        if api_type == "bing_free":
+            _free_instances[cache_key] = cls(api_key=api_key, region=region)
+        else:
+            _free_instances[cache_key] = cls(api_key=api_key)
+    return _free_instances[cache_key]
 
 
 def invalidate_free_translator(api_type):
-    """密钥变更时清除缓存实例"""
-    _free_instances.pop(api_type, None)
+    """密钥/区域变更时清除缓存实例"""
+    for key in [k for k in _free_instances if k.split(":", 1)[0] == api_type]:
+        _free_instances.pop(key, None)

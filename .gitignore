@@ -11,3 +11,8 @@ build/
 *.zip
 .mimosa/
 .zcode/
+.ohmyagent/
+.workbuddy/
+HANDOFF.md
+_tmp_*.py
+_preview_*.png
