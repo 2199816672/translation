@@ -1012,7 +1012,14 @@ def transcribe_api(audio_path, base_url, api_key, model, language='auto',
     except urllib.error.URLError as e:
         raise RuntimeError(f"无法连接 API: {e.reason}")
 
-    body = json.loads(raw.decode('utf-8', errors='replace'))
+    try:
+        body = json.loads(raw.decode('utf-8', errors='replace'))
+    except (ValueError, TypeError) as e:
+        preview = raw[:200].decode('utf-8', errors='replace').strip()
+        raise RuntimeError(
+            f"API 返回内容不是有效 JSON（{e}）：{preview or '空响应'}") from e
+    if not isinstance(body, dict):
+        raise RuntimeError("API 返回内容格式不正确（应为 JSON 对象）")
 
     if progress_cb:
         progress_cb(90, "正在解析结果…")

@@ -143,7 +143,8 @@ QPushButton {{
     color: {p.TEXT};
     border: 1px solid {p.BORDER};
     border-radius: 8px;
-    padding: 8px 16px;
+    /* 左右 12px：工具栏按钮多时就不需要靠压扁控件硬塞进一行 */
+    padding: 8px 12px;
     font-size: 14px;
 }}
 QPushButton:hover {{ background: {p.SURFACE_HOVER}; border-color: {p.BORDER_STRONG}; }}

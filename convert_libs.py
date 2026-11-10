@@ -9,9 +9,8 @@ import csv
 import io
 import os
 
-import openpyxl
-from PIL import Image
-
+# openpyxl / Pillow 只在真正处理 Excel、图片时导入：字幕与文本导出
+# 不该因为这两个可选依赖缺失就整体不可用（源码运行尤其常见）。
 from doc_parser import parse_file as _parse_source_text
 from subtitle import parse_subtitle, serialize_subtitle, subtitle_to_plain_text
 
@@ -152,6 +151,10 @@ def txt_to_pdf_bytes(text, progress_cb=None):
 
 def images_to_pdf_bytes(paths, progress_cb=None):
     """图片转 PDF（透明背景铺白底）。"""
+    try:
+        from PIL import Image
+    except ImportError:
+        raise RuntimeError("请先安装依赖: pip install Pillow")
     pages = []
     for p in paths:
         img = Image.open(p)
@@ -172,6 +175,10 @@ def images_to_pdf_bytes(paths, progress_cb=None):
 
 def xlsx_to_csv_bytes(src, progress_cb=None):
     """Excel 第一个工作表 -> CSV（UTF-8 BOM，Excel 可直接打开）。"""
+    try:
+        import openpyxl
+    except ImportError:
+        raise RuntimeError("请先安装依赖: pip install openpyxl")
     wb = openpyxl.load_workbook(src, read_only=True, data_only=True)
     buf = io.StringIO()
     try:
@@ -201,7 +208,9 @@ def text_to_docx_bytes(text, progress_cb=None):
 def text_to_bytes(text, target, progress_cb=None):
     """译文文本 -> 目标格式字节（txt/docx/pdf）。"""
     if target == 'txt':
-        return text.encode('utf-8')
+        # 中文 Windows 的记事本/Excel 会把无 BOM 的 UTF-8 当成 ANSI，
+        # 加 BOM 后双击直接可读；字幕格式仍走无 BOM 的分支。
+        return text.encode('utf-8-sig')
     if target == 'docx':
         return text_to_docx_bytes(text, progress_cb)
     if target == 'pdf':
@@ -216,6 +225,10 @@ def entries_to_subtitle_bytes(entries, target):
 
 def csv_to_xlsx_bytes(src, progress_cb=None):
     """CSV -> Excel（自动尝试 UTF-8 / GBK）。"""
+    try:
+        import openpyxl
+    except ImportError:
+        raise RuntimeError("请先安装依赖: pip install openpyxl")
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = 'Sheet1'

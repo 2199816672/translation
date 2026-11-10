@@ -224,7 +224,8 @@ class DownloadDialog(_BaseDialog):
             self.progress.setValue(min(100, int(done * 100 / total)))
             self.detail.setText(f"{_fmt_size(done)} / {_fmt_size(total)}")
         else:
-            self.detail.setText(f"已下载 {_fmt_size(done)}")
+            self.detail.setText(
+                f"已下载 {_fmt_size(done)} · 服务器未提供总大小")
         self.status.setText("正在下载安装包……")
 
     def set_done(self, path, verified: Optional[bool]) -> None:

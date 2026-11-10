@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from theme import Palette
+from flow_layout import FlowLayout
 from config import (SUPPORTED_TARGET_LANGS, SUPPORTED_SOURCE_LANGS,
                     APP_VERSION, SUBTITLE_AUDIO_SOURCES,
                     get_subtitle_settings, save_user_config)
@@ -112,9 +113,8 @@ class HomePage(QWidget):
         content_layout.addWidget(right_card, 1)
         root.addLayout(content_layout, 1)
 
-        # Bottom action bar
-        action_bar = QHBoxLayout()
-        action_bar.setSpacing(10)
+        # Bottom action bar（窄窗口自动换行，按钮文字不会被裁）
+        action_bar = FlowLayout(spacing=10, vspacing=8)
 
         self.copy_src_btn = self._btn("复制原文", kind="ghost")
         self.copy_src_btn.clicked.connect(self._copy_source)
@@ -162,9 +162,10 @@ class HomePage(QWidget):
     def _build_control_card(self) -> QFrame:
         card = QFrame()
         card.setObjectName("card")
-        layout = QHBoxLayout(card)
+        # 单行 HBox 在导航展开后会把 10 个控件一起压扁（「域截 / 时翻」），
+        # 换成流式布局：放不下就整行换行，按钮永远显示完整文字。
+        layout = FlowLayout(card, spacing=8, vspacing=10)
         layout.setContentsMargins(18, 14, 18, 14)
-        layout.setSpacing(12)
 
         self.screenshot_btn = self._btn("区域截图", kind="primary")
         self.screenshot_btn.clicked.connect(self.screenshotRequested.emit)

@@ -17,6 +17,7 @@ from config import (
 from app_paths import resource_path
 from ocr_recognizer import get_ocr_instance, check_engine_available
 from translator import get_translator_instance, TranslationError
+from subtitle import translate_segments
 from pages.home_page import HomePage
 from pages.settings_page import SettingsPage
 from pages.doc_page import DocPage
@@ -486,6 +487,15 @@ class MainWindow(FluentWindow):
         if not info.has_installer:
             QDesktopServices.openUrl(QUrl(info.page_url or updater.RELEASES_URL))
             return
+        if not info.sha256:
+            # 没有校验值就不能静默执行一个来路无法验证的安装包
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(
+                self, '无法自动安装',
+                '该版本未提供 SHA256 校验值。为避免安装来源不明或已被篡改的'
+                '安装包，已打开发布页，请手动下载后安装。')
+            QDesktopServices.openUrl(QUrl(info.page_url or updater.RELEASES_URL))
+            return
 
         cancel = threading.Event()
         dialog = DownloadDialog(info, cancel, self)
@@ -507,6 +517,7 @@ class MainWindow(FluentWindow):
                         if not self._update_stop.is_set() else None),
                     cancel=cancel,
                     headers=updater.download_headers(),
+                    expected_size=info.setup_size,
                 )
                 if cancel.is_set():
                     raise updater.UpdateCancelled()
@@ -1402,20 +1413,9 @@ class MainWindow(FluentWindow):
 
         def run():
             total = len(texts)
-            results = []
-            failed = 0
-            last_error = ""
-            for i, text in enumerate(texts, 1):
-                out = text
-                try:
-                    out = self.translator.translate(text)
-                except Exception as e:
-                    failed += 1
-                    last_error = str(e)
-                    out = text
-                results.append(out if out is not None else text)
-                if i % 5 == 0 or i == total:
-                    self._sig_av_trans_progress.emit(i, total)
+            results, failed, last_error = translate_segments(
+                texts, self.translator.translate,
+                lambda i, n: self._sig_av_trans_progress.emit(i, n))
             if total and failed == total:
                 self._sig_av_trans_done.emit([])
                 self._sig_error.emit(
@@ -1423,7 +1423,8 @@ class MainWindow(FluentWindow):
                 return
             if failed:
                 self._sig_status.emit(
-                    f"翻译完成（{failed}/{total} 条失败，已保留原文）", "#eab308")
+                    f"翻译完成（{failed}/{total} 条失败，导出译文时会改为只导出原文）",
+                    "#eab308")
             self._sig_av_trans_done.emit(results)
 
         threading.Thread(target=run, daemon=True).start()

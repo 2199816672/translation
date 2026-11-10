@@ -158,6 +158,38 @@ class DownloadTests(unittest.TestCase):
         self.assertFalse(dest.with_name(dest.name + ".part").exists())
         self.assertEqual(progress[-1][1], len(data))
 
+    def test_chunked_response_uses_release_size(self):
+        dest = self.root / SETUP
+        data = b"chunked-no-length" * 20
+        opener = lambda req, timeout=None: _FakeResponse(data, {})
+        progress = []
+        with mock.patch.object(updater, "_assert_safe_url"):
+            updater.download_file(
+                "https://github.com/x/y.exe", dest,
+                progress_cb=lambda d, t: progress.append((d, t)),
+                opener=opener, chunk_size=64, expected_size=len(data))
+        self.assertEqual(dest.read_bytes(), data)
+        self.assertEqual(progress[-1][1], len(data))
+
+    def test_cancel_after_last_chunk_leaves_no_installer(self):
+        dest = self.root / SETUP
+        cancel = threading.Event()
+        data = b"x" * 128
+
+        def on_progress(done, total):
+            if done >= len(data):
+                cancel.set()
+
+        opener = lambda req, timeout=None: _FakeResponse(data, {})
+        with mock.patch.object(updater, "_assert_safe_url"):
+            with self.assertRaises(updater.UpdateCancelled):
+                updater.download_file(
+                    "https://github.com/x/y.exe", dest,
+                    progress_cb=on_progress, cancel=cancel,
+                    opener=opener, chunk_size=64)
+        self.assertFalse(dest.exists())
+        self.assertFalse(dest.with_name(dest.name + ".part").exists())
+
     def test_cancel_removes_part(self):
         dest = self.root / SETUP
         cancel = threading.Event()

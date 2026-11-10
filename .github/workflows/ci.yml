@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  core-tests:
+    name: 语法检查 + 回归测试 (Python ${{ matrix.python-version }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.13']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # 这些测试只用标准库，不需要装 PySide6 / torch 等重型依赖；
+      # 窗口联动用例在缺 PySide6 时自动跳过，CI 几分钟内跑完
+      - name: 全部源码语法检查
+        shell: bash
+        run: |
+          python -c "import pathlib, py_compile; fs = list(pathlib.Path('.').glob('*.py')) + list(pathlib.Path('pages').glob('*.py')) + list(pathlib.Path('tests').glob('*.py')); [py_compile.compile(str(f), doraise=True) for f in fs]; print('checked', len(fs), 'python files')"
+
+      - name: 回归测试（核心逻辑 + 升级链路 + 批量转录）
+        run: python -m unittest discover -s tests -v
+
+      - name: 版本号与发布资产命名一致性
+        run: |
+          python -c "import config, re; assert re.fullmatch(r'\d+\.\d+\.\d+', config.APP_VERSION), config.APP_VERSION; print('APP_VERSION =', config.APP_VERSION, '| asset = TranslationTool-Setup-v' + config.APP_VERSION + '.exe')"

@@ -6,7 +6,7 @@ import threading
 from PySide6.QtCore import Qt, Signal, Slot, QTimer
 from PySide6.QtGui import QColor, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
-    QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+    QCheckBox, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
     QMessageBox, QPushButton, QProgressBar, QScrollArea, QSizePolicy,
     QSlider, QStackedWidget, QVBoxLayout, QWidget,
 )
@@ -40,6 +40,16 @@ def _safe_float(cfg, key, default):
         return value if value == value else default
     except (TypeError, ValueError, OverflowError):
         return default
+
+
+_SECRET_LABEL_WORDS = ('key', 'secret', 'token', 'cookie',
+                       'appid', 'access id', '密钥')
+
+
+def _is_secret_label(text):
+    """按字段标签判断是否凭证输入，避免把 Region / API 地址也设成密文。"""
+    low = str(text or '').lower()
+    return any(word in low for word in _SECRET_LABEL_WORDS)
 
 
 class _Section(QFrame):
@@ -807,7 +817,11 @@ class SettingsPage(QWidget):
         return edit
 
     def _build_key_page(self, tip, fields):
-        """引擎密钥子页面：统一的右对齐标签 + 自适应输入框。"""
+        """引擎密钥子页面：统一的右对齐标签 + 自适应输入框。
+
+        Key / Secret / Token / Cookie 类字段默认密文显示，并提供一个
+        「显示密钥」开关，避免录屏或旁人经过时泄露凭证。
+        """
         page = QWidget()
         grid = QGridLayout(page)
         grid.setContentsMargins(0, 8, 0, 3)
@@ -823,6 +837,24 @@ class SettingsPage(QWidget):
             t.setWordWrap(True)
             grid.addWidget(t, row, 0, 1, 2)
             row += 1
+
+        secret_edits = [item[1] for item in fields
+                        if isinstance(item[1], QLineEdit)
+                        and _is_secret_label(item[0])]
+        if secret_edits:
+            for edit in secret_edits:
+                edit.setEchoMode(QLineEdit.EchoMode.Password)
+            show_check = QCheckBox("显示密钥", page)
+            show_check.setToolTip(
+                "勾选后临时明文显示本页密钥；配置仍按原值保存，不受显隐影响")
+            show_check.toggled.connect(
+                lambda checked, edits=tuple(secret_edits): [
+                    e.setEchoMode(QLineEdit.EchoMode.Normal if checked
+                                  else QLineEdit.EchoMode.Password)
+                    for e in edits])
+            grid.addWidget(show_check, row, 0, 1, 2)
+            row += 1
+
         for item in fields:
             text, widget = item[0], item[1]
             field_tip = item[2] if len(item) > 2 else ""

@@ -56,33 +56,49 @@ def parse_file(path):
 
 
 def _parse_txt(path):
-    for enc in ('utf-8', 'gbk', 'gb2312', 'latin-1'):
+    # 与 convert_libs.read_text 保持一致：utf-8-sig 优先，能吃掉 BOM；
+    # 不再用 latin-1 兜底，避免二进制/未知编码被静默解成乱码后送去翻译。
+    for enc in ('utf-8-sig', 'utf-8', 'gbk', 'gb18030'):
         try:
             with open(path, 'r', encoding=enc) as f:
                 return f.read()
         except (UnicodeDecodeError, UnicodeError):
             continue
-    raise RuntimeError("无法读取文件，请检查文件编码")
+    raise RuntimeError("无法读取文件，请检查文件编码（支持 UTF-8 / GBK）")
 
 
 def _parse_pdf(path):
+    """PDF 解析：已安装却解析失败时保留原始原因，不再静默吞掉。"""
+    pdfplumber_error = None
     try:
         import pdfplumber
-        text_parts = []
-        with pdfplumber.open(path) as pdf:
-            for page in pdf.pages:
-                t = page.extract_text()
-                if t:
-                    text_parts.append(t)
-        if text_parts:
-            return '\n\n'.join(text_parts)
-    except Exception:
-        pass
+    except ImportError:
+        pdfplumber = None
+    else:
+        try:
+            text_parts = []
+            with pdfplumber.open(path) as pdf:
+                for page in pdf.pages:
+                    t = page.extract_text()
+                    if t:
+                        text_parts.append(t)
+            if text_parts:
+                return '\n\n'.join(text_parts)
+        except Exception as e:
+            # 加密、损坏、内存不足等，不能让界面误报「没装解析器」
+            pdfplumber_error = e
     try:
         from pdfminer.high_level import extract_text
-        return extract_text(path)
     except ImportError:
+        if pdfplumber_error is not None:
+            raise RuntimeError(
+                f"PDF 解析失败：{pdfplumber_error}；"
+                "可安装 pdfminer.six 作为备用解析器")
         raise RuntimeError("请安装 pdfplumber 或 pdfminer.six: pip install pdfplumber")
+    try:
+        return extract_text(path)
+    except Exception as e:
+        raise RuntimeError(f"PDF 解析失败：{pdfplumber_error or e}") from e
 
 
 def _parse_docx(path):

@@ -305,7 +305,8 @@ def safe_download_path(info: ReleaseInfo) -> Path:
 def download_file(url: str, dest: Path, progress_cb: Optional[Callable] = None,
                   cancel: Optional[threading.Event] = None,
                   timeout: float = 30, chunk_size: int = 256 * 1024,
-                  opener=None, headers=None) -> Path:
+                  opener=None, headers=None,
+                  expected_size: int = 0) -> Path:
     """下载到 .part 再原子替换，中途取消 / 失败不会留下半截文件。"""
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -322,6 +323,10 @@ def download_file(url: str, dest: Path, progress_cb: Optional[Callable] = None,
                 total = int(resp_headers.get("Content-Length") or 0)
             except (TypeError, ValueError):
                 total = 0
+            if total <= 0:
+                # 302 到对象存储常为 chunked / 无 Content-Length，
+                # 用 Release API 里的 asset size 兜底，进度条才有百分比。
+                total = int(expected_size or 0)
             done = 0
             while True:
                 if cancel is not None and cancel.is_set():
@@ -333,6 +338,9 @@ def download_file(url: str, dest: Path, progress_cb: Optional[Callable] = None,
                 done += len(block)
                 if progress_cb is not None:
                     progress_cb(done, total)
+        # 读完最后一个 chunk 到 replace 之间用户仍可能点了取消
+        if cancel is not None and cancel.is_set():
+            raise UpdateCancelled()
         os.replace(part, dest)
     except BaseException:
         try:

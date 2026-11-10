@@ -220,6 +220,9 @@ def _request_pollinations(prompt, settings):
             raw = _http_post(
                 "https://text.pollinations.ai/openai",
                 headers, payload)
+            # 首次 402 进冷却、重试成功后必须复位，否则接下来几十秒
+            # 明明通道已恢复却仍被「限流中」挡住
+            _pollinations_cooldown_until = 0.0
             return _parse_openai_json(raw)
         except PolishError as e:
             if "402" not in str(e):

@@ -5,7 +5,8 @@ import os
 import threading
 
 from PySide6.QtCore import Qt, Signal, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QPalette, QTextCursor
+from PySide6.QtGui import (QColor, QDesktopServices, QDragEnterEvent,
+                           QDropEvent, QPalette, QTextCursor)
 from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
@@ -13,13 +14,16 @@ from PySide6.QtWidgets import (
 )
 
 from theme import Palette
+from flow_layout import FlowLayout
 from config import (
     SUPPORTED_SOURCE_LANGS, SUPPORTED_TARGET_LANGS,
     load_user_config, save_user_config,
 )
 import speech_recognizer as asr
 from format_convert import export_text
-from subtitle import compose_entries
+from subtitle import compose_entries, safe_export_mode
+from batch_transcribe import classify_paths, is_supported
+from batch_dialog import BatchTranscribeDialog
 
 FMT_LABELS = {
     'srt': 'SRT 字幕',
@@ -96,6 +100,8 @@ class AVPage(QWidget):
         self.setObjectName("avPage")
         # 普通 QWidget 需要显式开启才能绘制 QSS 里的 background
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        # 与文档页一致：支持把音视频文件（可多选）直接拖进来
+        self.setAcceptDrops(True)
         self.cfg = load_user_config()
         self._file_path = None
         self._segments = []
@@ -107,8 +113,12 @@ class AVPage(QWidget):
         self._src_code = 'auto'
         self._stream_count = 0
         self._export_mode = self.cfg.get('asr_export_mode', 'source')
+        # 坏配置不能让整个应用起不来：非法值回退到只导出原文
+        if self._export_mode not in MODE_LABELS:
+            self._export_mode = 'source'
         self._hw = None
         self._recommendation = None
+        self._batch_dialog = None
         # 首次使用、且从未下载过模型时，等硬件检测结果回来自动选推荐项
         self._auto_select_recommend = (
             not self.cfg.get('asr_model') and not self._any_model_ready())
@@ -177,8 +187,7 @@ class AVPage(QWidget):
         root.addWidget(self._build_model_card())
         root.addWidget(self._build_export_card())
 
-        action_row = QHBoxLayout()
-        action_row.setSpacing(10)
+        action_row = FlowLayout(spacing=10, vspacing=8)
         self.start_btn = self._btn("开始识别", kind="primary")
         self.start_btn.clicked.connect(self._on_start)
         action_row.addWidget(self.start_btn)
@@ -222,13 +231,20 @@ class AVPage(QWidget):
     def _build_file_card(self) -> QFrame:
         card = QFrame()
         card.setObjectName("card")
-        row = QHBoxLayout(card)
+        row = FlowLayout(card, spacing=12, vspacing=10)
         row.setContentsMargins(18, 14, 18, 14)
-        row.setSpacing(12)
 
         self.select_btn = self._btn("选择音视频文件", kind="primary")
         self.select_btn.clicked.connect(self._open_file_dialog)
         row.addWidget(self.select_btn)
+
+        self.batch_btn = self._btn("批量转录", kind="ghost")
+        self.batch_btn.setToolTip(
+            "一次选多个音视频文件，按顺序逐个识别；\n"
+            "每个文件单独输出一份字幕，可指定统一输出文件夹。\n"
+            "也可以直接把多个文件拖到本页。")
+        self.batch_btn.clicked.connect(lambda: self._open_batch_dialog())
+        row.addWidget(self.batch_btn)
 
         self.file_label = _ElidedLabel(
             "支持 MP3 / WAV / M4A / FLAC / MP4 / MKV / MOV 等 · "
@@ -274,7 +290,7 @@ class AVPage(QWidget):
         col.setContentsMargins(18, 14, 18, 14)
         col.setSpacing(10)
 
-        head = QHBoxLayout()
+        head = FlowLayout(spacing=8)
         title = QLabel("识别模型", self)
         title.setObjectName("sectionTitle")
         head.addWidget(title)
@@ -285,8 +301,7 @@ class AVPage(QWidget):
         col.addLayout(head)
 
         # 智能推荐行：硬件检测在后台完成，结果回来后填入文字
-        rec_row = QHBoxLayout()
-        rec_row.setSpacing(8)
+        rec_row = FlowLayout(spacing=8)
         # 用可省略标签：推荐理由很长时不撑宽整行、也不因换行把卡片顶高
         self.rec_label = _ElidedLabel(
             "正在检测本机配置，稍后给出模型推荐…", self)
@@ -302,7 +317,7 @@ class AVPage(QWidget):
         rec_row.addWidget(self.rec_detail_btn)
         col.addLayout(rec_row)
 
-        mode_row = QHBoxLayout()
+        mode_row = FlowLayout(spacing=10, vspacing=8)
         mode_label = QLabel("识别方式:", self)
         mode_label.setObjectName("fieldLabel")
         mode_row.addWidget(mode_label)
@@ -322,9 +337,8 @@ class AVPage(QWidget):
 
         # 本地模型面板
         self.local_panel = QWidget(self)
-        local_row = QHBoxLayout(self.local_panel)
+        local_row = FlowLayout(self.local_panel, spacing=10, vspacing=8)
         local_row.setContentsMargins(0, 0, 0, 0)
-        local_row.setSpacing(10)
         model_label = QLabel("模型:", self)
         model_label.setObjectName("fieldLabel")
         local_row.addWidget(model_label)
@@ -362,9 +376,8 @@ class AVPage(QWidget):
 
         # 在线 API 面板
         self.api_panel = QWidget(self)
-        api_grid = QHBoxLayout(self.api_panel)
+        api_grid = FlowLayout(self.api_panel, spacing=10, vspacing=8)
         api_grid.setContentsMargins(0, 0, 0, 0)
-        api_grid.setSpacing(10)
         self.api_base = QLineEdit(self)
         self.api_base.setPlaceholderText("API 地址，如 https://api.openai.com/v1")
         self.api_base.setText(self.cfg.get('asr_api_base', ''))
@@ -414,9 +427,8 @@ class AVPage(QWidget):
     def _build_export_card(self) -> QFrame:
         card = QFrame()
         card.setObjectName("card")
-        row = QHBoxLayout(card)
+        row = FlowLayout(card, spacing=8, vspacing=8)
         row.setContentsMargins(14, 12, 14, 12)
-        row.setSpacing(8)
 
         fmt_label = QLabel("字幕格式:", self)
         fmt_label.setObjectName("fieldLabel")
@@ -470,8 +482,7 @@ class AVPage(QWidget):
         lay = QVBoxLayout(card)
         lay.setContentsMargins(14, 14, 14, 14)
         lay.setSpacing(8)
-        head = QHBoxLayout()
-        head.setSpacing(8)
+        head = FlowLayout(spacing=8)
         title = QLabel(title_text, self)
         title.setObjectName("sectionTitle")
         head.addWidget(title)
@@ -508,16 +519,110 @@ class AVPage(QWidget):
 
     def _open_file_dialog(self):
         patterns = ' '.join('*' + ext for ext in sorted(asr.AUDIO_VIDEO_EXTS))
+        start_dir = self.cfg.get('asr_last_dir') or ''
         path, _ = QFileDialog.getOpenFileName(
-            self, "选择音视频文件", "",
+            self, "选择音视频文件", start_dir,
             f"音视频文件 ({patterns});;所有文件 (*)")
         if path:
+            folder = os.path.dirname(path)
+            self.cfg['asr_last_dir'] = folder
+            save_user_config({'asr_last_dir': folder})
             self._load_file(path)
+
+    # ── 批量转录 ────────────────────────────────────────────
+
+    def _batch_settings(self):
+        """把当前页面配置冻结成一份快照，批量期间改动页面不影响已开始的任务。"""
+        from config import get_asr_settings
+        mode = self.mode_combo.currentData()
+        src_text = self.src_lang_combo.currentText()
+        dst_text = self.lang_combo.currentText()
+        model = self._current_model()
+        engine = (f"本地模型 {model}" if mode == LOCAL_MODE
+                  else f"在线 API {self.api_model.text().strip()}")
+        return {
+            'mode': mode,
+            'model': model,
+            'api_base': self.api_base.text().strip(),
+            'api_key': self.api_key.text().strip(),
+            'api_model': self.api_model.text().strip(),
+            'src_lang': SUPPORTED_SOURCE_LANGS.get(src_text, 'auto'),
+            'target_lang': SUPPORTED_TARGET_LANGS.get(dst_text, 'zh-CN'),
+            'fmt': self.fmt_combo.currentData(),
+            'export_mode': self._export_mode,
+            'asr_opts': get_asr_settings(),
+            'last_dir': self.cfg.get('asr_last_dir') or '',
+            'summary': f"识别：{engine} · 音频语言 {src_text} → {dst_text}",
+        }
+
+    def _open_batch_dialog(self, initial_paths=None):
+        if self._busy:
+            self.set_status("请先结束当前单文件识别任务", "#eab308")
+            return
+        if self._batch_dialog is not None:
+            self._batch_dialog.raise_()
+            self._batch_dialog.activateWindow()
+            return
+        dlg = BatchTranscribeDialog(
+            self._batch_settings(), self, initial_paths=initial_paths)
+        self._batch_dialog = dlg
+        try:
+            dlg.exec()
+        finally:
+            self._batch_dialog = None
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if self._busy:
+            event.ignore()
+            return
+        urls = event.mimeData().urls() if event.mimeData() else []
+        if any(is_supported(u.toLocalFile()) or os.path.isdir(u.toLocalFile())
+               for u in urls):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent):
+        # 识别期间换文件会让旧线程的结果回写到新文件名上
+        if self._busy:
+            self.set_status("请先结束当前识别任务再拖入文件", "#eab308")
+            event.ignore()
+            return
+        paths = []
+        for url in event.mimeData().urls():
+            local = url.toLocalFile()
+            if os.path.isdir(local):
+                try:
+                    paths.extend(e.path for e in os.scandir(local)
+                                 if e.is_file() and is_supported(e.path))
+                except OSError:
+                    pass
+            elif local:
+                paths.append(local)
+        valid, rejected = classify_paths(paths)
+        if not valid:
+            if paths:
+                self.set_status("拖入的文件都不是支持的音视频格式", "#e5635f")
+            event.ignore()
+            return
+        if len(valid) == 1 and not rejected:
+            self._load_file(valid[0])
+        else:
+            self._open_batch_dialog(valid)
+            if rejected:
+                self.set_status(
+                    f"已加入 {len(valid)} 个文件，忽略 "
+                    f"{len(rejected)} 个不支持的项目", "#eab308")
+        event.acceptProposedAction()
 
     def _load_file(self, path):
         ext = os.path.splitext(path)[1].lower()
         if ext not in asr.AUDIO_VIDEO_EXTS:
             self.set_status(f"不支持的音视频格式: {ext}", "#e5635f")
+            return
+        if not os.path.isfile(path):
+            self.set_status(
+                f"文件不存在或已被移动: {os.path.basename(path)}", "#e5635f")
             return
         self._file_path = path
         self._segments = []
@@ -526,9 +631,13 @@ class AVPage(QWidget):
         self.orig_text.clear()
         self.trans_text.clear()
         self.export_btn.setEnabled(False)
-        size_mb = os.path.getsize(path) / (1024 * 1024)
+        try:
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+            size_text = f"{size_mb:.1f} MB"
+        except OSError:
+            size_text = "大小未知"
         self.file_label.set_full_text(
-            f"{os.path.basename(path)}  |  {size_mb:.1f} MB")
+            f"{os.path.basename(path)}  |  {size_text}")
         self.file_label.setStyleSheet(
             f"color: {Palette.TEXT}; border: none; background: transparent;")
         # 加载文件后刷新按钮状态（否则「开始识别」仍保持禁用）
@@ -855,8 +964,14 @@ class AVPage(QWidget):
         self.set_status("正在识别音频…", "#eab308")
         self.orig_text.clear()
         self.trans_text.clear()
+        # 必须清空上一份字幕：否则本次失败/取消后仍能导出旧文件的字幕
+        self._segments = []
         self._translations = []
+        self._info = {}
         self.export_btn.setEnabled(False)
+        self.translate_btn.setEnabled(False)
+        self.polish_src_btn.setEnabled(False)
+        self.polish_trans_btn.setEnabled(False)
         stream_enabled = bool(asr_opts.get('asr_stream_enabled', True))
 
         src_text = self.src_lang_combo.currentText()
@@ -934,9 +1049,9 @@ class AVPage(QWidget):
     def _on_asr_done(self, result):
         self._busy = False
         self._sync_buttons()
-        self.progress.setRange(0, 100)
-        self.progress.setValue(100)
-        self.progress.setFormat("识别完成")
+        # 成功后也要收起进度条：它是流式工具栏里的定宽控件，留着会一直
+        # 占一行，窄窗口下把「开始识别」等按钮挤到下一行。
+        self.progress.setVisible(False)
         self._info = result
         self._segments = result.get('segments') or []
         self._translations = []
@@ -963,6 +1078,10 @@ class AVPage(QWidget):
 
     def _on_asr_error(self, msg):
         self._busy = False
+        # 本次没有成功结果，绝不能保留上一份字幕供导出/翻译
+        self._segments = []
+        self._translations = []
+        self._info = {}
         self._sync_buttons()
         self.progress.setVisible(False)
         self.set_status(f"识别失败: {msg[:120]}", "#e5635f")
@@ -998,8 +1117,16 @@ class AVPage(QWidget):
         self._translations = list(translations or [])
         self._refresh_trans_preview()
         self._sync_buttons()
-        if translations:
-            self.set_status(f"翻译完成：{len(translations)} 条", "#4ade80")
+        if self._translations:
+            ok = sum(1 for t in self._translations
+                     if str(t or '').strip())
+            total = len(self._translations)
+            if ok == total:
+                self.set_status(f"翻译完成：{total} 条", "#4ade80")
+            else:
+                self.set_status(
+                    f"翻译完成：{ok}/{total} 条（失败项导出时回退原文）",
+                    "#eab308")
         else:
             self.set_status("翻译结果为空", "#eab308")
 
@@ -1073,9 +1200,13 @@ class AVPage(QWidget):
     # ── 导出 ────────────────────────────────────────────────
 
     def _on_fmt_changed(self, _index=None):
-        self._save_cfg(asr_export_fmt=self.fmt_combo.currentData())
+        fmt = self.fmt_combo.currentData()
+        if fmt:
+            self._save_cfg(asr_export_fmt=fmt)
 
     def _on_export_mode(self, mode):
+        if mode not in MODE_LABELS:
+            return
         self._export_mode = mode
         for key, btn in self.mode_buttons.items():
             btn.setChecked(key == mode)
@@ -1087,15 +1218,23 @@ class AVPage(QWidget):
             return
         fmt = self.fmt_combo.currentData()
         if self._export_mode in ('both', 'target') and not self._translations:
-            self.set_status("请先点「翻译字幕」再导出该模式", "#eab308")
+            self.set_status(
+                "译文不可用：请重新点「翻译字幕」，或改选「只导出原文」",
+                "#eab308")
             return
+        # 与批量转录一致：译文不完整就整份退回原文，绝不产出
+        # 「原文冒充译文」的字幕。
+        mode, missing = safe_export_mode(
+            len(self._segments), self._translations, self._export_mode)
+        self._export_note = (
+            f"（{missing} 条翻译失败，已改为只导出原文）" if missing else '')
         composed = compose_entries(
-            self._segments, self._translations, self._export_mode, '.' + fmt)
+            self._segments, self._translations, mode, '.' + fmt)
         out_dir = os.path.dirname(self._file_path)
         stem = os.path.splitext(os.path.basename(self._file_path))[0]
         filename = f"{stem}_字幕.{fmt}"
 
-        self.set_status("正在导出字幕…", "#eab308")
+        self.set_status("正在导出字幕…" + self._export_note, "#eab308")
         self.export_btn.setEnabled(False)
 
         def run():
@@ -1112,7 +1251,9 @@ class AVPage(QWidget):
         self.export_btn.setEnabled(True)
         self._last_out_dir = os.path.dirname(path)
         self.open_dir_btn.setEnabled(True)
-        self.set_status(f"已导出: {os.path.basename(path)}", "#4ade80")
+        self.set_status(
+            f"已导出: {path}{getattr(self, '_export_note', '')}"
+            "（可点「打开输出文件夹」查看）", "#4ade80")
 
     def _on_export_error(self, msg):
         self.export_btn.setEnabled(True)
@@ -1136,6 +1277,7 @@ class AVPage(QWidget):
             self._file_path is not None and not self._busy)
         self.stop_btn.setEnabled(self._busy)
         self.select_btn.setEnabled(not self._busy)
+        self.batch_btn.setEnabled(not self._busy and self._batch_dialog is None)
         self.translate_btn.setEnabled(
             not self._busy and bool(self._segments))
         self.polish_src_btn.setEnabled(

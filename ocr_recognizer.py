@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 
-from subprocess_util import check_call_quiet, pip_cmd, popen_quiet
+from subprocess_util import pip_cmd, popen_quiet
 
 
 def check_engine_available(engine):
@@ -25,31 +25,26 @@ def check_engine_available(engine):
     return False
 
 
-def install_engine(engine):
-    """通过pip安装指定OCR引擎"""
-    packages = {
-        'easy': 'easyocr',
-        'windows': 'winrt-runtime winrt-Windows.Media.Ocr winrt-Windows.Globalization winrt-Windows.Graphics.Imaging winrt-Windows.Storage.Streams winrt-Windows.Foundation winrt-Windows.Foundation.Collections',
-    }
-    pkg = packages.get(engine)
-    if not pkg:
-        return False, f"{engine} 无法安装"
-    cmd, hint = pip_cmd(pkg.split())
-    if cmd is None:
-        return False, hint
+def _imread_unicode(path):
+    """cv2.imread 在 Windows 走 ANSI fopen，中文路径会直接返回 None。"""
+    import cv2
+    import numpy as np
     try:
-        check_call_quiet(cmd, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.PIPE)
-        return True, "安装成功"
-    except subprocess.CalledProcessError as e:
-        detail = e.stderr or b""
-        if isinstance(detail, bytes):
-            detail = detail.decode(errors="ignore")
-        return False, f"安装失败: {str(detail)[-200:]}"
+        data = np.fromfile(str(path), dtype=np.uint8)
+        if data.size == 0:
+            return None
+        return cv2.imdecode(data, cv2.IMREAD_COLOR)
+    except (OSError, ValueError):
+        return None
+
+
+def install_engine(engine):
+    """兼容旧接口：复用带进度的实现，失败时能拿到真实错误输出。"""
+    return install_engine_with_progress(engine)
 
 
 def install_engine_with_progress(engine, on_progress=None):
-    """通过pip安装指定OCR引擎，实时回调进度"""
+    """通过 pip 安装指定 OCR 引擎，实时回调进度。"""
     packages = {
         'easy': 'easyocr',
         'windows': 'winrt-runtime winrt-Windows.Media.Ocr winrt-Windows.Globalization winrt-Windows.Graphics.Imaging winrt-Windows.Storage.Streams winrt-Windows.Foundation winrt-Windows.Foundation.Collections',
@@ -66,20 +61,32 @@ def install_engine_with_progress(engine, on_progress=None):
             text=True,
         )
         last_lines = []
-        while True:
-            line = proc.stdout.readline()
-            if not line and proc.poll() is not None:
-                break
-            if line:
-                last_lines.append(line.strip())
-                if on_progress:
-                    on_progress(line)
-        proc.wait()
+        try:
+            while True:
+                line = proc.stdout.readline()
+                if not line and proc.poll() is not None:
+                    break
+                if line:
+                    last_lines.append(line.strip())
+                    if on_progress:
+                        on_progress(line)
+        finally:
+            # 异常/取消时也要收回管道和子进程，避免残留 pip 进程
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            if proc.poll() is None:
+                proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
         if proc.returncode == 0:
             return True, "安装成功"
-        else:
-            tail = '\n'.join(last_lines[-5:])
-            return False, f"安装失败 (code {proc.returncode}): {tail}"
+        tail = '\n'.join(last_lines[-5:])
+        return False, f"安装失败 (code {proc.returncode}): {tail}"
     except Exception as e:
         return False, f"安装失败: {e}"
 
@@ -145,7 +152,7 @@ class WindowsOCRRecognizer:
             import winrt.windows.storage.streams as wss
             import cv2
 
-            img = cv2.imread(str(image_path))
+            img = _imread_unicode(image_path)
             if img is None:
                 raise RuntimeError(f"无法读取图片: {image_path}")
             h_img = img.shape[0]
@@ -192,7 +199,7 @@ class WindowsOCRRecognizer:
             import winrt.windows.storage.streams as wss
             import cv2
 
-            img = cv2.imread(str(image_path))
+            img = _imread_unicode(image_path)
             if img is None:
                 raise RuntimeError(f"无法读取图片: {image_path}")
             ret, buf = cv2.imencode(".png", img)

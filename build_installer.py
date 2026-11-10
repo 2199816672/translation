@@ -202,7 +202,20 @@ def main() -> int:
                         help="覆盖安装包版本号（仅供本地覆盖升级测试用）")
     args = parser.parse_args()
 
-    version = args.version or read_version()
+    source_version = read_version()
+    if args.version and args.version != source_version:
+        # --version 只注入 ISCC / 安装包文件名，不会改程序内的 APP_VERSION。
+        # 若用它出正式包，装完程序仍自报旧版本，latest 恒比它新，用户会陷入
+        # 「每次启动都提示升级、升完还是旧版本」的死循环。本地覆盖升级测试
+        # 专供 --skip-exe，那里允许版本号不同。
+        if not args.skip_exe:
+            raise RuntimeError(
+                f"--version {args.version} 与 config.py 的 APP_VERSION "
+                f"{source_version} 不一致；正式构建请先改 config.py 再不带 "
+                "--version 重跑（该参数仅供 --skip-exe 本地测试）")
+        print(f"警告：仅本地测试，安装包版本 {args.version} 与程序内 "
+              f"APP_VERSION {source_version} 不一致，切勿发布。", flush=True)
+    version = args.version or source_version
     iscc = find_iscc()
     print(f"版本 v{version} | ISCC: {iscc}", flush=True)
 

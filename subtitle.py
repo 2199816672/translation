@@ -72,11 +72,19 @@ _TAG_HTML = re.compile(r'</?[a-zA-Z][^>]*>')  # <i>、<v Roger> 等
 
 
 def _clean_text(text):
-    """剥掉 ASS/HTML 标签，统一换行。"""
+    """剥掉 ASS/HTML 标签，统一换行。
+
+    <br> 必须先换成换行再做通用标签剥离，否则会被 _TAG_HTML 一并删掉，
+    两行字幕粘成一行。VTT 导出时转义过的 &amp; / &lt; 也要还原，
+    否则「导出 VTT → 再导入」内容会变。
+    """
+    import html
+
+    text = html.unescape(str(text))
     text = _TAG_ASS.sub('', text)
+    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.I)
     text = _TAG_HTML.sub('', text)
     text = text.replace('\\N', '\n').replace('\\n', '\n')
-    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.I)
     return text.strip()
 
 
@@ -232,6 +240,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
 
+def _escape_vtt(text):
+    """WebVTT cue 里 & < > 必须转义，否则 --> 会被当成时间轴、<b> 当标签。"""
+    return (str(text).replace('&', '&amp;').replace('<', '&lt;')
+            .replace('>', '&gt;'))
+
+
 def serialize_subtitle(entries, fmt):
     """把条目列表序列化为指定格式字符串。fmt ∈ {'.srt','.vtt','.ass','.ssa'}。"""
     fmt = fmt.lower()
@@ -240,15 +254,19 @@ def serialize_subtitle(entries, fmt):
     if fmt not in ('.srt', '.vtt', '.ass', '.lrc'):
         raise ValueError(f"不支持的字幕格式: {fmt}")
 
+    # 空文本条目不写空 cue，否则导出再导入会丢条目（LRC 解析会跳过空行）
+    items = [e for e in entries if str(e.get('text', '')).strip()]
     out = []
     if fmt == '.lrc':
-        for e in entries:
+        for e in items:
             text = e['text'].replace('\n', ' ').strip()
+            # LRC 用 [mm:ss.xx] 做时间戳，正文里的方括号会干扰解析
+            text = text.replace('[', '(').replace(']', ')')
             out.append(f"[{_fmt_lrc(e['start'])}]{text}")
         return '\n'.join(out) + '\n'
 
     if fmt == '.srt':
-        for i, e in enumerate(entries, 1):
+        for i, e in enumerate(items, 1):
             out.append(str(i))
             out.append(f"{_fmt_srt(e['start'])} --> {_fmt_srt(e['end'])}")
             out.append(e['text'])
@@ -258,15 +276,15 @@ def serialize_subtitle(entries, fmt):
     if fmt == '.vtt':
         out.append('WEBVTT')
         out.append('')
-        for e in entries:
+        for e in items:
             out.append(f"{_fmt_vtt(e['start'])} --> {_fmt_vtt(e['end'])}")
-            out.append(e['text'])
+            out.append(_escape_vtt(e['text']))
             out.append('')
         return '\n'.join(out)
 
     # ASS
     out.append(_ASS_HEADER.rstrip('\n'))
-    for e in entries:
+    for e in items:
         text = e['text'].replace('\n', '\\N')
         out.append(
             f"Dialogue: 0,{_fmt_ass(e['start'])},{_fmt_ass(e['end'])},"
@@ -311,3 +329,48 @@ def compose_entries(entries, translations, mode, fmt='.srt'):
             'text': text,
         })
     return result
+
+
+def translate_segments(texts, translate, on_progress=None):
+    """逐条翻译，失败 / 空结果一律置空，绝不回退原文冒充译文。
+
+    返回 ``(results, failed, last_error)``；results 与 texts 等长，失败项是
+    空串。单文件与批量链路共用这条语义，避免「只导出译文」写出原文、
+    「原文+译文」出现「原文 / 原文」重复双语。
+    """
+    results = []
+    failed = 0
+    last_error = ''
+    total = len(texts)
+    for i, text in enumerate(texts, 1):
+        out = ''
+        try:
+            out = translate(text)
+        except Exception as exc:  # 单条失败不能丢掉整份已识别的字幕
+            last_error = str(exc)
+        if not isinstance(out, str) or not out.strip():
+            failed += 1
+            results.append('')
+        else:
+            results.append(out)
+        if on_progress is not None and (i % 5 == 0 or i == total):
+            on_progress(i, total)
+    return results, failed, last_error
+
+
+def safe_export_mode(entry_count, translations, mode):
+    """译文不完整时降级导出模式，返回 ``(实际模式, 缺失条数)``。
+
+    - ``target``：只要有一条没译出来就整份退回 ``source``，否则会把原文
+      当成译文写进字幕文件；
+    - ``both``：缺译文的条目由 :func:`compose_entries` 只保留一行原文，
+      不会产出「原文 / 原文」重复双语，无需整份降级；
+    - ``source``：不依赖译文，原样返回。
+    """
+    if mode != 'target':
+        return mode, 0
+    trs = translations or []
+    missing = sum(
+        1 for i in range(entry_count)
+        if i >= len(trs) or not str(trs[i] or '').strip())
+    return ('source' if missing else 'target'), missing

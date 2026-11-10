@@ -33,7 +33,8 @@ HIDDEN_IMPORTS = [
     "speech_recognizer", "live_caption", "realtime_translate",
     "screenshot_overlay", "subtitle_overlay", "subtitle", "text_segment",
     "format_convert", "doc_parser", "office_bridge", "convert_libs",
-    "resize_util", "pages", "pages.home_page", "pages.doc_page",
+    "resize_util", "batch_transcribe", "batch_dialog", "flow_layout",
+    "pages", "pages.home_page", "pages.doc_page",
     "pages.av_page", "pages.settings_page",
     # 第三方
     "keyboard", "winrt", "winrt.windows.media.ocr",

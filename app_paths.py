@@ -101,16 +101,28 @@ def screenshots_dir() -> Path:
     path = APP_DIR / "screenshots"
     try:
         path.mkdir(parents=True, exist_ok=True)
+        return path
     except OSError as exc:
         logging.warning("无法创建截图目录 %s: %s", path, exc)
-        return _user_data_root() / "screenshots"
-    return path
+    # 降级目录同样要真正创建，否则截图保存会静默失败
+    fallback = _user_data_root() / "screenshots"
+    try:
+        fallback.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logging.warning("无法创建降级截图目录 %s: %s", fallback, exc)
+    return fallback
 
 
 def models_dir() -> Path:
     path = APP_DIR / "models"
     try:
         path.mkdir(parents=True, exist_ok=True)
+        return path
     except OSError:
-        return _user_data_root() / "models"
-    return path
+        pass
+    fallback = _user_data_root() / "models"
+    try:
+        fallback.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logging.warning("无法创建降级模型目录 %s: %s", fallback, exc)
+    return fallback

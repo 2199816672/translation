@@ -5,7 +5,7 @@
 ; 本文件必须保存为 UTF-8 with BOM，否则中文会乱码。
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.4.0"
+  #define MyAppVersion "1.5.0"
 #endif
 ; 待打包的程序目录。手工编译时使用默认 dist\TranslationTool；
 ; build_installer.py 会通过 /dSourceDir 指向每次构建的全新暂存目录。

@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from theme import Palette
+from flow_layout import FlowLayout
 from config import SUPPORTED_TARGET_LANGS, SUPPORTED_SOURCE_LANGS
 from doc_parser import (
     SUPPORTED_EXTENSIONS, SUBTITLE_EXTENSIONS,
@@ -85,6 +86,7 @@ class DocPage(QWidget):
         self._pending_export_fmt = None
         self._last_out_dir = None
         self._last_outputs = []
+        self._exporting = False
         self.setAcceptDrops(True)
         self._sig_parse_done.connect(self._on_parse_done)
         self._sig_parse_error.connect(self._on_parse_error)
@@ -180,8 +182,8 @@ class DocPage(QWidget):
 
         root.addLayout(content_layout, 1)
 
-        action_bar = QHBoxLayout()
-        action_bar.setSpacing(10)
+        # 窄窗口自动换行，按钮文字完整（导航展开后不会再挤成一坨）
+        action_bar = FlowLayout(spacing=10, vspacing=8)
 
         self.translate_btn = self._btn("翻译", kind="primary")
         self.translate_btn.clicked.connect(self._on_translate)
@@ -222,9 +224,8 @@ class DocPage(QWidget):
     def _build_top_bar(self) -> QFrame:
         card = QFrame()
         card.setObjectName("card")
-        layout = QHBoxLayout(card)
+        layout = FlowLayout(card, spacing=12, vspacing=10)
         layout.setContentsMargins(18, 14, 18, 14)
-        layout.setSpacing(12)
 
         self.select_btn = self._btn("选择文件", kind="primary")
         self.select_btn.clicked.connect(self._open_file_dialog)
@@ -260,9 +261,8 @@ class DocPage(QWidget):
     def _build_convert_bar(self) -> QFrame:
         card = QFrame()
         card.setObjectName("card")
-        layout = QHBoxLayout(card)
+        layout = FlowLayout(card, spacing=12, vspacing=10)
         layout.setContentsMargins(18, 14, 18, 14)
-        layout.setSpacing(12)
 
         fmt_label = QLabel("转换为:", self)
         fmt_label.setObjectName("fieldLabel")
@@ -603,6 +603,12 @@ class DocPage(QWidget):
     def _do_export(self, fmt, filename=None):
         if not self._current_file:
             return
+        # 连点导出会起多个后台线程写同一目录，最后一条状态还会盖掉失败提示
+        if self._exporting:
+            self.set_status("已有导出任务在进行，请稍候", "#eab308")
+            return
+        self._exporting = True
+        self.export_btn.setEnabled(False)
         out_dir = (os.path.dirname(self._current_file)
                    if filename is None else os.path.dirname(filename))
         stem = os.path.splitext(os.path.basename(self._current_file))[0]
@@ -614,7 +620,8 @@ class DocPage(QWidget):
         def run():
             try:
                 out = export_text(text, entries, fmt, out_dir, stem,
-                                  filename=filename)
+                                  filename=filename,
+                                  overwrite=filename is not None)
                 self._sig_export_done.emit(out)
             except Exception as e:
                 self._sig_export_error.emit(str(e))
@@ -622,11 +629,16 @@ class DocPage(QWidget):
         threading.Thread(target=run, daemon=True).start()
 
     def _on_export_done(self, path):
+        self._exporting = False
+        self.export_btn.setEnabled(True)
         self._last_out_dir = os.path.dirname(path)
         self.open_dir_btn.setEnabled(True)
-        self.set_status(f"已导出: {os.path.basename(path)}", "#4ade80")
+        self.set_status(
+            f"已导出: {path}（可点「打开输出文件夹」查看）", "#4ade80")
 
     def _on_export_error(self, msg):
+        self._exporting = False
+        self.export_btn.setEnabled(True)
         self.set_status(f"导出失败: {msg[:120]}", "#e5635f")
 
     def _on_export(self):
