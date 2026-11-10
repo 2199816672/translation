@@ -6,6 +6,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  # GitHub Actions 的 Windows runner 控制台默认 cp1252，产品代码里的中文
+  # 提示（配置损坏告警、构建脚本输出）会触发 UnicodeEncodeError。统一按
+  # UTF-8 输出，让回归测试只测逻辑、不受 runner 区域设置影响。
+  PYTHONIOENCODING: utf-8
+
 jobs:
   core-tests:
     name: 语法检查 + 回归测试 (Python ${{ matrix.python-version }})

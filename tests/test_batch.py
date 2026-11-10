@@ -484,7 +484,10 @@ class RealExportTests(unittest.TestCase):
         summary = self._runner(settings).run()
         self.assertEqual(summary['done'], 1)
         out = Path(summary['outputs'][0])
-        self.assertEqual(out.parent, self.src.parent)
+        # Windows runner 的 TEMP 可能是 8.3 短名（RUNNER~1），路径字符串
+        # 与 resolve 后的长名不同；比较是否同一个目录而不是字符串相等。
+        self.assertTrue(out.parent.samefile(self.src.parent),
+                        f'{out.parent} 与 {self.src.parent} 不是同一目录')
         self.assertEqual(out.name, '讲座_字幕.srt')
         self.assertIn('line 0', out.read_text(encoding='utf-8'))
 

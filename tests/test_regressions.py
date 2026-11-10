@@ -77,7 +77,9 @@ class ExportTests(unittest.TestCase):
         out = format_convert.export_text(
             '内容', None, 'txt', self.root, 'doc',
             filename=str(target), overwrite=True)
-        self.assertEqual(Path(out), target)
+        # Windows runner 的 TEMP 可能是 8.3 短名，同上比较同一文件
+        self.assertTrue(Path(out).samefile(target),
+                        f'{out} 与 {target} 不是同一文件')
         self.assertNotEqual(target.read_bytes(), b'old')
 
     def test_default_export_never_overwrites(self):
