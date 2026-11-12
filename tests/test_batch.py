@@ -380,7 +380,7 @@ class TranslationSafetyTests(unittest.TestCase):
 
         fake.Translator = FakeTranslator
         with mock.patch.dict(sys.modules, {'translator': fake}):
-            results, failed = bt._default_translate(
+            results, failed, _ = bt._default_translate(
                 ['原文A', '原文B', '原文C'],
                 {'src_lang': 'auto', 'target_lang': 'zh-CN'}, None, None)
         self.assertEqual(results, ['译文A', '', ''])
@@ -398,7 +398,7 @@ class TranslationSafetyTests(unittest.TestCase):
 
         fake.Translator = FakeTranslator
         with mock.patch.dict(sys.modules, {'translator': fake}):
-            results, failed = bt._default_translate(['原文'], {}, None, None)
+            results, failed, _ = bt._default_translate(['原文'], {}, None, None)
         self.assertEqual(results, [''])
         self.assertEqual(failed, 1)
 

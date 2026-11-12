@@ -1525,12 +1525,13 @@ class SettingsPage(QWidget):
             self.ocr_install_btn.setText("安装")
             self._refresh_ocr_status()
             from qfluentwidgets import InfoBar, InfoBarPosition
-            InfoBar.success("安装成功", "OCR 引擎已安装，保存设置后生效",
+            InfoBar.success("安装成功", "OCR 引擎已安装，可直接切换使用；升级后无需重装",
                             duration=3000, position=InfoBarPosition.TOP,
                             parent=self)
         else:
             self.ocr_install_btn.setText("重试安装")
-            self.ocr_status_label.setText(f"安装失败: {msg[:100]}")
+            # pip 的多行错误日志塞进单行标签会把文字撑到界面外，压成一行
+            self.ocr_status_label.setText(f"安装失败: {msg[:100]}".replace("\n", " "))
             self.ocr_status_label.setStyleSheet("color: #e5635f;")
             from qfluentwidgets import InfoBar, InfoBarPosition
             InfoBar.error("安装失败", msg[:200], duration=5000,

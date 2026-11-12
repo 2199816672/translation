@@ -154,6 +154,8 @@ def _default_translate(texts, settings, progress_cb, cancel):
 
     失败条目一律留空串并计数：绝不能把原文塞进译文列表，否则
     「只导出译文」会变成原文冒充译文、「原文 + 译文」会变成重复双语。
+    返回 (results, failed, last_error)：last_error 保留首个真实异常，
+    便于「全部失败」时向用户展示根因（密钥错误 / 网络超时等）。
     """
     from translator import Translator
 
@@ -161,6 +163,7 @@ def _default_translate(texts, settings, progress_cb, cancel):
                             settings.get('target_lang', 'zh-CN'))
     results, failed = [], 0
     total = len(texts)
+    last_error = ''
     for i, text in enumerate(texts, 1):
         if cancel is not None and cancel.is_set():
             raise Cancelled()
@@ -169,8 +172,10 @@ def _default_translate(texts, settings, progress_cb, cancel):
             value = translator.translate(text)
             if value is not None and str(value).strip():
                 translated = str(value)
-        except Exception:
-            pass
+        except Exception as e:
+            # 保留首个真实错误，便于全部失败时展示根因，而非只报「X 条失败」
+            if not last_error:
+                last_error = str(e)[:120]
         if translated:
             results.append(translated)
         else:
@@ -178,7 +183,7 @@ def _default_translate(texts, settings, progress_cb, cancel):
             results.append('')
         if progress_cb and (i % 5 == 0 or i == total):
             progress_cb(f'正在翻译字幕 {i}/{total}', int(i * 100 / total))
-    return results, failed
+    return results, failed, last_error
 
 
 def _default_export(segments, translations, settings, source_path):
@@ -258,9 +263,16 @@ class BatchRunner:
                 if translate_on:
                     texts = [str(s.get('text', '')) for s in segments]
                     try:
-                        translations, failed_trans = self.translate(
+                        out = self.translate(
                             texts, self.settings,
                             lambda t, p: progress(t, p), self.cancel)
+                        if not isinstance(out, (tuple, list)) or len(out) not in (2, 3):
+                            raise TypeError(
+                                '翻译回调应返回 (译文列表, 失败数) 或 '
+                                '(译文列表, 失败数, 错误原因)')
+                        translations, failed_trans = out[0], out[1]
+                        if len(out) == 3:
+                            translate_error = str(out[2] or '')[:120]
                     except Cancelled:
                         raise
                     except Exception as e:
@@ -298,6 +310,8 @@ class BatchRunner:
                 elif failed_trans:
                     job.detail = (f'翻译 {failed_trans}/{len(segments)} 条失败，'
                                   '失败条目只保留原文')
+                    if translate_error:
+                        job.detail += f'（{translate_error}）'
                 else:
                     job.detail = f'{len(segments)} 条字幕'
             except Cancelled:

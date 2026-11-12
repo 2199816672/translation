@@ -50,13 +50,20 @@ def _need(module, pip_name):
 
 def read_text(path):
     """多编码读取文本文件（TXT 常见 UTF-8 / GBK）。"""
-    for enc in ('utf-8-sig', 'utf-8', 'gbk', 'gb18030', 'latin-1'):
+    for enc in ('utf-8-sig', 'utf-8', 'gbk', 'gb18030'):
         try:
             with open(path, 'r', encoding=enc) as f:
                 return f.read()
         except (UnicodeDecodeError, UnicodeError):
             continue
-    raise RuntimeError("无法读取文件，请检查文件编码")
+    # 兜底：仅当文件为纯 ASCII 时才用 latin-1 解码，避免把 GBK/Big5 等非常规编码
+    # 静默解码成乱码（latin-1 能解码任何字节，但非 ASCII 字节会变成乱码）。
+    try:
+        with open(path, 'rb') as fb:
+            return fb.read().decode('ascii')
+    except Exception:
+        pass
+    raise RuntimeError("无法读取文件，请检查文件编码（支持 UTF-8 / GBK）")
 
 
 def doc_text(src):
@@ -157,15 +164,15 @@ def images_to_pdf_bytes(paths, progress_cb=None):
         raise RuntimeError("请先安装依赖: pip install Pillow")
     pages = []
     for p in paths:
-        img = Image.open(p)
-        if img.mode in ('RGBA', 'LA', 'P'):
-            img = img.convert('RGBA')
-            bg = Image.new('RGB', img.size, (255, 255, 255))
-            bg.paste(img, mask=img.split()[-1])
-            img = bg
-        else:
-            img = img.convert('RGB')
-        pages.append(img)
+        with Image.open(p) as src:
+            if src.mode in ('RGBA', 'LA', 'P'):
+                img = src.convert('RGBA')
+                bg = Image.new('RGB', img.size, (255, 255, 255))
+                bg.paste(img, mask=img.split()[-1])
+                img = bg
+            else:
+                img = src.convert('RGB')
+            pages.append(img)
     if not pages:
         raise RuntimeError("没有可转换的图片")
     buf = io.BytesIO()

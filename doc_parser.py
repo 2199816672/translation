@@ -132,17 +132,22 @@ def _parse_xlsx(path):
     try:
         from openpyxl import load_workbook
         wb = load_workbook(path, read_only=True, data_only=True)
-        text_parts = []
-        for sheet in wb.sheetnames:
-            ws = wb[sheet]
-            text_parts.append(f"[{sheet}]")
-            for row in ws.iter_rows(values_only=True):
-                cells = [str(c) for c in row if c is not None]
-                if cells:
-                    text_parts.append(' | '.join(cells))
-            text_parts.append('')
-        wb.close()
-        return '\n'.join(text_parts)
+        try:
+            text_parts = []
+            for sheet in wb.sheetnames:
+                ws = wb[sheet]
+                text_parts.append(f"[{sheet}]")
+                for row in ws.iter_rows(values_only=True):
+                    cells = [str(c) for c in row if c is not None]
+                    if cells:
+                        text_parts.append(' | '.join(cells))
+                # 每个工作表之间空一行即可；原先误缩进到逐行循环内会让
+                # xlsx 转文本每行都带空行，逐行翻译的行数直接翻倍。
+                text_parts.append('')
+            return '\n'.join(text_parts)
+        finally:
+            # 异常路径也必须释放句柄，否则 read_only 模式会锁住文件
+            wb.close()
     except ImportError:
         raise RuntimeError("请安装 openpyxl: pip install openpyxl")
 

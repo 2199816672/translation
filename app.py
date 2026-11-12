@@ -17,10 +17,18 @@ def _acquire_single_instance():
         lock = QLockFile(os.path.join(
             os.environ.get("TEMP", os.path.expanduser("~")),
             "TranslationTool.lock"))
-        # 使用默认过期策略：崩溃残留的锁不会永久阻止启动
+        # 先正常抢锁：确有另一实例运行时不去做任何删除动作，避免误删活锁。
         if lock.tryLock(0):
             _instance_lock = lock
             return True
+        # 只有抢锁失败才尝试清理崩溃残留的 stale 锁，然后重试一次。
+        # removeStaleLockFile 自身会校验 PID/主机名，不会删掉活实例的锁。
+        try:
+            if lock.removeStaleLockFile() and lock.tryLock(0):
+                _instance_lock = lock
+                return True
+        except Exception:
+            pass
         return False
     except Exception:
         return True

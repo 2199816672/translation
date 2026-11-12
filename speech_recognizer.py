@@ -29,7 +29,7 @@ import uuid
 from urllib.parse import urlsplit
 
 # 本地模型缓存目录（用户目录下，不写入项目）
-from subprocess_util import pip_cmd, popen_quiet, run_quiet
+from subprocess_util import pip_cmd, pip_process, run_quiet
 
 MODEL_ROOT = os.path.join(os.path.expanduser("~"), ".cache", "trans_asr", "models")
 
@@ -230,6 +230,8 @@ def check_dependencies():
     依赖残缺时由 transcribe_local() 捕获 ImportError 再提示安装。
     """
     import importlib.util
+    from app_paths import refresh_user_libs
+    refresh_user_libs()   # 刚在线装完 faster-whisper 时立刻可见
     missing = []
     for mod in ('faster_whisper', 'ctranslate2', 'av', 'tokenizers'):
         try:
@@ -262,20 +264,19 @@ def _run_pip(extra_args, progress_cb=None):
     if cmd is None:
         return False, hint
     try:
-        proc = popen_quiet(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True,
-        )
-        tail = []
-        while True:
-            line = proc.stdout.readline()
-            if not line and proc.poll() is not None:
-                break
-            if line:
-                tail.append(line.strip())
-                if progress_cb:
-                    progress_cb(line)
-        proc.wait()
+        # 看门狗超时会 kill 子进程，readline() 随即返回空串，不会永久卡住
+        with pip_process(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True) as proc:
+            tail = []
+            while True:
+                line = proc.stdout.readline()
+                if not line and proc.poll() is not None:
+                    break
+                if line:
+                    tail.append(line.strip())
+                    if progress_cb:
+                        progress_cb(line)
         return proc.returncode == 0, '\n'.join(tail[-8:])
     except Exception as e:
         return False, f"执行失败: {e}"
@@ -286,8 +287,8 @@ def install_dependencies(progress_cb=None):
 
     国内镜像偶发 403（限流/同步问题）时，会自动切换阿里云 / PyPI 官方。
     """
-    _, hint = pip_cmd(_PIP_PACKAGES)
-    if hint:  # 冻结态：不做四个镜像的无谓重试
+    cmd, hint = pip_cmd(_PIP_PACKAGES)
+    if cmd is None:  # 防御：pip 不可用时不做四个镜像的无谓重试
         return False, hint
     last_tail = ""
     total = len(_PIP_INDEXES)
@@ -704,9 +705,41 @@ _shared_whisper_locks = {}
 _shared_whisper_lock = threading.Lock()
 
 
+def _release_whisper_entry(key):
+    """释放某个模型缓存条目占用的显存/内存（尽力而为）。"""
+    model = _shared_whisper_models.pop(key, None)
+    # 刻意保留 _shared_whisper_locks[key]：正在推理的线程可能仍持有这把锁，
+    # 若这里删掉，下次重建同 key 模型会拿到另一把锁，同一实例就被两把不同
+    # 的锁「保护」，ctranslate2 并发推理会崩。Lock 只有几十字节，可常驻。
+    if model is not None:
+        try:
+            del model
+        except Exception:
+            pass
+    try:
+        import gc
+        gc.collect()
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _free_other_devices(norm_path, keep_key):
+    """切换设备/精度时，释放同一模型路径下旧设备对应的实例，避免显存累积。"""
+    for key in list(_shared_whisper_models.keys()):
+        if key[0] == norm_path and key != keep_key:
+            _release_whisper_entry(key)
+
+
 def _get_whisper_model(path, device, compute):
-    """获取（必要时创建）共享的 Whisper 模型，并返回该模型的互斥锁。"""
-    key = (os.path.normcase(os.path.abspath(path)), device, compute)
+    """获取（必要时创建）共享的 Whisper 模型，并返回该模型的互斥锁。
+
+    同一模型路径在切换设备/精度时，旧实例会被释放，避免显存无限累积。
+    """
+    norm_path = os.path.normcase(os.path.abspath(path))
+    key = (norm_path, device, compute)
     with _shared_whisper_lock:
         lock = _shared_whisper_locks.get(key)
         if lock is None:
@@ -714,10 +747,35 @@ def _get_whisper_model(path, device, compute):
             _shared_whisper_locks[key] = lock
         model = _shared_whisper_models.get(key)
         if model is None:
+            # 切换设备/精度时释放旧实例，避免显存累积
+            _free_other_devices(norm_path, key)
             from faster_whisper import WhisperModel
             model = WhisperModel(path, device=device, compute_type=compute)
             _shared_whisper_models[key] = model
     return model, lock
+
+
+def unload_whisper_model(path=None, device=None, compute=None):
+    """释放指定（或全部）缓存的 Whisper 模型，释放显存/内存。
+
+    path / device / compute 各自独立作为过滤条件，None 表示该维度不限。
+    三个参数全为 None 时才清空全部缓存。
+    """
+    norm_path = (os.path.normcase(os.path.abspath(path))
+                 if path is not None else None)
+    with _shared_whisper_lock:
+        for key in list(_shared_whisper_models.keys()):
+            if ((norm_path is None or key[0] == norm_path)
+                    and (device is None or key[1] == device)
+                    and (compute is None or key[2] == compute)):
+                _release_whisper_entry(key)
+
+
+def unload_all_whisper_models():
+    """释放所有缓存的 Whisper 模型（切换设置或退出前可调用，释放显存）。"""
+    with _shared_whisper_lock:
+        for key in list(_shared_whisper_models.keys()):
+            _release_whisper_entry(key)
 
 
 def _fmt_clock(seconds):

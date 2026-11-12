@@ -3,6 +3,7 @@
 """主页：截图控制、图片预览、OCR 文本、翻译结果。"""
 import os
 import threading
+from datetime import datetime
 
 from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap
@@ -152,6 +153,12 @@ class HomePage(QWidget):
         action_bar.addWidget(self.subtitle_source_combo)
 
         action_bar.addStretch(1)
+
+        self.save_btn = self._btn("保存", kind="ghost")
+        self.save_btn.setToolTip(
+            "把「识别文本」与「翻译结果」保存到本地文件（.txt / .md）")
+        self.save_btn.clicked.connect(self._on_save)
+        action_bar.addWidget(self.save_btn)
 
         self.clear_btn = self._btn("清空", kind="ghost")
         self.clear_btn.clicked.connect(self._on_clear)
@@ -377,6 +384,8 @@ class HomePage(QWidget):
             from PySide6.QtWidgets import QApplication
             QApplication.clipboard().setText(text)
             self.set_status("已复制原文")
+        else:
+            self.set_status("没有可复制的原文", "#71717a")
 
     @Slot()
     def _copy_translation(self):
@@ -385,6 +394,8 @@ class HomePage(QWidget):
             from PySide6.QtWidgets import QApplication
             QApplication.clipboard().setText(text)
             self.set_status("已复制译文")
+        else:
+            self.set_status("没有可复制的译文", "#71717a")
 
     @Slot()
     def _on_clear(self):
@@ -395,3 +406,34 @@ class HomePage(QWidget):
         self._current_image_path = None
         self.set_status("已清空")
         self.clearRequested.emit()
+
+    @Slot()
+    def _on_save(self):
+        """把「识别文本」与「翻译结果」导出到本地文件，便于留存与分享。"""
+        src = self.ocr_text.toPlainText()
+        trans = self.trans_text.toPlainText()
+        if not src.strip() and not trans.strip():
+            self.set_status("没有可保存的内容", "#71717a")
+            return
+        from PySide6.QtWidgets import QFileDialog
+        default_name = f"翻译结果_{datetime.now():%Y%m%d_%H%M%S}.txt"
+        path, chosen = QFileDialog.getSaveFileName(
+            self, "保存识别 / 翻译结果", default_name,
+            "文本文件 (*.txt);;Markdown (*.md)")
+        if not path:
+            return
+        # 用户手输文件名不带后缀时按所选格式补全，避免存出无扩展名文件
+        if not os.path.splitext(path)[1]:
+            path += '.md' if '*.md' in (chosen or '') else '.txt'
+        try:
+            # .txt 带 UTF-8 BOM：Windows 记事本 / Excel 打开中文才不乱码，
+            # 与项目其它文本导出（convert_libs）保持一致；.md 用纯 UTF-8。
+            enc = "utf-8-sig" if path.lower().endswith(".txt") else "utf-8"
+            with open(path, "w", encoding=enc) as f:
+                if src.strip():
+                    f.write("【原文】\n" + src + "\n\n")
+                if trans.strip():
+                    f.write("【译文】\n" + trans + "\n")
+            self.set_status(f"已保存到 {os.path.basename(path)}", "#4ade80")
+        except Exception as e:
+            self.set_status(f"保存失败：{e}", "#e5635f")

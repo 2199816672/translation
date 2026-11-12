@@ -38,7 +38,7 @@ SETUP_PREFIX = "TranslationTool-Setup-v"
 # 包内默认配置覆盖用户设置（ignoreversion），卸载时还会被当作安装文件删掉。
 RUNTIME_DATA = (
     "user_config.json", "user_config.json.broken", "user_config.json.tmp",
-    "screenshots", "models", "converted",
+    "screenshots", "models", "converted", "user_libs",
 )
 
 
@@ -140,7 +140,12 @@ def sanitize_app_dir(app_dir: Path) -> None:
             src.rename(dst)
             moved.append(name)
         except OSError as exc:
-            print(f"警告：无法移出 {name}: {exc}", flush=True)
+            # 绝不能带着用户数据继续打包：一旦它进了 [Files] 清单，覆盖升级
+            # 会用包内默认值覆盖用户设置、卸载时还会把组件当程序文件删掉。
+            raise RuntimeError(
+                f"无法把运行时数据 {name} 移出打包源：{exc}\n"
+                "请关闭正在运行的程序或检查文件占用后重新构建。"
+            ) from exc
     if moved:
         print(f"已从打包源移出运行时数据: {', '.join(moved)}", flush=True)
     else:

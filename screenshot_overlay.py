@@ -637,16 +637,21 @@ class ScreenshotOverlay(QWidget):
             self._row2_layout.addWidget(self._size_label)
             self._menu_row2.setVisible(True)
         else:
-            actions = ["复制", "保存", "提取", "翻译"]
+            # 已有识别文字时，提供「复制文字」一键拿译文/原文（翻译工具最高频动作），
+            # 「复制图片」保留原选区图片复制，避免只能复制图片拿不到文字。
+            if self._ocr_text:
+                actions = ["复制文字", "复制图片", "保存", "提取", "翻译"]
+            else:
+                actions = ["复制", "保存", "提取", "翻译"]
             if self._mode == "translate" and self._ocr_text:
-                actions[3] = "原文" if self._showing_trans else "翻译"
+                actions[-1] = "原文" if self._showing_trans else "翻译"
             if self._trans_text.strip():
                 actions.append("润色")
             actions.extend(["编辑", "取消"])
             for name in actions:
                 btn = self._menu_button(
                     name, lambda n=name: self._do_action(n))
-                if name in ("复制", "翻译", "保存"):
+                if name in ("复制", "复制图片", "复制文字", "翻译", "保存"):
                     btn.setProperty("kind", "primary")
                 self._row1_layout.addWidget(btn)
             self._menu_row2.setVisible(False)
@@ -981,6 +986,39 @@ class ScreenshotOverlay(QWidget):
         self._extract_text_edit.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
         layout.addWidget(self._extract_text_edit)
 
+        # 底部操作：一键复制 / 保存识别文字，避免弹窗里还得手动 Ctrl+C
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        self._extract_copy_btn = QPushButton("复制")
+        self._extract_copy_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._extract_copy_btn.clicked.connect(self._on_extract_copy)
+        self._extract_save_btn = QPushButton("保存")
+        self._extract_save_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._extract_save_btn.clicked.connect(self._on_extract_save)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self._extract_copy_btn)
+        btn_row.addWidget(self._extract_save_btn)
+        layout.addLayout(btn_row)
+
+    def _flash_extract_btn(self, btn, text):
+        """在弹窗按钮上就地显示短反馈并自动恢复。
+
+        主浮层的 _status_text 是画在全屏覆盖层上的，提取弹窗是独立置顶
+        窗口，用户看不到那里的提示；改为按钮自身换字最直观，也不会像
+        _status_timer.stop() 那样让提示永久残留。
+        """
+        original = btn.text()
+        btn.setText(text)
+        btn.setEnabled(False)
+
+        def _restore():
+            try:
+                btn.setText(original)
+                btn.setEnabled(True)
+            except RuntimeError:
+                pass  # 弹窗已被销毁
+        QTimer.singleShot(1200, _restore)
+
     def _show_extract_popup(self, text):
         if self._extract_popup is None:
             self._create_extract_popup()
@@ -1004,6 +1042,38 @@ class ScreenshotOverlay(QWidget):
     def _hide_extract_popup(self):
         if self._extract_popup:
             self._extract_popup.hide()
+
+    def _on_extract_copy(self):
+        """提取弹窗：一键复制识别文字到剪贴板。"""
+        text = self._extract_text_edit.toPlainText()
+        if not text.strip():
+            self._flash_extract_btn(self._extract_copy_btn, "无内容")
+            return
+        QApplication.clipboard().setText(text)
+        self._flash_extract_btn(self._extract_copy_btn, "已复制")
+
+    def _on_extract_save(self):
+        """提取弹窗：把识别文字保存到本地文件。"""
+        text = self._extract_text_edit.toPlainText()
+        if not text.strip():
+            self._flash_extract_btn(self._extract_save_btn, "无内容")
+            return
+        path, chosen = QFileDialog.getSaveFileName(
+            self, "保存识别文字", "识别文字.txt",
+            "文本文件 (*.txt);;Markdown (*.md)")
+        if not path:
+            return
+        # 用户手输文件名不带后缀时按所选格式补全
+        if not os.path.splitext(path)[1]:
+            path += '.md' if '*.md' in (chosen or '') else '.txt'
+        try:
+            with open(path, "w", encoding="utf-8-sig" if
+                      path.lower().endswith(".txt") else "utf-8") as f:
+                f.write(text)
+            self._flash_extract_btn(self._extract_save_btn, "已保存")
+        except Exception as e:
+            self._flash_extract_btn(self._extract_save_btn, "保存失败")
+            print(f"保存识别文字失败：{e}")
 
     def _on_extract_popup_close(self):
         self._hide_extract_popup()
@@ -1679,7 +1749,23 @@ class ScreenshotOverlay(QWidget):
         self._status_timer.stop()
         self.setCursor(QCursor(Qt.CursorShape.WaitCursor))
 
-        if name == "复制":
+        if name == "复制文字":
+            # 翻译工具最高频动作是「拿译文」：译文优先，未翻译时回退原文
+            text = (self._trans_text.strip() or self._ocr_text.strip())
+            if not text:
+                # 没有文字时别静默关掉浮层，用户会以为复制成功了
+                self._status_text = "没有可复制的文字"
+                self._status_timer.start()
+                self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+                self.update()
+                return
+            QApplication.clipboard().setText(text)
+            self._hide_extract_popup()
+            self.close()
+            self.finished.emit()
+        elif name in ("复制", "复制图片"):
+            # 菜单在有识别文字时把「复制」改名成「复制图片」，两个名字必须都
+            # 走这里；否则会落到末尾的 _cancel()，图片没复制还把截图作废了。
             self._show_menu = False
             image = self._crop_image()
             if image:

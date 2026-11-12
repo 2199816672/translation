@@ -5,6 +5,8 @@ PROJECT_MEMORY.md
 screenshot_old.py
 screenshots/
 converted/
+models/
+user_libs/
 dist/
 build/
 *.spec

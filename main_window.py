@@ -164,6 +164,7 @@ class MainWindow(FluentWindow):
         self._upgrade_dialog = None
         self._upgrade_cancel = None
         self._upgrade_info = None
+        self._pending_installer_path = None
         self._update_stop = threading.Event()
 
         self.home = HomePage(self)
@@ -484,6 +485,8 @@ class MainWindow(FluentWindow):
         from PySide6.QtCore import QUrl
         from update_dialog import DownloadDialog, UPGRADE
         import updater
+        # 记录已下好的安装包路径，避免完成信号因对话框已关闭被丢弃导致漏装
+        self._pending_installer_path = None
         if not info.has_installer:
             QDesktopServices.openUrl(QUrl(info.page_url or updater.RELEASES_URL))
             return
@@ -538,8 +541,12 @@ class MainWindow(FluentWindow):
         threading.Thread(target=_worker, daemon=True).start()
         code = dialog.exec()
         self._upgrade_dialog = None
-        if code == UPGRADE and dialog.installer_path is not None:
-            self._queue_install(dialog.installer_path)
+        # 即便完成信号晚到（对话框已关闭使 _on_update_finished 提前返回），
+        # 安装包路径也已存入 _pending_installer_path，不会丢失。
+        installer = self._pending_installer_path or dialog.installer_path
+        self._pending_installer_path = None
+        if code == UPGRADE and installer is not None:
+            self._queue_install(installer)
         else:
             cancel.set()  # 取消 / 关闭时让下载线程尽快退出
 
@@ -551,6 +558,10 @@ class MainWindow(FluentWindow):
 
     @Slot(bool, str, str)
     def _on_update_finished(self, ok, message, path):
+        # 先落盘路径：即使对话框已关闭导致下面提前返回，安装包也不会丢。
+        # 该状态只在主线程写（worker 仅通过信号传 path），避免跨线程串台；
+        # 失败/取消一律清空，杜绝「取消了却还装着旧路径」。
+        self._pending_installer_path = path if (ok and path) else None
         dlg = self._upgrade_dialog
         if dlg is None or not dlg.isVisible():
             return
@@ -758,6 +769,11 @@ class MainWindow(FluentWindow):
         self._live_pending = False
         if rect.width() < 8 or rect.height() < 8:
             self._restore_main_after_live()
+            # 关闭残留浮层并清理引用，避免「选区太小 → 取消」后浮层卡在
+            # 屏幕上、主窗口（从托盘触发时）无法恢复只能去托盘找回。
+            if self._overlay is not None:
+                self._overlay.close()
+            self._overlay = None
             self._on_status("选区太小，无法实时翻译", "#eab308")
             return
         try:
@@ -991,6 +1007,9 @@ class MainWindow(FluentWindow):
 
     @Slot(int, str)
     def _on_caption_segment(self, seq, text):
+        # 停止后迟到的回调直接丢弃：引擎已置空，避免主页继续追加已「停止」的字幕
+        if self._caption_engine is None:
+            return
         if self._caption_window is not None:
             self._caption_window.append_source(seq, text)
         # 字幕框隐藏后仍继续写主页「识别文本」
@@ -998,6 +1017,9 @@ class MainWindow(FluentWindow):
 
     @Slot(int, str)
     def _on_caption_translation(self, seq, text):
+        # 停止后迟到的译文回调同样丢弃
+        if self._caption_engine is None:
+            return
         if not bool(self._caption_cfg.get('subtitle_translate', True)):
             return  # 用户没开翻译，就绝不往「翻译结果」里写东西
         if self._caption_window is not None:
@@ -1056,15 +1078,11 @@ class MainWindow(FluentWindow):
 
     @Slot()
     def _on_caption_window_closed(self):
-        """窗口被意外销毁时重建一个，识别不中断；正常停止走 _stop_caption。"""
+        """浮层窗口被外部关闭（Alt+F4 / WM_CLOSE / 显示变更）时直接停止字幕识别；
+        正常「停止」走 _stop_caption，且其 close 已被 blockSignals 屏蔽，不会触发此处。"""
+        if self._caption_engine is not None:
+            self._stop_caption()
         self._caption_window = None
-        if self._caption_engine is not None and self._caption_cfg:
-            try:
-                win = self._new_caption_window(dict(self._caption_cfg))
-                self._caption_window = win
-                win.show_overlay()
-            except Exception:
-                pass
 
     def _set_caption_mode(self, mode, _checked=False):
         from config import SUBTITLE_DISPLAY_MODES, save_user_config

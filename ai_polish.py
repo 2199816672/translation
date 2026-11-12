@@ -454,7 +454,12 @@ _NUM_RE = re.compile(r"^\s*(\d+)\s*[.、)．]\s*(.*)$")
 
 
 def _parse_batch(raw, originals):
-    """解析批量结果：优先按编号，其次按行数；失败返回 None。"""
+    """解析批量结果：严格按编号匹配；无法可靠对齐时返回 None，由调用方逐条处理。
+
+    行式（无编号）的回退对齐已移除：模型在批量输出时可能重排条目，按位置 zip 会把
+    一条译文错配到另一条原文上且无任何报错。返回 None 后 _polish_chunk 会回退到
+    _polish_single 逐条调用，天然保持一一对应。
+    """
     cleaned = _clean_output(raw)
     if not cleaned:
         return None
@@ -470,10 +475,6 @@ def _parse_batch(raw, originals):
     if len(parsed) == len(originals):
         return [_clean_output(parsed[i], originals[i]) or originals[i]
                 for i in range(len(originals))]
-    if not parsed and len(lines) == len(originals):
-        result = [_clean_output(line, original) or original
-                  for line, original in zip(lines, originals)]
-        return result
     return None
 
 

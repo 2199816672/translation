@@ -92,13 +92,19 @@ def _clean_text(text):
 
 def _read_text(path):
     """多编码尝试读取（SRT 常见 GBK/UTF-8）。"""
-    for enc in ('utf-8-sig', 'utf-8', 'gbk', 'gb18030', 'latin-1'):
+    for enc in ('utf-8-sig', 'utf-8', 'gbk', 'gb18030'):
         try:
             with open(path, 'r', encoding=enc) as f:
                 return f.read()
         except (UnicodeDecodeError, UnicodeError):
             continue
-    raise RuntimeError("无法读取字幕文件，请检查文件编码")
+    # 兜底：仅纯 ASCII 才用 latin-1，避免非常规编码被静默解码成乱码
+    try:
+        with open(path, 'rb') as fb:
+            return fb.read().decode('ascii')
+    except Exception:
+        pass
+    raise RuntimeError("无法读取字幕文件，请检查文件编码（支持 UTF-8 / GBK）")
 
 
 def _detect_format(path, content):

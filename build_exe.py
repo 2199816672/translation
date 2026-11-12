@@ -10,10 +10,12 @@
     <distpath>/TranslationTool/TranslationTool.exe
 
 说明：
-- 用户数据（user_config.json / screenshots / models）一律放在 exe 同目录，
-  不进入安装清单，覆盖升级不会丢；
+- 用户数据（user_config.json / screenshots / models / user_libs）一律放在
+  exe 同目录，不进入安装清单，覆盖升级不会丢；
 - 体积很大的可选后端（torch / easyocr / CUDA 等）全部排除，OCR 默认使用
-  Windows 系统自带引擎；faster-whisper、soundcard 等随包附带。
+  Windows 系统自带引擎；faster-whisper、soundcard 等随包附带；
+- 但 pip 本身随包附带：安装版可通过设置页在线安装可选组件，装到用户数据
+  目录 user_libs（不进安装清单，升级后不用重装），见 main.py 的 worker 模式。
 """
 import argparse
 import shutil
@@ -78,6 +80,13 @@ def main() -> int:
         "--add-data", "pages;pages",
     ]
     for module in HIDDEN_IMPORTS:
+        cmd += ["--hidden-import", module]
+    # pip 的子模块大量通过字符串 / importlib 动态导入，必须整包收集（含
+    # pip._vendor 里的 CA 证书等数据），否则 worker 模式装组件时 SSL 或
+    # 依赖解析会失败。体积只有几 MB，换来安装版可在线装组件。
+    cmd += ["--collect-all", "pip",
+            "--hidden-import", "pip._internal.cli.main"]
+    for module in ("certifi", "truststore"):
         cmd += ["--hidden-import", module]
     for module in EXCLUDES:
         cmd += ["--exclude-module", module]

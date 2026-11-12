@@ -5,7 +5,7 @@
 ; 本文件必须保存为 UTF-8 with BOM，否则中文会乱码。
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.5.0"
+  #define MyAppVersion "1.5.1"
 #endif
 ; 待打包的程序目录。手工编译时使用默认 dist\TranslationTool；
 ; build_installer.py 会通过 /dSourceDir 指向每次构建的全新暂存目录。
@@ -68,11 +68,12 @@ Name: "chinesesimplified"; MessagesFile: "packaging\ChineseSimplified.isl"
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务:"; Flags: unchecked
 
 [Files]
-; 只打包程序本体。运行时生成的 user_config.json / screenshots / models
-; 绝不能进入安装清单：一旦被登记，覆盖升级会用包内默认配置覆盖用户设置
-; （ignoreversion），卸载时还会被当作安装文件删掉。
-; build_installer.py 会先把这些文件移出源目录；这里的 Excludes 是第二道保险。
-Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "user_config.json, user_config.json.*, screenshots\*, models\*, converted\*, *.log, 使用说明.txt.bak"
+; 只打包程序本体。运行时生成的 user_config.json / screenshots / models /
+; user_libs 绝不能进入安装清单：一旦被登记，覆盖升级会用包内默认配置覆盖
+; 用户设置（ignoreversion）、删掉在线装好的可选组件，卸载时还会被当作安装
+; 文件删掉。build_installer.py 会先把这些文件移出源目录；Excludes 是第二道保险。
+; user_libs 被排除 => 在线安装的组件在升级/覆盖后仍然保留，无需重新安装。
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "user_config.json, user_config.json.*, screenshots\*, models\*, converted\*, user_libs\*, *.log, 使用说明.txt.bak"
 
 ; 面向普通用户的简短说明由 build_exe.py 复制进程序目录，随上面这条一起安装。
 

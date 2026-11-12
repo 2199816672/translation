@@ -47,6 +47,8 @@ _SILENCE_FRAMES = int(SAMPLE_RATE * 0.32)      # 停顿 320ms 视为一句结束
 
 def dependency_status():
     """返回各能力的可用性与给界面看的提示文字。"""
+    from app_paths import refresh_user_libs
+    refresh_user_libs()   # 刚在线装完 soundcard 时立刻可见
     mic = importlib.util.find_spec('sounddevice') is not None
     loopback = importlib.util.find_spec('soundcard') is not None
     local_asr = importlib.util.find_spec('faster_whisper') is not None
@@ -418,8 +420,16 @@ class LiveCaptionEngine:
         if not path:
             raise RuntimeError(
                 f'模型 {name} 未就绪，请先在「音视频」页下载，或在设置里改用在线 API')
+        # 实时字幕的计算设备遵循「语音识别设置 → 计算设备」的选择（asr_device）。
+        # 字幕配置本身不含 asr_device，必须跨模块读 ASR 配置；仅当 ASR 侧
+        # 也没配置时才用字幕配置里的 subtitle_device 兜底。
+        try:
+            from config import get_asr_settings
+            asr_device = str(get_asr_settings().get('asr_device') or '')
+        except Exception:
+            asr_device = ''
         device, compute, notice = asr._resolve_device(
-            str(self.cfg.get('subtitle_device') or 'auto'))
+            str(asr_device or self.cfg.get('subtitle_device') or 'auto'))
         if notice:
             self._call('on_status', notice, '#eab308')
         self._call('on_status', f'正在加载 {name} 模型…', '#eab308')
@@ -559,6 +569,8 @@ class LiveCaptionEngine:
                 self._call('on_error', f'识别失败：{e}')
                 continue
             text = trim_repeated_prefix(text, last_text)
+            if self._stop.is_set():
+                break
             if not text or text == last_text:
                 continue
             last_text = text
@@ -595,4 +607,6 @@ class LiveCaptionEngine:
                 translated = translator.translate(text) or text
             except Exception:
                 translated = text       # 翻译失败保留原文，不丢字幕
+            if self._stop.is_set():
+                break
             self._call('on_translation', seq, translated)

@@ -6,15 +6,18 @@
 * text=True 统一用 UTF-8 + errors=replace，中文 pip / nvidia-smi 输出不会
   UnicodeDecodeError；
 * 冻结（PyInstaller）后 ``sys.executable`` 是应用本体，绝不能拿它跑
-  ``-m pip``——参数会被程序自己吞掉，甚至二次启动应用。这里对冻结态直接
-  给出可操作的错误提示。
+  ``-m pip``——参数会被程序自己吞掉，甚至二次启动应用。这里改用同一个 exe
+  的 ``--tt-pip-worker`` 子进程模式（见 main.py），既不需要用户自己装
+  Python，也保证装进来的 C 扩展与主程序是同一套 Python ABI。
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import subprocess
 import sys
+import threading
 
 from app_paths import is_frozen
 
@@ -46,18 +49,81 @@ def check_call_quiet(cmd, **kwargs) -> int:
     return subprocess.check_call(cmd, **_text_kwargs(kwargs))
 
 
-FROZEN_PIP_HINT = (
-    "当前是安装版，无法在线安装可选组件。\n"
-    "安装包已内置常用功能；若确需该组件，请使用源码版运行，或下载带该组件"
-    "的完整安装包。"
-)
+# 在线装 EasyOCR 会连带下载 torch 等大依赖，留足时间；但绝不允许无限挂起。
+PIP_TIMEOUT = 900
+
+
+@contextlib.contextmanager
+def pip_process(cmd, timeout=PIP_TIMEOUT, **kwargs):
+    """启动 pip 并提供带超时的流式输出读取。
+
+    Windows 下管道不支持 select，调用方阻塞在 ``proc.stdout.readline()`` 时
+    光靠 ``finally`` 里的 terminate 是救不回来的。这里用看门狗在超时后
+    ``kill`` 子进程：管道随之关闭，readline() 返回空串，读取循环自然退出。
+    正常结束时由 ``finally`` 统一收回管道并等待子进程。
+    """
+    proc = popen_quiet(cmd, **kwargs)
+    done = threading.Event()
+
+    def guard():
+        if not done.wait(timeout) and proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    watcher = threading.Thread(target=guard, daemon=True)
+    watcher.start()
+    try:
+        yield proc
+    finally:
+        done.set()
+        stream = getattr(proc, "stdout", None)
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+# 冻结态专用：让应用本体以「pip worker」模式启动（见 main.py）。
+PIP_WORKER_FLAG = "--tt-pip-worker"
 
 
 def pip_cmd(packages, extra_args=()):
-    """构造 pip 命令；冻结态返回 (None, 提示文本)，调用方须直接返回失败。"""
+    """构造 ``pip install`` 命令，返回 ``(cmd, hint)``；hint 非空表示无法安装。
+
+    * 源码版：``python -m pip install ...``，沿用用户自己的环境；
+    * 安装版：``TranslationTool.exe --tt-pip-worker install ...``，并统一
+      ``--target`` 到用户数据目录 :func:`app_paths.user_libs_dir`。该目录被
+      安装程序排除在清单外，覆盖升级不会删除，因此组件只需装一次。
+
+    绝不退回「找系统 python 来跑 pip」：系统解释器的版本/位数可能与程序内置
+    解释器不同，装出来的 numpy / torch / cv2 等扩展在本程序里根本 import 不了。
+    """
     args = [str(p) for p in packages]
     if is_frozen():
-        return None, FROZEN_PIP_HINT
+        # 必须用启动时就固定下来的目录：pip_cmd 每次重算 user_libs_dir() 时，
+        # 若磁盘/权限状态变化可能降级到另一目录，造成「装到 A、sys.path 指 B」。
+        from app_paths import USER_LIBS_DIR
+        # 刻意不加 --upgrade：所有组件共用一个 --target，且调用方会做多镜像
+        # 重试；pip 的 --target --upgrade 会替换目标目录里已有的包文件，可能
+        # 把先装好的其它组件/依赖弄成半套状态。首次安装本就无需 upgrade。
+        cmd = [sys.executable, PIP_WORKER_FLAG, "install",
+               "--disable-pip-version-check",
+               "--no-warn-script-location",  # --target 会生成脚本目录，不必警告
+               "--target", str(USER_LIBS_DIR)]
+        return cmd + list(extra_args) + args, ""
     return [sys.executable, "-m", "pip", "install"] + list(extra_args) + args, ""
 
 
