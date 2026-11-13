@@ -6,7 +6,7 @@
 点击穿透和关闭。
 """
 
-from PySide6.QtCore import Qt, QPoint, QRect, QRectF, Signal, Slot
+from PySide6.QtCore import Qt, QPoint, QRect, QRectF, QTimer, Signal, Slot
 from PySide6.QtGui import (QColor, QCursor, QFont, QFontMetrics, QGuiApplication,
                            QPainter, QPen)
 from PySide6.QtWidgets import QApplication, QPushButton, QWidget
@@ -450,6 +450,25 @@ class CaptionWindow(QWidget):
             self._bar.set_mode(mode)
             self.update()
 
+    def apply_appearance(self, cfg):
+        """设置页保存后即时同步字号 / 行数 / 底色，无需停止重开实时字幕。
+
+        这些值原本只在构造时读一次，用户改完设置看到「保存成功」却毫无变化，
+        会反复保存甚至以为设置坏了。
+        """
+        c = dict(cfg or {})
+
+        def _int(key, default):
+            try:
+                return int(c.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        self._font_size = max(12, min(48, _int('subtitle_font_size', 22)))
+        self._max_lines = max(1, min(8, _int('subtitle_max_lines', 3)))
+        self._bg_alpha = max(0, min(255, _int('subtitle_bg_alpha', 190)))
+        self.update()
+
     def _change_font_size(self, delta):
         self._font_size = max(12, min(48, self._font_size + int(delta)))
         self.fontSizeChanged.emit(self._font_size)
@@ -468,8 +487,24 @@ class CaptionWindow(QWidget):
 
     def _copy_text(self):
         text = self.display_text()
-        if text:
-            QApplication.clipboard().setText(text)
+        if not text:
+            return
+        QApplication.clipboard().setText(text)
+        # 开了「点击穿透」后更容易误点，没有任何反馈时无法确认是否复制成功
+        self._flash_state('已复制字幕文字')
+
+    def _flash_state(self, text):
+        """在状态位短显一条操作结果，不打断后续真正的状态更新。"""
+        prev = self._state_text
+        self._state_text = text
+        self.update()
+
+        def restore():
+            # 期间若有新的状态文字进来，就不要把它覆盖回旧值
+            if not self._closed and self._state_text == text:
+                self._state_text = prev
+                self.update()
+        QTimer.singleShot(1500, restore)
 
     # ── 绘制 ────────────────────────────────────────────────
 

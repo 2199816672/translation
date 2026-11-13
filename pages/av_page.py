@@ -91,6 +91,7 @@ class AVPage(QWidget):
     _sig_asr_segment = Signal(dict)
     _sig_asr_done = Signal(dict)
     _sig_asr_error = Signal(str)
+    _sig_asr_stopped = Signal()
     _sig_export_done = Signal(str)
     _sig_export_error = Signal(str)
     _sig_hw_ready = Signal(object)
@@ -132,6 +133,7 @@ class AVPage(QWidget):
         self._sig_asr_segment.connect(self._on_asr_segment)
         self._sig_asr_done.connect(self._on_asr_done)
         self._sig_asr_error.connect(self._on_asr_error)
+        self._sig_asr_stopped.connect(self._on_asr_stopped)
         self._sig_export_done.connect(self._on_export_done)
         self._sig_export_error.connect(self._on_export_error)
         self._build_ui()
@@ -261,7 +263,8 @@ class AVPage(QWidget):
         self.src_lang_combo = QComboBox(self)
         self.src_lang_combo.addItems(list(SUPPORTED_SOURCE_LANGS.keys()))
         self.src_lang_combo.setCurrentText("自动检测")
-        # 右侧 34px 留给下拉箭头，宽度不足会把「自动检测」裁成「自动检」
+        # 文字区要扣掉左右 padding 与 ::drop-down 箭头位（见 theme.py）；
+        # 宽度不足会把「自动检测」裁成「自动检」，130px 给最长项留足余量。
         self.src_lang_combo.setMinimumWidth(130)
         self.src_lang_combo.setMaxVisibleItems(6)
         self.src_lang_combo.setToolTip(
@@ -281,6 +284,9 @@ class AVPage(QWidget):
         self.lang_combo.setMaxVisibleItems(6)
         self.lang_combo.setToolTip("字幕翻译的目标语言（识别后点「翻译字幕」）")
         row.addWidget(self.lang_combo)
+        import ui_theme
+        ui_theme.align_lang_row(src_label, self.src_lang_combo,
+                                dst_label, self.lang_combo)
         return card
 
     def _build_model_card(self) -> QFrame:
@@ -361,13 +367,26 @@ class AVPage(QWidget):
         self.open_models_btn = self._btn("打开模型目录", kind="ghost")
         self.open_models_btn.clicked.connect(self._open_model_dir)
         self.open_models_btn.setToolTip(
-            f"模型下载位置：{asr.MODEL_ROOT}")
+            "打开本机模型目录；每台电脑位置不同，以实际打开的为准")
         local_row.addWidget(self.open_models_btn)
         local_row.addStretch(1)
         self.install_btn = self._btn("安装识别组件")
         self.install_btn.clicked.connect(self._on_install_deps)
         local_row.addWidget(self.install_btn)
         col.addWidget(self.local_panel)
+
+        # 缓存占用 / 路径：以前只有「打开模型目录」的 tooltip，用户不知道
+        # 下了几个模型、占了多少磁盘、路径也复制不了。
+        cache_row = FlowLayout(spacing=8, vspacing=6)
+        self.model_cache_label = _ElidedLabel("", self)
+        self.model_cache_label.setObjectName("caption")
+        cache_row.addWidget(self.model_cache_label, 1)
+        self.copy_cache_btn = self._btn(
+            "复制缓存路径", kind="ghost", parent=card)
+        self.copy_cache_btn.clicked.connect(self._copy_model_cache_path)
+        cache_row.addWidget(self.copy_cache_btn)
+        col.addLayout(cache_row)
+        self._refresh_model_cache_hint()
 
         self.model_hint = QLabel("", self)
         self.model_hint.setObjectName("caption")
@@ -495,6 +514,10 @@ class AVPage(QWidget):
         lay.addLayout(head)
         edit = QTextEdit(card)
         edit.setReadOnly(True)
+        edit.setPlaceholderText(
+            "选择音视频文件并点「开始识别」，识别结果会显示在这里"
+            if title_text == "识别结果"
+            else "识别完成后点「翻译字幕」，译文会显示在这里")
         edit.setMinimumHeight(110)
         # 垂直方向忽略 QTextEdit 偏大的默认 sizeHint，避免把滚动容器撑到
         # 比窗口还高；剩余高度仍由 stretch 分配给它。
@@ -701,6 +724,9 @@ class AVPage(QWidget):
         self._update_recommend_button()
 
     def _refresh_model_status(self):
+        # 下载期间硬件推荐回调 / 模式切换都会走到这里；若照常刷新按钮，会把
+        # 「取消下载」改回「下载模型」，用户再点一下反而把正在下的模型取消了。
+        downloading = getattr(self, '_download_cancel', None) is not None
         mode = self.mode_combo.currentData()
         if mode == API_MODE:
             self.model_status.setText("在线 API 模式")
@@ -716,23 +742,26 @@ class AVPage(QWidget):
             if not deps_ok:
                 self.model_status.setText("未安装识别组件")
                 self.model_status.setStyleSheet("color: #e5635f;")
-                self.download_btn.setEnabled(False)
-                self.download_btn.setText("下载模型")
+                if not downloading:
+                    self.download_btn.setEnabled(False)
+                    self.download_btn.setText("下载模型")
             elif ready:
                 imported = asr.is_imported_model_ready(name)
                 self.model_status.setText("模型已就绪 ✓")
                 self.model_status.setStyleSheet("color: #4ade80;")
                 # 已下载/已导入的模型禁止重复下载
-                self.download_btn.setEnabled(False)
-                self.download_btn.setText("已导入" if imported else "已下载")
-                self.download_btn.setToolTip(
-                    "模型已存在，无需重复下载；可点「打开模型目录」查看")
+                if not downloading:
+                    self.download_btn.setEnabled(False)
+                    self.download_btn.setText("已导入" if imported else "已下载")
+                    self.download_btn.setToolTip(
+                        "模型已存在，无需重复下载；可点「打开模型目录」查看")
             else:
                 self.model_status.setText("模型未下载")
                 self.model_status.setStyleSheet("color: #eab308;")
-                self.download_btn.setEnabled(bool(name))
-                self.download_btn.setText("下载模型")
-                self.download_btn.setToolTip("")
+                if not downloading:
+                    self.download_btn.setEnabled(bool(name))
+                    self.download_btn.setText("下载模型")
+                    self.download_btn.setToolTip("")
         self.start_btn.setEnabled(
             self._file_path is not None and deps_ok and not self._busy)
 
@@ -844,6 +873,12 @@ class AVPage(QWidget):
         self._refresh_model_status()
 
     def _on_download(self):
+        # 同一个按钮兼任「开始」与「取消」：大模型动辄上 GB，不能锁住用户。
+        if getattr(self, '_download_cancel', None) is not None:
+            self._download_cancel.set()
+            self.download_btn.setEnabled(False)
+            self.download_btn.setText("正在取消…")
+            return
         name = self._current_model()
         if not name:
             return
@@ -857,14 +892,18 @@ class AVPage(QWidget):
         if not deps_ok:
             self.set_status("请先安装识别组件", "#eab308")
             return
-        self.download_btn.setEnabled(False)
+        cancel = threading.Event()
+        self._download_cancel = cancel
         self.model_combo.setEnabled(False)
         self.import_btn.setEnabled(False)
+        self.download_btn.setText("取消下载")
+        self.download_btn.setToolTip(
+            "立即中断下载；未完成的文件会保留，下次点下载自动续传")
         self.dl_progress.setVisible(True)
         self.dl_progress.setRange(0, 0)  # 未知总量时先走不确定动画
         self.dl_progress.setFormat("准备下载…")
         self.dl_label.setVisible(True)
-        self.dl_label.setText(f"正在下载模型 {name} …")
+        self.dl_label.setText(f"正在下载模型 {name} …（可点按钮取消）")
         self.set_status(f"正在下载模型 {name} …", "#eab308")
 
         def run():
@@ -872,14 +911,21 @@ class AVPage(QWidget):
                 asr.download_model(
                     name,
                     lambda done, total: self._sig_download_progress.emit(
-                        done, total))
+                        done, total),
+                    cancel_event=cancel)
                 self._sig_download_done.emit(True, name)
+            except asr.ModelDownloadCancelled:
+                self._sig_download_done.emit(False, "已取消下载")
             except Exception as e:
                 self._sig_download_done.emit(False, str(e))
 
         threading.Thread(target=run, daemon=True).start()
 
     def _on_download_progress(self, done, total):
+        # 下载已结束后忽略仍在队列里的进度回调，别把「已取消 / 已完成」
+        # 又刷回「下载中」。
+        if getattr(self, '_download_cancel', None) is None:
+            return
         if total > 0:
             percent = int(done * 100 / total)
             self.dl_progress.setRange(0, 100)
@@ -892,14 +938,25 @@ class AVPage(QWidget):
             self.dl_label.setText("正在下载…")
 
     def _on_download_done(self, ok, msg):
+        # 以底层结果为准：任务刚结束时再点一下按钮也会置位 cancel，
+        # 不能因此把「下载完成」显示成「已取消」。
+        cancelled = (not ok) and msg == "已取消下载"
+        self._download_cancel = None
+        self.download_btn.setEnabled(True)
+        self.download_btn.setText("下载模型")
+        self.download_btn.setToolTip("")
         self.model_combo.setEnabled(True)
         self.import_btn.setEnabled(True)
         self.dl_progress.setVisible(False)
         self.dl_label.setVisible(False)
         if ok:
             self.set_status(f"模型 {msg} 下载完成", "#4ade80")
+        elif cancelled:
+            self.set_status("已取消下载 · 未完成的文件已保留，下次自动续传",
+                            "#eab308")
         else:
             self.set_status(f"下载失败: {msg[:100]}", "#e5635f")
+        self._refresh_model_cache_hint()
         self._refresh_model_status()
 
     def _on_import_model(self):
@@ -983,6 +1040,7 @@ class AVPage(QWidget):
         api_model = self.api_model.text().strip()
 
         def run():
+            from cancelable import CallCancelled
             try:
                 def on_progress(percent, text):
                     self._sig_asr_progress.emit(int(percent), str(text))
@@ -1003,8 +1061,13 @@ class AVPage(QWidget):
                 else:
                     result = asr.transcribe_api(
                         path, api_base, api_key, api_model,
-                        language=src_code, progress_cb=on_progress)
+                        language=src_code, progress_cb=on_progress,
+                        cancel_event=self._cancel)
                 self._sig_asr_done.emit(result)
+            except CallCancelled:
+                # 在线 API 请求已支持取消，但这里一直没传 cancel_event，
+                # 「停止」仍要等最长 600 秒；补上并把取消与失败分开显示。
+                self._sig_asr_stopped.emit()
             except Exception as e:
                 self._sig_asr_error.emit(str(e))
 
@@ -1015,10 +1078,15 @@ class AVPage(QWidget):
         self.set_status("正在停止识别…", "#eab308")
 
     def _on_asr_progress(self, percent, text):
-        if 0 <= percent <= 100:
+        if self.mode_combo.currentData() == API_MODE:
+            # 在线 API 只有「上传 / 等待 / 完成」几个阶段，5% 不是真实进度；
+            # 用不确定动画 + 阶段文字，免得用户以为卡死在 5%。
+            self.progress.setRange(0, 0)
+            self.progress.setFormat(text)
+        elif 0 <= percent <= 100:
             self.progress.setRange(0, 100)
             self.progress.setValue(percent)
-        self.progress.setFormat(f"{text} {percent}%")
+            self.progress.setFormat(f"{text} {percent}%")
         self.set_status(text, "#eab308")
 
     def _on_asr_segment(self, seg):
@@ -1085,6 +1153,16 @@ class AVPage(QWidget):
         self._sync_buttons()
         self.progress.setVisible(False)
         self.set_status(f"识别失败: {msg[:120]}", "#e5635f")
+
+    def _on_asr_stopped(self):
+        """用户主动停止：和「识别失败」分开，别把已停止显示成报错。"""
+        self._busy = False
+        self._segments = []
+        self._translations = []
+        self._info = {}
+        self._sync_buttons()
+        self.progress.setVisible(False)
+        self.set_status("已停止识别（本次未生成字幕）", "#eab308")
 
     def _format_preview(self, segments):
         lines = []
@@ -1265,10 +1343,34 @@ class AVPage(QWidget):
         if d and os.path.isdir(d):
             QDesktopServices.openUrl(QUrl.fromLocalFile(d))
 
+    def _refresh_model_cache_hint(self):
+        """刷新缓存占用文字与「打开模型目录」的悬停说明（只读元数据）。"""
+        info = asr.model_cache_info()
+        summary = asr.model_cache_summary(info)
+        if hasattr(self, 'model_cache_label'):
+            # 必须用 set_full_text：_ElidedLabel 会在每次 resizeEvent 里按
+            # 内部的 _full 重算省略文字，直接 setText 会在首次布局时被清空，
+            # 用户根本看不到「模型缓存占用」这一行。
+            self.model_cache_label.set_full_text(
+                summary,
+                tooltip="本机模型目录请用「打开目录」按钮定位"
+                        "（每台电脑不同，说明里不写死路径）\n" + summary)
+        if hasattr(self, 'open_models_btn'):
+            self.open_models_btn.setToolTip(
+                "打开本机模型下载目录；每台电脑的位置可能不同，"
+                "以实际打开的为准\n" + summary)
+
+    def _copy_model_cache_path(self):
+        from PySide6.QtWidgets import QApplication
+        root = str(asr.model_cache_info()['root'])
+        QApplication.clipboard().setText(root)
+        self.set_status("已复制本机模型缓存路径，可直接粘贴使用", "#4ade80")
+
     def _open_model_dir(self):
         """打开模型下载目录（不存在则先创建）。"""
         os.makedirs(asr.MODEL_ROOT, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(asr.MODEL_ROOT))
+        self._refresh_model_cache_hint()
 
     # ── 杂项 ────────────────────────────────────────────────
 
@@ -1286,6 +1388,16 @@ class AVPage(QWidget):
             not self._busy and bool(self._translations))
         self.export_btn.setEnabled(
             not self._busy and bool(self._segments))
+        # 禁用态要说明「为什么不能用、怎么才能用」，否则新手以为按钮坏了
+        reason = ("请先点「开始识别」生成字幕" if not self._segments
+                  else "当前任务进行中，请等它结束或点「停止」")
+        for btn in (self.translate_btn, self.polish_src_btn,
+                    self.export_btn):
+            btn.setToolTip("" if btn.isEnabled() else reason)
+        self.polish_trans_btn.setToolTip(
+            "" if self.polish_trans_btn.isEnabled()
+            else ("请先点「翻译字幕」生成译文" if self._segments
+                  else reason))
 
     def _save_cfg(self, **kwargs):
         # 只提交相对本地快照变化的键：整份写回会用旧快照覆盖设置页刚存的密钥

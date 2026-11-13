@@ -117,6 +117,8 @@ QLabel#navHeader {{
 /* ---- 文本层级 ---- */
 QLabel#pageTitle {{ color: {p.TEXT_STRONG}; font-size: 22px; font-weight: 700; }}
 QLabel#sectionTitle {{ color: {p.TEXT_STRONG}; font-size: 15px; font-weight: 600; }}
+/* 与 QComboBox 保持同一字号/行高：语言选择那一行出现「标签偏小、下拉框
+   偏大且基线不齐」时，看起来就像多了一圈不协调的框。 */
 QLabel#fieldLabel {{ color: {p.TEXT}; font-size: 13px; }}
 QLabel#statTitle {{ color: {p.TEXT_MUTED}; font-size: 12px; }}
 QLabel#statValue {{ color: {p.TEXT_STRONG}; font-size: 26px; font-weight: 700; }}
@@ -180,14 +182,18 @@ QLineEdit:focus {{ border: 1px solid {p.FOCUS}; }}
 QLineEdit:disabled {{ color: {p.TEXT_DISABLED}; }}
 
 /* ---- 下拉框 ---- */
-/* 右侧 padding 给箭头留位，避免长文本压到箭头下；与按钮统一高度 */
+/* 文字区宽度 = 控件宽 − 左 padding − 右 padding − ::drop-down 宽 − 边框。
+   ::drop-down 本身已独立占位，右 padding 再留 34px 等于把箭头位扣了两次：
+   实测 120px 的框只剩 46px 文字区，而「自动检测」要 52px，第 4 个字被裁掉
+   半边。这里只留 8px 呼吸位并把箭头位收到 20px，文字区恢复到 80px，连最长的
+   「中文(繁体)」(78px) 也放得下；控件总宽不变，不影响 FlowLayout 布局回归。 */
 QComboBox {{
     background: {p.BG_INPUT};
     color: {p.TEXT};
     border: 1px solid {p.BORDER_STRONG};
     border-radius: 8px;
-    padding: 6px 34px 6px 10px;
-    font-size: 14px;
+    padding: 6px 8px 6px 10px;
+    font-size: 13px;
 }}
 QComboBox:hover {{ border-color: {p.FOCUS}; }}
 QComboBox:focus, QComboBox:on {{ border-color: {p.FOCUS}; }}
@@ -201,7 +207,8 @@ QComboBox::drop-down {{
     subcontrol-position: center right;
     border: none;
     background: transparent;
-    width: 28px;
+    /* 箭头图标只有 12px，20px 足够；多出来的宽度要还给文字区 */
+    width: 20px;
 }}
 /* Qt 的 QSS 不支持用 transparent 边框画三角形，会渲染成实心白块；改用 SVG。
    靠右定位交给 ::drop-down，这里只画图标。切勿再给 ::down-arrow 补任何带

@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 
 from app_paths import is_frozen
 
@@ -52,25 +53,35 @@ def check_call_quiet(cmd, **kwargs) -> int:
 # 在线装 EasyOCR 会连带下载 torch 等大依赖，留足时间；但绝不允许无限挂起。
 PIP_TIMEOUT = 900
 
+# 用户主动取消时，各安装函数统一返回这条信息，界面据此显示「已取消」
+# 而不是「安装失败」。
+CANCELLED_TEXT = "已取消安装"
+
 
 @contextlib.contextmanager
-def pip_process(cmd, timeout=PIP_TIMEOUT, **kwargs):
-    """启动 pip 并提供带超时的流式输出读取。
+def pip_process(cmd, timeout=PIP_TIMEOUT, cancel=None, **kwargs):
+    """启动 pip 并提供带超时、可中途取消的流式输出读取。
 
     Windows 下管道不支持 select，调用方阻塞在 ``proc.stdout.readline()`` 时
-    光靠 ``finally`` 里的 terminate 是救不回来的。这里用看门狗在超时后
-    ``kill`` 子进程：管道随之关闭，readline() 返回空串，读取循环自然退出。
-    正常结束时由 ``finally`` 统一收回管道并等待子进程。
+    光靠 ``finally`` 里的 terminate 是救不回来的。这里用看门狗每 0.2 秒检查
+    取消标志 / 超时，必要时 ``kill`` 子进程：管道随之关闭，readline() 返回
+    空串，读取循环自然退出。正常结束时由 ``finally`` 统一收回管道并等待。
     """
     proc = popen_quiet(cmd, **kwargs)
     done = threading.Event()
 
     def guard():
-        if not done.wait(timeout) and proc.poll() is None:
-            try:
-                proc.kill()
-            except OSError:
-                pass
+        deadline = time.monotonic() + max(1, timeout)
+        while not done.wait(0.2):
+            if proc.poll() is not None:
+                return
+            cancelled = cancel is not None and cancel.is_set()
+            if cancelled or time.monotonic() >= deadline:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                return
 
     watcher = threading.Thread(target=guard, daemon=True)
     watcher.start()
@@ -125,6 +136,84 @@ def pip_cmd(packages, extra_args=()):
                "--target", str(USER_LIBS_DIR)]
         return cmd + list(extra_args) + args, ""
     return [sys.executable, "-m", "pip", "install"] + list(extra_args) + args, ""
+
+
+# 显式 ``-i`` 能覆盖用户 pip.ini 里配置的默认源。国内镜像（尤其清华）偶发
+# 403 / 同步延迟，只走单源会让「点一次安装」变成必然失败；按可用性依次
+# 尝试，最后才回落到用户自己的配置，尊重自定义但可用的源。
+PIP_INDEXES = (
+    ("阿里云镜像", ("-i", "https://mirrors.aliyun.com/pypi/simple/")),
+    ("PyPI 官方", ("-i", "https://pypi.org/simple")),
+    ("系统默认源", ()),
+)
+
+
+def pip_install_with_mirrors(packages, on_progress=None, cancel=None,
+                             on_attempt=None, extra_args=None,
+                             label="组件", indexes=None,
+                             timeout=PIP_TIMEOUT):
+    """依次用多个 pip 源安装组件，返回 ``(ok, message)``。
+
+    * 每个源显式带 ``-i``（「系统默认源」除外），避开失效的全局镜像；
+    * ``--retries/--timeout`` 让坏源快速失败，不在 403 上干等；
+    * ``cancel`` 置位立即收手，不会再尝试下一个源；
+    * 全部失败返回中文可操作提示 + 最后一次原始日志，UI 把日志放 tooltip。
+    """
+    import subprocess
+    if cancel is not None and cancel.is_set():
+        return False, CANCELLED_TEXT
+    packages = [str(p) for p in packages]
+    probe, hint = pip_cmd(packages)
+    if probe is None:                    # pip 不可用时不做无谓的多源重试
+        return False, hint
+    indexes = tuple(indexes if indexes is not None else PIP_INDEXES)
+    base_args = list(extra_args) if extra_args else [
+        '--retries', '2', '--timeout', '30']
+    last = ""
+    total = len(indexes)
+    for i, (name, extra) in enumerate(indexes, 1):
+        if cancel is not None and cancel.is_set():
+            return False, CANCELLED_TEXT
+        if on_attempt is not None:
+            try:
+                on_attempt(i, total, name)
+            except Exception:
+                pass
+        cmd, hint = pip_cmd(packages, base_args + list(extra))
+        if cmd is None:
+            return False, hint
+        try:
+            with pip_process(cmd, cancel=cancel, timeout=timeout,
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True) as proc:
+                tail = []
+                while True:
+                    line = proc.stdout.readline()
+                    if not line and proc.poll() is not None:
+                        break
+                    if line:
+                        tail.append(line.rstrip())
+                        if on_progress is not None:
+                            try:
+                                on_progress(line)
+                            except Exception:
+                                pass
+            last = '\n'.join(tail[-8:])
+            # 已经装成功就如实报成功：用户在收尾瞬间点了取消，不能把装好
+            # 的组件显示成「已取消安装」（设置页也有同样的守卫）。
+            if proc.returncode == 0:
+                return True, f"{label}安装成功（{name}）"
+            if cancel is not None and cancel.is_set():
+                return False, CANCELLED_TEXT
+        except Exception as exc:
+            last = f"执行失败: {exc}"
+    tried = " / ".join(name for name, _ in indexes)
+    manual = " ".join(packages)
+    return False, (
+        f"安装失败（已依次尝试：{tried}）。\n"
+        "可点「重试安装」再试一次；也可在命令行手动执行：\n"
+        f"  pip install {manual} -i https://pypi.org/simple\n\n"
+        f"最后一次错误输出：\n{last}")
 
 
 def python_launcher() -> str:

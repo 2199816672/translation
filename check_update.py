@@ -14,7 +14,7 @@ from updater import (  # noqa: F401  (保持旧 import 可用)
     API_URL, RELEASES_URL, ReleaseInfo, UpdateError, UpdateCancelled,
     fetch_latest_release, is_newer, version_tuple, check_update as _check,
     installer_url, safe_download_path, download_file, verify_download,
-    queue_install, launch_installer,
+    queue_install, launch_installer, friendly_network_error,
 )
 
 
@@ -59,7 +59,8 @@ class UpdateChecker:
             self._q.put(check_update())
         except Exception as exc:
             self._q.put({"has_update": False, "current": APP_VERSION,
-                         "latest": "", "url": "", "error": f"检测失败：{exc}"})
+                         "latest": "", "url": "",
+                         "error": f"检测失败：{friendly_network_error(exc)}"})
 
     def _poll(self):
         try:

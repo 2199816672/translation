@@ -13,7 +13,7 @@ from PySide6.QtCore import Qt, Signal, QUrl, Slot
 from PySide6.QtGui import QColor, QDesktopServices, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
-    QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QMessageBox,
+    QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QMenu, QMessageBox,
     QProgressBar, QPushButton, QRadioButton, QSizePolicy, QTableWidget,
     QTableWidgetItem, QVBoxLayout,
 )
@@ -84,6 +84,8 @@ class BatchTranscribeDialog(QDialog):
         self._sig_all_done.connect(self._on_all_done)
 
         self._build_ui()
+        from ui_theme import prevent_combo_elide
+        prevent_combo_elide(self)
         if initial_paths:
             self.add_paths(initial_paths, quiet=True)
 
@@ -111,7 +113,8 @@ class BatchTranscribeDialog(QDialog):
         root.addWidget(title)
         hint = QLabel(
             '一次选多个音视频文件，按顺序逐个识别；每个文件单独生成一份字幕，'
-            '单个文件失败不会影响后面的文件。', self)
+            '单个文件失败不会影响后面的文件。支持直接把文件 / 文件夹拖进窗口。',
+            self)
         hint.setObjectName('caption')
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -144,6 +147,13 @@ class BatchTranscribeDialog(QDialog):
         toolbar.addWidget(self.count_label)
         fv.addLayout(toolbar)
 
+        self.empty_hint = QLabel(
+            '暂无文件 · 点「添加文件」，或把音视频文件 / 文件夹拖进窗口', self)
+        self.empty_hint.setObjectName('caption')
+        self.empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_hint.setStyleSheet(f'color: {MUTED_COLOR}; padding: 16px;')
+        fv.addWidget(self.empty_hint)
+
         self.table = QTableWidget(0, 3, self)
         self.table.setHorizontalHeaderLabels(['文件', '大小', '状态'])
         self.table.verticalHeader().setVisible(False)
@@ -157,6 +167,10 @@ class BatchTranscribeDialog(QDialog):
         self.table.setMinimumHeight(190)
         self.table.setSizePolicy(QSizePolicy.Policy.Expanding,
                                  QSizePolicy.Policy.Expanding)
+        self.table.setToolTip(
+            '在任意一行上点右键，可单独重试这一项 / 打开所在文件夹 / 复制路径')
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_table_menu)
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -287,15 +301,21 @@ class BatchTranscribeDialog(QDialog):
         self.stop_btn = self._btn('停止')
         self.stop_btn.clicked.connect(self._stop)
         self.stop_btn.setEnabled(False)
+        self.stop_btn.setToolTip('任务运行中可用：处理完当前文件后停止')
         self.retry_btn = self._btn('重试失败项')
         self.retry_btn.clicked.connect(self._retry_failed)
         self.retry_btn.setEnabled(False)
+        self.retry_btn.setToolTip('任务结束后，有失败项时可一键重跑；'
+                                  '也可在表格里右键单独重试某一项')
         self.open_dir_btn = self._btn('打开输出文件夹')
         self.open_dir_btn.clicked.connect(self._open_output_dir)
         self.open_dir_btn.setEnabled(False)
+        self.open_dir_btn.setToolTip('有输出结果后可用；'
+                                     '结果分散在多个目录时会让你选一个打开')
         self.copy_btn = self._btn('复制输出路径')
         self.copy_btn.clicked.connect(self._copy_outputs)
         self.copy_btn.setEnabled(False)
+        self.copy_btn.setToolTip('有输出结果后可用：复制全部字幕文件的完整路径')
         self.close_btn = self._btn('关闭')
         self.close_btn.clicked.connect(self.close)
         for b in (self.start_btn, self.stop_btn, self.retry_btn,
@@ -332,6 +352,9 @@ class BatchTranscribeDialog(QDialog):
         return added
 
     def _refresh_table(self):
+        hint = getattr(self, 'empty_hint', None)
+        if hint is not None:
+            hint.setVisible(not self.jobs)
         self.table.setRowCount(len(self.jobs))
         for row, job in enumerate(self.jobs):
             name = QTableWidgetItem(job.name)
@@ -607,7 +630,14 @@ class BatchTranscribeDialog(QDialog):
                 QMessageBox.StandardButton.No)
             if answer != QMessageBox.StandardButton.Yes:
                 return
+        only_rows = getattr(self, '_retry_rows', None)
+        self._retry_rows = None
         self._cancel = threading.Event()
+        import time
+        from task_center import TASK_CENTER
+        self._batch_started_at = time.monotonic()
+        TASK_CENTER.start('batch', '批量转录', cancelable=True,
+                          cancel=self._cancel, detail='准备中')
         self._running = True
         self._stopping = False
         retry_mode = self._retry_mode
@@ -619,9 +649,10 @@ class BatchTranscribeDialog(QDialog):
         self.total_progress.setFormat('总进度 %p%')
         self.file_progress.setValue(0)
         self.status_label.setText('正在开始批量转录…')
-        # 重试失败项时保留已完成项的输出路径，只重置需要重跑的项
-        reset_status = ((FAILED, SKIPPED) if retry_mode
-                        else (FAILED, SKIPPED, DONE))
+        # 右键「重试此项」用 only_rows 精确控制，不再重置其它失败项
+        reset_status = (() if only_rows is not None
+                        else ((FAILED, SKIPPED) if retry_mode
+                              else (FAILED, SKIPPED, DONE)))
         for job in self.jobs:
             if job.status in reset_status:
                 job.status = PENDING
@@ -631,7 +662,7 @@ class BatchTranscribeDialog(QDialog):
         self._refresh_table()
 
         runner = BatchRunner(self.jobs, settings, cancel=self._cancel,
-                             resume=retry_mode)
+                             resume=retry_mode, only_rows=only_rows)
 
         # 窗口在「已请求停止」后允许关闭，先缓存信号对象，避免迟到信号
         # 打到已销毁的窗口上抛 RuntimeError。
@@ -675,10 +706,11 @@ class BatchTranscribeDialog(QDialog):
         self._cancel.set()
         self._stopping = True
         self.stop_btn.setEnabled(False)
-        # 在线 API 的单次请求可能较久，此时不该把窗口一起锁死
+        # 在线 API / 翻译请求会在取消时立即中断，当前文件会被跳过，
+        # 不能再承诺「处理完」；此前已写出的字幕不受影响。
         self.status_label.setText(
-            '已请求停止，当前文件处理完后结束；此时可以关闭窗口，'
-            '已生成的字幕会保留。')
+            '已请求停止，当前文件会被跳过（不生成字幕）；'
+            '此前已完成的字幕会保留，此时可以关闭窗口。')
 
     def _retry_failed(self):
         failed = [j for j in self.jobs if j.status == FAILED]
@@ -695,6 +727,44 @@ class BatchTranscribeDialog(QDialog):
         self.status_label.setText(f'准备重试 {len(failed)} 个失败项…')
         self._start()
 
+    def _on_table_menu(self, pos):
+        """表格右键：单独重试某一项 / 打开所在文件夹 / 复制完整路径。"""
+        if self._running:
+            return
+        row = self.table.rowAt(pos.y())
+        if row < 0 or row >= len(self.jobs):
+            return
+        job = self.jobs[row]
+        menu = QMenu(self)
+        retry = menu.addAction('重试此项')
+        retry.setEnabled(job.status in (DONE, FAILED, SKIPPED))
+        open_loc = menu.addAction('打开所在文件夹')
+        copy_path = menu.addAction('复制完整路径')
+        action = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if action is retry:
+            self._retry_one(row)
+        elif action is open_loc:
+            target = job.output or job.path
+            folder = (target if os.path.isdir(target)
+                      else os.path.dirname(target))
+            if folder and os.path.isdir(folder):
+                QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+        elif action is copy_path:
+            QApplication.clipboard().setText(job.output or job.path)
+            self.status_label.setText('已复制完整路径')
+
+    def _retry_one(self, row):
+        """只重跑这一行：其余已完成 / 失败项的状态与输出全部保留。"""
+        job = self.jobs[row]
+        job.status = PENDING
+        job.detail = ''
+        job.output = ''
+        job.lines = 0
+        self._retry_rows = {row}
+        self._refresh_table()
+        self.status_label.setText(f'准备重试：{job.name}')
+        self._start()
+
     def _set_editing_enabled(self, enabled):
         for widget in (self.add_files_btn, self.add_folder_btn, self.remove_btn,
                        self.up_btn, self.down_btn, self.clear_btn,
@@ -705,11 +775,33 @@ class BatchTranscribeDialog(QDialog):
         self.stop_btn.setEnabled(not enabled)
         self.table.setEnabled(enabled)
 
+    @staticmethod
+    def _format_eta(seconds):
+        seconds = max(0, int(seconds))
+        return (f'{seconds} 秒' if seconds < 60
+                else f'{seconds // 60} 分 {seconds % 60:02d} 秒')
+
+    def _eta_text(self, index, total):
+        """按已完成文件的平均耗时估算剩余，不编造单文件百分比。"""
+        start = getattr(self, '_batch_started_at', None)
+        if not start or index <= 1 or total <= 0:
+            return ''
+        import time
+        done = max(1, index - 1)
+        elapsed = time.monotonic() - start
+        remain = int(elapsed / done * max(0, total - done))
+        return (f' · 预计剩余 {self._format_eta(remain)}'
+                if remain > 0 else '')
+
     @Slot(int, int, str)
     def _on_started(self, index, total, name):
         self.file_progress.setRange(0, 100)
         self.file_progress.setValue(0)
-        self.status_label.setText(f'[{index}/{total}] 正在识别：{name}')
+        from task_center import TASK_CENTER
+        TASK_CENTER.update('batch', f'第 {index}/{total} 个：{name}')
+        self.status_label.setText(
+            f'[{index}/{total}] 正在识别：{name}'
+            + self._eta_text(index, total))
 
     @Slot(int, int, str, int, str)
     def _on_progress(self, index, total, name, percent, text):
@@ -717,7 +809,8 @@ class BatchTranscribeDialog(QDialog):
             self.file_progress.setRange(0, 100)
             self.file_progress.setValue(percent)
         self.status_label.setText(
-            f'[{index}/{total}] {name} · {text} {percent}%')
+            f'[{index}/{total}] {name} · {text} {percent}%'
+            + self._eta_text(index, total))
 
     @Slot(int, str, str, str)
     def _on_finished(self, row, status, detail, output):
@@ -731,6 +824,8 @@ class BatchTranscribeDialog(QDialog):
 
     @Slot(str)
     def _on_all_done(self, text):
+        from task_center import TASK_CENTER
+        TASK_CENTER.finish('batch')
         self._running = False
         self._last_summary = text
         self._set_editing_enabled(True)
@@ -752,16 +847,40 @@ class BatchTranscribeDialog(QDialog):
     # ── 结果操作 ────────────────────────────────────────────
 
     def _output_folder(self):
+        """兼容旧调用：返回第一个可用输出目录。"""
+        folders = self._output_folders()
+        return folders[0] if folders else None
+
+    def _output_folders(self):
         if self.custom_radio.isChecked() and self.out_dir:
-            return self.out_dir
+            return [self.out_dir]
+        folders = []
         for job in self.jobs:
             if job.status == DONE and job.output:
-                return os.path.dirname(job.output)
-        return None
+                folder = os.path.dirname(job.output)
+                if folder and folder not in folders:
+                    folders.append(folder)
+        return folders
 
     def _open_output_dir(self):
-        folder = self._output_folder()
-        if folder and os.path.isdir(folder):
+        folders = self._output_folders()
+        if not folders:
+            return
+        folder = folders[0]
+        if len(folders) > 1:
+            # 默认「与源文件同目录」时结果可能散落在多个盘，
+            # 只打开第一个会让用户误以为其它字幕没生成。
+            menu = QMenu(self)
+            for path in folders:
+                menu.addAction(path)
+            chosen = menu.exec(self.open_dir_btn.mapToGlobal(
+                self.open_dir_btn.rect().bottomLeft()))
+            if chosen is None:
+                return
+            folder = chosen.text()
+            self.status_label.setText(
+                f'结果分散在 {len(folders)} 个目录，已打开：{folder}')
+        if os.path.isdir(folder):
             QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
     def _copy_outputs(self):
@@ -770,13 +889,30 @@ class BatchTranscribeDialog(QDialog):
             QApplication.clipboard().setText('\n'.join(paths))
             self.status_label.setText(f'已复制 {len(paths)} 个字幕文件路径')
 
+    def reject(self):
+        # QDialog 默认 Esc 走 reject()，会绕过 closeEvent 的「任务进行中」
+        # 拦截：运行中按 Esc 直接藏起窗口，连「停止」入口都找不到。
+        if self._running and not self._stopping:
+            self.close()  # 交给 closeEvent 弹同一条提示并 ignore
+            return
+        # 已请求停止后按 Esc 走 super().reject()（done()→hide()），Qt 不会
+        # 触发 closeEvent；而 worker 的 all_done 此时也可能发不出来，任务登记
+        # 必须在这里兜底清除，否则任务中心常驻幽灵项、每次退出都误报有任务。
+        from task_center import TASK_CENTER
+        TASK_CENTER.finish('batch')
+        super().reject()
+
     def closeEvent(self, event):
         if self._running and not self._stopping:
             QMessageBox.information(
                 self, '任务进行中',
-                '批量转录还没结束，请先点「停止」，等当前文件处理完再关闭窗口。')
+                '批量转录还没结束，请先点「停止」，再关闭窗口。')
             event.ignore()
             return
         # 已请求停止：状态栏已经说明「可以关闭窗口」，直接放行，
         # 不再弹模态框打断用户（离屏/自动化场景也不会被弹窗阻塞）。
+        # 窗口关掉后 worker 的 all_done 信号可能发不出来，任务登记必须
+        # 在这里兜底清除，否则退出确认会永远显示「批量转录」还在跑。
+        from task_center import TASK_CENTER
+        TASK_CENTER.finish('batch')
         super().closeEvent(event)

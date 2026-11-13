@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QSystemTrayIcon, QMenu, QApplication
 
 from config import (
     OCR_LANGUAGES, OCR_ENGINE, SUPPORTED_TARGET_LANGS, SUPPORTED_SOURCE_LANGS,
-    load_user_config, APP_VERSION,
+    load_user_config, save_user_config, APP_VERSION,
 )
 from app_paths import resource_path
 from ocr_recognizer import get_ocr_instance, check_engine_available
@@ -23,6 +23,9 @@ from pages.settings_page import SettingsPage
 from pages.doc_page import DocPage
 from pages.av_page import AVPage
 from screenshot_overlay import ScreenshotOverlay, FullscreenCapture
+from status_bus import StatusBus
+from task_center import TASK_CENTER
+import diagnostics
 
 
 # 内部标识 / 注册表自启动项名：保持不变，避免改名后旧的自启动项残留
@@ -30,6 +33,11 @@ APP_NAME = "截图翻译工具"
 # 界面显示名：功能早就不止截图了，统一叫「翻译工具」
 APP_DISPLAY_NAME = "翻译工具"
 AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+# 截图前隐藏主窗口后等待桌面重绘的时间。以前固定 150ms 仍会把 FluentWindow
+# 的淡出动画拍进背景（用户看到「隐隐约约的窗口」），而且明显拖慢截图启动；
+# 现在配合 setWindowOpacity(0) 立即消除内容，只需让事件循环转一轮。
+CAPTURE_SETTLE_MS = 80
 
 
 def _launch_command():
@@ -109,6 +117,7 @@ class MainWindow(FluentWindow):
     _sig_polish_av_trans_done = Signal(list)
     _sig_polish_failed = Signal()
     _sig_status = Signal(str, str)
+    _sig_bus_status = Signal(str, str)   # StatusBus 的输出，跨线程安全
     _sig_error = Signal(str)
     # 实时字幕：采集 / 识别 / 翻译都在后台线程，只通过信号回主线程
     _sig_caption_segment = Signal(int, str)
@@ -145,6 +154,8 @@ class MainWindow(FluentWindow):
         self._overlay_ocr_text = ""
         self._overlay_blocks = []   # OCR 视觉段落块（归一化坐标），译文按原位置贴回用
         self._restore_after_capture = False
+        self._capture_pending = False   # 截图延迟内防重复触发
+        self._capture_opacity = None    # 抓屏期间临时把窗口设为全透明
         self._last_trans_text = ""
         self._last_trans_result = ""
         self._last_trans_paras = []   # 覆盖层逐段译文，缓存命中时按原条数复用
@@ -166,6 +177,11 @@ class MainWindow(FluentWindow):
         self._upgrade_info = None
         self._pending_installer_path = None
         self._update_stop = threading.Event()
+        # 状态总线：长任务用独立 owner 显示，结束后自动回落，不再被一句
+        # 「就绪」盖掉，也不会留下过时的「正在…」。emit 走 Qt 信号，
+        # 后台线程调用 clear/push 也不会碰 UI。
+        self._status_bus = StatusBus(emit=self._sig_bus_status.emit)
+        self._task_center = TASK_CENTER
 
         self.home = HomePage(self)
         self.doc = DocPage(self)
@@ -176,6 +192,10 @@ class MainWindow(FluentWindow):
         self.addSubInterface(self.doc, FluentIcon.DOCUMENT, "文档处理")
         self.addSubInterface(self.av, FluentIcon.VIDEO, "音视频")
         self.addSubInterface(self.settings, FluentIcon.SETTING, "设置")
+        # 所有页面的下拉框统一防截断：popup 按内容展开，长选项不再显示成
+        # 「电脑…声音」这种省略号（图里反馈的样式问题，同类控件一次覆盖）。
+        from ui_theme import prevent_combo_elide
+        prevent_combo_elide(self)
 
         self.setWindowTitle(APP_DISPLAY_NAME)
         # 音视频页内容约 700px 高；默认给足高度，避免结果卡片被迫滚动才看得全
@@ -192,8 +212,18 @@ class MainWindow(FluentWindow):
 
         if start_minimized or self.cfg.get("start_minimized", False):
             QTimer.singleShot(0, self._minimize_to_tray)
+        # Ctrl+K 命令面板：托盘 / 浮层专属动作汇总到一个可搜索入口
+        from PySide6.QtGui import QShortcut, QKeySequence
+        self._palette_shortcut = QShortcut(QKeySequence('Ctrl+K'), self)
+        self._palette_shortcut.activated.connect(self._open_command_palette)
+        QTimer.singleShot(700, self._maybe_show_welcome)
 
     def _wire(self):
+        # 统一排队：后台线程 clear/push 与主线程 push 不会因 Direct/Queued
+        # 混用导致「就绪」把刚完成的状态覆盖掉。
+        self._sig_bus_status.connect(
+            self._apply_status_text, Qt.ConnectionType.QueuedConnection)
+        self.home.moreActionsRequested.connect(self._show_more_menu)
         self.home.screenshotRequested.connect(self._start_screenshot)
         self.home.fullscreenRequested.connect(self._start_fullscreen)
         self.home.liveTranslateRequested.connect(self._start_live_translate)
@@ -219,8 +249,8 @@ class MainWindow(FluentWindow):
         self._sig_polish_doc_done.connect(self._on_doc_polished)
         self._sig_polish_doc_sub_done.connect(self._on_doc_sub_polished)
         self._sig_polish_overlay_done.connect(self._on_overlay_polished)
-        self._sig_polish_av_src_done.connect(self.av.set_polished_sources)
-        self._sig_polish_av_trans_done.connect(self.av.set_polished_translations)
+        self._sig_polish_av_src_done.connect(self._on_av_polished_sources)
+        self._sig_polish_av_trans_done.connect(self._on_av_polished_translations)
         self._sig_polish_failed.connect(self._on_polish_failed)
         self._sig_status.connect(self._on_status)
         self._sig_error.connect(self._on_error)
@@ -248,13 +278,22 @@ class MainWindow(FluentWindow):
     # ── 线程安全的 UI 更新 ──────────────────────────────────
 
     @Slot(str, str)
-    def _on_status(self, text, color):
+    def _on_status(self, text, color=None):
+        """普通状态走 general owner；长任务另用独立 owner 覆盖显示。"""
+        self._status_bus.push('general', text, color or '#71717a')
+
+    def _apply_status_text(self, _text=None, _color=None):
+        # 忽略排队到达的旧值，永远显示总线「当前」状态，彻底避免乱序覆盖
+        text, color = self._status_bus.current()
         self.home.set_status(text)
         self.home.status_dot.setStyleSheet(f"color: {color}; font-size: 14px;")
 
     @Slot(str)
     def _on_error(self, msg):
         """后台任务失败：更新状态栏，并清除截图覆盖层上的等待提示。"""
+        diagnostics.record('error', str(msg), source='后台任务')
+        # 失败也要解除「翻译中…」的禁用态，否则按钮会永久点不动
+        self.home.set_translating(False)
         self._on_status(msg, "#e5635f")
         if self._overlay and self._overlay.isVisible():
             self._overlay.show_error(msg)
@@ -308,6 +347,7 @@ class MainWindow(FluentWindow):
 
     @Slot(str)
     def _on_trans_done(self, text):
+        self.home.set_translating(False)
         if self._overlay and self._overlay.isVisible():
             self._overlay.show_trans_result(text)
         self.home.set_trans_text(text)
@@ -329,7 +369,10 @@ class MainWindow(FluentWindow):
             return
         self._ocr_loading = True
         wanted = self.cfg.get("ocr_engine", OCR_ENGINE)
-        self._on_status("正在初始化 OCR 模型...", "#eab308")
+        # 高优先级长任务：不会被普通状态覆盖，加载完 clear 自动回落
+        self._status_bus.push(
+            'ocr_init', "正在准备 OCR 引擎…（首次加载可能要几秒）",
+            "#eab308", priority=20)
 
         def init():
             try:
@@ -340,18 +383,26 @@ class MainWindow(FluentWindow):
                         if fallback != wanted and check_engine_available(fallback):
                             engine = fallback
                             self._sig_status.emit(
-                                "OCR引擎未安装，已切换到备用引擎", "#eab308")
+                                "OCR 引擎未安装，已切换到备用引擎 " + fallback,
+                                "#eab308")
                             break
                     if not engine:
                         self._sig_status.emit(
-                            "OCR引擎未安装，请前往设置页安装", "#e5635f")
+                            "OCR 引擎都未安装，请在「设置 → OCR 设置」点「安装」",
+                            "#e5635f")
                         return
                 self.ocr = get_ocr_instance(OCR_LANGUAGES, engine=engine)
-                self._sig_status.emit("就绪", "#4ade80")
+                # 别用一句笼统的「就绪」盖掉上面的「已切换到备用引擎」
+                if engine == wanted:
+                    self._sig_status.emit("就绪", "#4ade80")
+                else:
+                    self._sig_status.emit(
+                        f"就绪（已自动切换到 {engine} 备用引擎）", "#eab308")
             except Exception as exc:
                 self._sig_status.emit(f"OCR 初始化失败：{exc}", "#e5635f")
             finally:
                 self._ocr_loading = False
+                self._status_bus.clear('ocr_init')
                 if self._ocr_reload_pending:
                     self._ocr_reload_pending = False
                     QTimer.singleShot(0, self, self._init_ocr_async)
@@ -364,7 +415,9 @@ class MainWindow(FluentWindow):
         """按设置页的快捷键配置注册全局热键（默认全部为空 = 不占用按键）。"""
         from hotkeys import HotkeyManager, get_hotkeys
         self._hotkeys = HotkeyManager(
-            self._sig_hotkey.emit, on_error=self.settings.show_hotkey_error)
+            self._sig_hotkey.emit,
+            on_error=self.settings.show_hotkey_error,
+            on_warning=self.settings.show_hotkey_warning)
         self._hotkeys.reload(get_hotkeys(self.cfg))
 
     @Slot(str)
@@ -375,7 +428,9 @@ class MainWindow(FluentWindow):
         elif action == 'fullscreen':
             self.home.fullscreenRequested.emit()
         elif action == 'translate':
-            self.home.translateRequested.emit(self.home.ocr_text.toPlainText())
+            # 走主页统一的翻译入口：那里有空文本检查、「翻译中…」按钮状态
+            # 和防重入。直接 emit 会绕过这些反馈，连按会起多个翻译线程。
+            self.home._on_translate()
         elif action == 'live_translate':
             self.home.liveTranslateRequested.emit()
         elif action == 'stop_live_translate':
@@ -442,7 +497,7 @@ class MainWindow(FluentWindow):
         fn = {"warning": InfoBar.warning,
               "success": InfoBar.success}.get(level, InfoBar.info)
         fn(title=title, content=message, duration=duration,
-           position=InfoBarPosition.TOP, parent=self.home)
+           position=InfoBarPosition.TOP, parent=self)
 
     @Slot(object, bool)
     def _on_update_found(self, info, silent=False):
@@ -540,6 +595,10 @@ class MainWindow(FluentWindow):
 
         threading.Thread(target=_worker, daemon=True).start()
         code = dialog.exec()
+        # 下载中点「取消下载」对话框立刻关闭，worker 的完成回调已经找不到
+        # 窗口；这里补一条主窗口状态栏反馈，别让用户只看到窗口凭空消失。
+        if getattr(dialog, 'cancelled_by_user', False):
+            self._on_status("已取消下载 · 可稍后重新检查更新", "#eab308")
         self._upgrade_dialog = None
         # 即便完成信号晚到（对话框已关闭使 _on_update_finished 提前返回），
         # 安装包路径也已存入 _pending_installer_path，不会丢失。
@@ -568,30 +627,30 @@ class MainWindow(FluentWindow):
         if ok:
             dlg.set_done(path, True if message == "verified" else None)
         else:
-            dlg.show_error(message)
+            # 用户主动取消下载不该染红显示成失败
+            if "已取消" not in str(message):
+                dlg.show_error(message)
 
     def _queue_install(self, path):
         """登记安装包并真正退出；app.py 在事件循环结束后拉起静默安装。"""
+        # 先确认用户真的要退出：若在「还有任务在运行」里选了继续运行，
+        # 绝不能先把安装包登记好，否则下次正常退出会静默装上用户以为
+        # 已经取消的升级。
+        self._update_stop.set()
+        if not self._quit_app():
+            return
         import updater
         updater.queue_install(path)
-        self._update_stop.set()
-        self._quit_app()
 
     # ── 系统托盘 ────────────────────────────────────────────
 
-    def _setup_tray(self):
-        self._tray = QSystemTrayIcon(self)
-        # 优先用窗口图标，兜底用应用图标
-        icon = self.windowIcon()
-        if icon.isNull():
-            from PySide6.QtGui import QIcon
-            icon = QIcon(str(resource_path("assets/app_icon.png")))
-        self._tray.setIcon(icon)
-        self.setWindowIcon(icon)
-        self._tray.setToolTip(APP_DISPLAY_NAME)
-        self._tray.activated.connect(self._on_tray_activated)
+    def _build_action_menu(self, parent=None):
+        """托盘右键与主页「更多动作」共用同一份动作清单。
 
-        menu = QMenu()
+        Windows 常把托盘图标折叠进「^」里，之前字幕暂停 / 清空 / 双语模式
+        等 6 类动作就完全不可达；主页给一个同款菜单作为可见入口。
+        """
+        menu = QMenu(parent)
         menu.setStyleSheet("QMenu { background: #1a1a1e; color: #e4e4e7; border: 1px solid #333; }"
                            "QMenu::item:selected { background: #3b82f6; }")
         shot_action = QAction("区域截图", menu)
@@ -614,7 +673,18 @@ class MainWindow(FluentWindow):
         clear_caption_action = QAction("清空当前字幕", menu)
         clear_caption_action.triggered.connect(self._clear_caption)
 
-        # 字幕显示模式：互斥勾选，浮层控制条上的「双语/译文/原文」同源
+        # 只置灰「点了确实没反应」的三项。caption_action / hide_caption_action
+        # 在未运行时承担启动入口，clear_caption_action 能清主页残留文本。
+        runtime = getattr(self, '_tray_runtime_actions', None)
+        if runtime is None:
+            runtime = []
+            self._tray_runtime_actions = runtime
+        runtime.extend((
+            (stop_live_action, lambda: self._live_window is not None),
+            (pause_caption_action, lambda: self._caption_window is not None),
+            (stop_caption_action, lambda: self._caption_engine is not None),
+        ))
+
         mode_menu = menu.addMenu("字幕显示模式")
         mode_group = QActionGroup(mode_menu)
         mode_group.setExclusive(True)
@@ -629,11 +699,22 @@ class MainWindow(FluentWindow):
                 lambda _checked=False, k=key: self._set_caption_mode(k))
             mode_group.addAction(act)
             mode_menu.addAction(act)
+        groups = getattr(self, '_caption_mode_groups', None)
+        if groups is None:
+            groups = []
+            self._caption_mode_groups = groups
+        groups.append(mode_group)
         self._caption_mode_actions = {
             a.text(): a for a in mode_group.actions()}
 
         show_action = QAction("显示主窗口", menu)
         show_action.triggered.connect(self._restore_from_tray)
+        palette_action = QAction("命令面板  Ctrl+K", menu)
+        palette_action.triggered.connect(self._open_command_palette)
+        tasks_action = QAction("任务中心", menu)
+        tasks_action.triggered.connect(self._open_task_center)
+        update_action = QAction("检查更新", menu)
+        update_action.triggered.connect(lambda: self.check_update(silent=False))
         quit_action = QAction("退出", menu)
         quit_action.triggered.connect(self._quit_app)
         menu.addAction(shot_action)
@@ -649,14 +730,148 @@ class MainWindow(FluentWindow):
         menu.addAction(clear_caption_action)
         menu.addSeparator()
         menu.addAction(show_action)
+        menu.addAction(palette_action)
+        menu.addAction(tasks_action)
+        menu.addAction(update_action)
         menu.addSeparator()
         menu.addAction(quit_action)
-        self._tray.setContextMenu(menu)
+        menu.aboutToShow.connect(self._refresh_tray_actions)
+        return menu
+
+    def _show_more_menu(self):
+        """主页「更多动作 ▾」：镜像托盘菜单，托盘被折叠时仍可达。"""
+        from PySide6.QtCore import QPoint
+        if getattr(self, '_more_menu', None) is None:
+            self._more_menu = self._build_action_menu(self)
+        btn = getattr(self.home, 'more_btn', None)
+        if btn is None:
+            pos = self.mapToGlobal(QPoint(20, 60))
+        else:
+            pos = btn.mapToGlobal(QPoint(0, btn.height()))
+        self._more_menu.exec(pos)
+
+    def _open_command_palette(self):
+        import command_palette
+        command_palette.open_command_palette(self, self._command_handlers())
+
+    def _command_handlers(self):
+        """命令面板里每个动作真正要调用的方法。"""
+        from hotkeys import HOTKEY_ACTIONS
+        handlers = {
+            key: (lambda k=key: self._on_hotkey_action(k))
+            for key in HOTKEY_ACTIONS
+        }
+        handlers.update({
+            'translate_home': self.home._on_translate,
+            'show_window': self._restore_from_tray,
+            'caption_start': self._show_caption_window,
+            'caption_hide': self._toggle_caption_overlay,
+            'caption_pause': self._toggle_caption_pause,
+            'caption_stop': self._stop_caption,
+            'caption_clear': self._clear_caption,
+            'live_stop': self._close_live_window,
+            'check_update': lambda: self.check_update(silent=False),
+            'open_settings': self._open_settings_page,
+            'copy_screenshot': self.home._copy_image,
+            'diagnostics': self._copy_diagnostics,
+        })
+        return handlers
+
+    def _copy_diagnostics(self):
+        import ui_feedback
+        text = ui_feedback.copy_diagnostic_report()
+        self._on_status("诊断信息已复制到剪贴板", "#4ade80")
+        return text
+
+    def _open_settings_page(self):
+        self._restore_from_tray()
+        try:
+            self.switchTo(self.settings)
+        except Exception:
+            try:
+                self.stackedWidget.setCurrentWidget(self.settings)
+            except Exception:
+                pass
+
+    def _open_task_center(self):
+        """显示仍在跑的后台任务，可逐个取消。"""
+        from PySide6.QtWidgets import QMessageBox
+        tasks = self._task_center.active()
+        if not tasks:
+            QMessageBox.information(
+                self, "任务中心",
+                "当前没有后台任务。\n安装组件、下载模型、批量转录和实时字幕"
+                "运行时会显示在这里。")
+            return
+        lines = [f"• {t['name']}" + (f"（{t['detail']}）" if t['detail'] else "")
+                 for t in tasks]
+        box = QMessageBox(self)
+        box.setWindowTitle(f"任务中心 · {len(tasks)} 项进行中")
+        box.setText("\n".join(lines))
+        box.setInformativeText(
+            "点「停止全部」会请求中断；已下载的文件会保留，下次可续传。")
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Ok
+            | QMessageBox.StandardButton.Cancel)
+        box.button(QMessageBox.StandardButton.Cancel).setText("停止全部")
+        box.button(QMessageBox.StandardButton.Ok).setText("继续运行")
+        if box.exec() == QMessageBox.StandardButton.Cancel:
+            self._task_center.cancel_all()
+            self._on_status("已请求停止全部后台任务", "#eab308")
+
+    def _maybe_show_welcome(self):
+        """全新安装后的一次性 3 步引导；从托盘启动 / 老用户都不打扰。"""
+        if self.isHidden() or self.isMinimized():
+            return
+        import onboarding
+        onboarding.show_welcome(
+            self,
+            on_enable_hotkey=self._enable_recommended_hotkey,
+            on_open_settings=self._open_settings_page)
+
+    def _enable_recommended_hotkey(self, mapping):
+        """用户主动点「启用推荐热键」才写配置，不擅自占用系统按键。"""
+        from config import save_user_config
+        from hotkeys import get_hotkeys
+        save_user_config(mapping)
+        self.cfg = load_user_config()
+        try:
+            if self._hotkeys is not None:
+                self._hotkeys.reload(get_hotkeys(self.cfg))
+        except Exception:
+            pass
+        self._on_status(
+            "已启用推荐截图热键，可在「设置 → 快捷键」随时修改", "#4ade80")
+
+    def _setup_tray(self):
+        self._tray = QSystemTrayIcon(self)
+        # 优先用窗口图标，兜底用应用图标
+        icon = self.windowIcon()
+        if icon.isNull():
+            from PySide6.QtGui import QIcon
+            icon = QIcon(str(resource_path("assets/app_icon.png")))
+        self._tray.setIcon(icon)
+        self.setWindowIcon(icon)
+        self._tray.setToolTip(APP_DISPLAY_NAME)
+        self._tray.activated.connect(self._on_tray_activated)
+
+        # QSystemTrayIcon 不接管菜单所有权，必须自己持有引用；否则菜单被
+        # Python GC 回收后，aboutToShow 里的运行时置灰会静默失效。
+        self._tray_menu = self._build_action_menu(self)
+        self._tray.setContextMenu(self._tray_menu)
         self._tray.show()
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self._restore_from_tray()
+
+    def _refresh_tray_actions(self):
+        """菜单弹出时按运行状态启用相关项，避免「点了没反应」被当成坏了。"""
+        for action, available in getattr(self, '_tray_runtime_actions', ()):
+            try:
+                action.setEnabled(bool(available()))
+            except Exception:
+                pass
 
     def _minimize_to_tray(self):
         # 托盘不可用时绝不能隐藏窗口：用户既看不到窗口也看不到托盘图标，
@@ -664,6 +879,19 @@ class MainWindow(FluentWindow):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
         self.hide()
+        # 首次关闭只提示一次：Windows 常把托盘图标折叠，用户不知道去哪找回，
+        # 还容易误以为程序已退出、再双击图标又被单实例拦下。
+        if not self.cfg.get("tray_hint_shown"):
+            self.cfg["tray_hint_shown"] = True
+            save_user_config({"tray_hint_shown": True})
+            try:
+                self._tray.showMessage(
+                    APP_DISPLAY_NAME,
+                    ("已最小化到系统托盘；右键图标可截图、开关 / 暂停 / "
+                     "清空实时字幕、切换双语模式，或显示窗口 / 退出"),
+                    QSystemTrayIcon.MessageIcon.Information, 5000)
+            except Exception:
+                pass
 
     def _restore_from_tray(self):
         self.showNormal()
@@ -671,7 +899,27 @@ class MainWindow(FluentWindow):
         self.raise_()
 
     def _quit_app(self):
+        tasks = self._task_center.active()
+        if tasks:
+            from PySide6.QtWidgets import QMessageBox
+            names = "、".join(t['name'] for t in tasks[:3])
+            answer = QMessageBox.question(
+                self, "还有任务在运行",
+                f"当前有 {len(tasks)} 项后台任务（{names}）。\n"
+                "直接退出会中断它们；已下载的文件会保留，下次可续传。"
+                "确定退出吗？",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+        self._task_center.cancel_all()
         self._update_stop.set()  # 后台检查线程不要再向已销毁的窗口发信号
+        # 正在进行的 pip 安装 / 模型下载：先置取消标志，别把子进程留成孤儿
+        try:
+            self.settings.cancel_running_tasks()
+        except Exception:
+            pass
         self._restore_after_live = False
         self._close_live_window()
         self._stop_caption()
@@ -679,6 +927,7 @@ class MainWindow(FluentWindow):
             self._hotkeys.dispose()
         self._tray.hide()
         QApplication.instance().quit()
+        return True
 
     def closeEvent(self, event):
         if self.cfg.get("minimize_to_tray", True):
@@ -688,32 +937,110 @@ class MainWindow(FluentWindow):
             # app.setQuitOnLastWindowClosed(False) 是全局设置，仅 accept 关闭事件
             # 不会结束事件循环：进程会变成无窗口、无托盘的僵尸，升级安装包也会
             # 因为 exe 仍被占用而覆盖失败。必须显式 quit。
-            self._quit_app()
-            event.accept()
+            # 用户在「还有任务在运行」里选了取消时，绝不能 accept：
+            # 会变成无窗口、无托盘、进程不退出的僵尸状态。
+            if self._quit_app():
+                event.accept()
+            else:
+                event.ignore()
 
     # ── 截图 ────────────────────────────────────────────────
 
+    def _hide_for_capture(self):
+        """截图前让主窗口「立刻且干净」地消失，不留半透明残影。
+
+        Windows / FluentWindow 隐藏时带淡出动画：hide() 后固定等 150ms 再
+        grabWindow(0)，拍到的仍是一层正在淡出的主窗口，浮层把这张背景图
+        画出来就成了「隐隐约约还能看到我们的窗口」。先把整窗透明度设成 0
+        让内容瞬时不可见，再 hide 并强制处理一轮事件，动画期拍到的就是纯
+        桌面；抓屏结束后立刻还原（窗口那时仍隐藏，不会出现透明窗口）。
+        """
+        if getattr(self, '_capture_opacity', None) is None:
+            try:
+                self._capture_opacity = self.windowOpacity()
+            except Exception:
+                self._capture_opacity = None
+        if self._capture_opacity is not None:
+            try:
+                self.setWindowOpacity(0.0)
+            except Exception:
+                pass
+        QApplication.processEvents()
+        self.hide()
+        QApplication.processEvents()
+
+    def _restore_capture_opacity(self):
+        """抓屏完成后还原透明度；所有恢复路径都会再调一次作为兜底。"""
+        value = getattr(self, '_capture_opacity', None)
+        if value is not None:
+            try:
+                self.setWindowOpacity(value)
+            except Exception:
+                pass
+            self._capture_opacity = None
+
+    def _abort_capture(self, message):
+        """截图链路抛异常时的兜底：把藏起来的主窗口找回来。
+
+        _hide_for_capture() 先隐藏了窗口，正常路径靠 overlay.finished 信号
+        或 _do_fullscreen 后半段的 showNormal() 恢复；一旦浮层构造 / 抓屏
+        本身抛异常，这些都不会执行，用户会看到「程序整个不见了」，只能去
+        托盘找回。这里统一还原透明度、清标志并恢复原有可见状态。
+        """
+        was_visible = bool(getattr(self, '_restore_after_capture', False)
+                           or getattr(self, '_restore_after_live', False))
+        self._restore_capture_opacity()
+        self._capture_pending = False
+        self._live_pending = False
+        self._restore_after_capture = False
+        self._restore_after_live = False
+        if self._overlay is not None:
+            try:
+                self._overlay.close()
+            except Exception:
+                pass
+            self._overlay = None
+        if was_visible:
+            self.showNormal()
+            self.activateWindow()
+            self.raise_()
+        self._on_status(message, "#e5635f")
+        if not was_visible:
+            # 从托盘 / 全局热键触发时主窗口本就保持隐藏，状态栏看不见
+            self._tray_notify(message)
+
     @Slot()
     def _start_screenshot(self):
-        if self._overlay is not None and self._overlay.isVisible():
-            return  # 已在截图中，避免重复触发
+        # _do_screenshot 是 150ms 后才创建的，光看 _overlay 挡不住连按
+        if self._capture_pending or (
+                self._overlay is not None and self._overlay.isVisible()):
+            return
+        self._capture_pending = True
         self._close_live_window(restore=True)
         self._on_status("请选择截图区域...", "#eab308")
         # 记录截图前窗口是否可见，结束后按原状态恢复
         # （从托盘热键触发时不弹出主窗口）
         self._restore_after_capture = self.isVisible() and not self.isMinimized()
-        self.hide()
-        QTimer.singleShot(150, self._do_screenshot)
+        self._hide_for_capture()
+        QTimer.singleShot(CAPTURE_SETTLE_MS, self._do_screenshot)
 
     def _do_screenshot(self):
-        auto_translate = self.cfg.get("auto_translate", False)
-        self._overlay = ScreenshotOverlay(auto_translate=auto_translate)
-        self._overlay.extractRequested.connect(self._on_overlay_extract)
-        self._overlay.translateRequested.connect(self._on_overlay_translate)
-        self._overlay.polishRequested.connect(self._on_overlay_polish)
-        self._overlay.screenshotTaken.connect(self._on_overlay_screenshot)
-        self._overlay.finished.connect(self._on_overlay_finished)
-        self._overlay.start_capture()
+        self._capture_pending = False
+        try:
+            auto_translate = self.cfg.get("auto_translate", False)
+            self._overlay = ScreenshotOverlay(auto_translate=auto_translate)
+            self._overlay.extractRequested.connect(self._on_overlay_extract)
+            self._overlay.translateRequested.connect(self._on_overlay_translate)
+            self._overlay.polishRequested.connect(self._on_overlay_polish)
+            self._overlay.screenshotTaken.connect(self._on_overlay_screenshot)
+            self._overlay.imageCopied.connect(self._on_image_copied)
+            self._overlay.finished.connect(self._on_overlay_finished)
+            self._overlay.start_capture()
+        except Exception as exc:
+            self._abort_capture(f"截图启动失败：{exc}")
+        finally:
+            # 抓屏已完成（或异常），立刻还原透明度，避免留下透明窗口
+            self._restore_capture_opacity()
 
     def _on_overlay_finished(self):
         overlay = self.sender()
@@ -721,6 +1048,7 @@ class MainWindow(FluentWindow):
             # 旧覆盖层的延迟信号，忽略，避免误清当前覆盖层
             return
         self._overlay = None
+        self._capture_pending = False
         if overlay is not None:
             overlay.deleteLater()
         if self._live_pending:
@@ -730,6 +1058,7 @@ class MainWindow(FluentWindow):
             self._on_status("已取消实时翻译", "#71717a")
             return
         if self._restore_after_capture:
+            self._restore_capture_opacity()
             self.showNormal()
             self.activateWindow()
         self._restore_after_capture = False
@@ -755,14 +1084,19 @@ class MainWindow(FluentWindow):
             self.isVisible() and not self.isMinimized())
         self._live_pending = True
         self._on_status("请框选实时翻译区域...", "#eab308")
-        self.hide()
-        QTimer.singleShot(150, self._do_live_select)
+        self._hide_for_capture()
+        QTimer.singleShot(CAPTURE_SETTLE_MS, self._do_live_select)
 
     def _do_live_select(self):
-        self._overlay = ScreenshotOverlay(live_select=True)
-        self._overlay.regionSelected.connect(self._on_live_region_selected)
-        self._overlay.finished.connect(self._on_overlay_finished)
-        self._overlay.start_capture()
+        try:
+            self._overlay = ScreenshotOverlay(live_select=True)
+            self._overlay.regionSelected.connect(self._on_live_region_selected)
+            self._overlay.finished.connect(self._on_overlay_finished)
+            self._overlay.start_capture()
+        except Exception as exc:
+            self._abort_capture(f"实时翻译选区启动失败：{exc}")
+        finally:
+            self._restore_capture_opacity()
 
     @Slot(QRect)
     def _on_live_region_selected(self, rect):
@@ -812,12 +1146,13 @@ class MainWindow(FluentWindow):
         self._restore_after_live = restore
         self._live_pending = True
         self._on_status("请重新框选实时翻译区域...", "#eab308")
-        self.hide()
-        QTimer.singleShot(150, self._do_live_select)
+        self._hide_for_capture()
+        QTimer.singleShot(CAPTURE_SETTLE_MS, self._do_live_select)
 
     def _restore_main_after_live(self):
         if self._restore_after_live:
             self._restore_after_live = False
+            self._restore_capture_opacity()
             self.showNormal()
             self.activateWindow()
             self.raise_()
@@ -899,11 +1234,11 @@ class MainWindow(FluentWindow):
                     cfg['subtitle_audio_device'] = ''
                     self._caption_notice = (
                         "（内录未就绪，已临时用麦克风；"
-                        "听电脑声音请到设置 → 实时字幕安装组件）")
+                        "听电脑声音请到「设置 → 实时字幕」点「安装组件」）")
             if source == 'mic':
                 if not deps['mic']:
                     self._on_status(
-                        "缺少 sounddevice，无法采集麦克风（pip install sounddevice）",
+                        "缺少 sounddevice，请在「设置 → 实时字幕」点「安装组件」在线安装",
                         "#e5635f")
                     return
                 # 防止上一轮留下的 loopback 设备 id 被误当成麦克风采集器
@@ -914,14 +1249,15 @@ class MainWindow(FluentWindow):
             engine_kind = str(cfg.get('subtitle_engine') or 'local')
             if engine_kind == 'local':
                 if not deps['local_asr']:
-                    self._on_status("缺少 faster-whisper，请在「音视频」页安装依赖",
+                    self._on_status(
+                        "缺少 faster-whisper，请在「音视频」页点「安装识别组件」",
                                     "#e5635f")
                     return
                 from speech_recognizer import resolve_model_path
                 name = str(cfg.get('subtitle_model') or 'tiny')
                 if not resolve_model_path(name)[0]:
                     self._on_status(
-                        f"本地模型 {name} 未下载：请到「音视频」页下载，"
+                        f"本地模型 {name} 未下载：请到「音视频」页点「下载模型」，"
                         "或在设置里改用在线 API", "#e5635f")
                     return
             elif not str(cfg.get('subtitle_api_url') or '').strip():
@@ -929,14 +1265,16 @@ class MainWindow(FluentWindow):
                                 "#e5635f")
                 return
         except Exception as e:
-            self._caption_starting = False
             self._on_status(f"实时字幕启动检查失败: {e}", "#e5635f")
             return
+        finally:
+            # 上面 4 个校验失败分支都是直接 return；不在 finally 里复位，
+            # _caption_starting 会永久为 True，之后再点「实时字幕」全被开头的
+            # 防重入判断静默拒绝，只能重启程序才能恢复。
+            self._caption_starting = False
 
         self._caption_cfg = cfg
         self._launch_caption()
-        # _launch_caption 同步创建引擎（含加载模型），无论成功失败都清起始标志
-        self._caption_starting = False
 
     def _new_caption_window(self, cfg, region=None):
         """构造字幕浮层并集中连接信号（重建时也走这里）。"""
@@ -1095,9 +1433,10 @@ class MainWindow(FluentWindow):
             self._caption_window.set_mode(mode)
         label = next((k for k, v in SUBTITLE_DISPLAY_MODES.items()
                       if v == mode), None)
-        action = getattr(self, '_caption_mode_actions', {}).get(label)
-        if action is not None:
-            action.setChecked(True)
+        # 托盘与主页「更多动作」各有一组互斥动作，两组都要同步勾选
+        for group in getattr(self, '_caption_mode_groups', ()):
+            for act in group.actions():
+                act.setChecked(act.text() == label)
 
     def _cycle_caption_mode(self):
         from config import SUBTITLE_DISPLAY_MODES
@@ -1138,7 +1477,8 @@ class MainWindow(FluentWindow):
                 pass
         self._caption_cfg = {}
         self.home.set_subtitle_running(False)
-        self._on_status("实时字幕已停止", "#71717a")
+        self._on_status("实时字幕已停止" if engine is not None
+                        else "实时字幕未在运行", "#71717a")
         # engine.stop() 会 join 音频 / ASR / 翻译三个线程（ASR 可能正卡在 Whisper
         # 推理，单句在普通 CPU 上也常 >3s）。在主线程同步 join 会冻结界面数秒，
         # 放到后台线程执行，保证点「停止」时界面立刻响应；结束后才开放启动，
@@ -1154,7 +1494,36 @@ class MainWindow(FluentWindow):
             self._caption_stopping = False
 
     def _on_overlay_screenshot(self, path):
+        sender = self.sender()
+        if sender is not None and sender is not self._overlay:
+            return  # 旧浮层迟到的信号，别覆盖当前预览
         self.home.set_image(path)
+
+    @Slot(str)
+    def _on_image_copied(self, detail):
+        """复制图片后的跨窗口反馈：状态栏 + 托盘气泡。
+
+        浮层在发出信号后立刻关闭，自己闪一行提示用户根本看不到；从托盘
+        热键触发时主窗口还保持隐藏，这种情况下只有托盘气泡能送达。
+        """
+        sender = self.sender()
+        if sender is not None and sender is not self._overlay:
+            return  # 旧浮层的迟到信号，别再弹一次气泡
+        msg = (f"图片已复制到剪贴板（{detail}），"
+               "可直接粘贴到聊天框 / 文档")
+        self._on_status(msg, "#4ade80")
+        self._tray_notify(msg)
+
+    def _tray_notify(self, msg):
+        """主窗口隐藏时，只有托盘气泡能把结果送到用户眼前。"""
+        tray = getattr(self, '_tray', None)
+        if tray is not None and not self.isVisible():
+            try:
+                tray.showMessage(
+                    APP_DISPLAY_NAME, msg,
+                    QSystemTrayIcon.MessageIcon.Information, 4000)
+            except Exception:
+                pass
 
     @Slot(str)
     def _on_overlay_extract(self, path):
@@ -1281,25 +1650,47 @@ class MainWindow(FluentWindow):
 
     @Slot()
     def _start_fullscreen(self):
-        if self._overlay is not None and self._overlay.isVisible():
+        if self._capture_pending or (
+                self._overlay is not None and self._overlay.isVisible()):
             return
+        self._capture_pending = True
         self._close_live_window(restore=True)
         self._on_status("正在全屏截图...", "#eab308")
         # 先隐藏主窗口再抓屏，避免把本程序窗口截进去
         self._restore_after_capture = self.isVisible() and not self.isMinimized()
-        self.hide()
-        QTimer.singleShot(150, self._do_fullscreen)
+        self._hide_for_capture()
+        QTimer.singleShot(CAPTURE_SETTLE_MS, self._do_fullscreen)
 
     def _do_fullscreen(self):
-        path = FullscreenCapture.capture()
+        self._capture_pending = False
+        try:
+            path = FullscreenCapture.capture()
+        except Exception as exc:
+            self._abort_capture(f"全屏截图失败：{exc}")
+            return
+        finally:
+            self._restore_capture_opacity()
+        hidden = not self._restore_after_capture
         if self._restore_after_capture:
             self.showNormal()
             self.activateWindow()
         self._restore_after_capture = False
         if not path:
             self._on_status("截图失败", "#e5635f")
+            if hidden:
+                self._tray_notify("全屏截图失败，请重试或改用区域截图")
             return
         self.home.set_image(path)
+        msg = "整屏截图已放入剪贴板，可直接粘贴到其它程序"
+        if hidden:
+            # 从托盘 / 全局热键触发时主窗口保持隐藏，InfoBar 挂在隐藏窗口
+            # 上等于没有提示；只能靠托盘气泡送达。
+            self._on_status("整屏截图已放入剪贴板", "#4ade80")
+            self._tray_notify(msg)
+        else:
+            # 状态栏马上要被「正在识别文字」覆盖，用独立提示条告知
+            InfoBar.success("截图已复制", msg, duration=3000,
+                            position=InfoBarPosition.TOP, parent=self)
         self._do_ocr_home(path)
 
     # ── 主页 OCR + 翻译 ────────────────────────────────────
@@ -1308,6 +1699,13 @@ class MainWindow(FluentWindow):
         if self.ocr is None:
             self._on_status("OCR 未就绪，请稍候...", "#eab308")
             return
+        # 连点「提取文字」/ 连续截图会起多个 OCR 线程，结果互相覆盖。
+        if getattr(self, '_home_ocr_busy', False):
+            self._on_status("正在识别文字，请稍候…", "#eab308")
+            return
+        self._home_ocr_busy = True
+        self._status_bus.push('ocr', "正在识别文字…", "#eab308",
+                              priority=15)
         self._on_status("正在识别文字...", "#eab308")
 
         def run():
@@ -1316,6 +1714,10 @@ class MainWindow(FluentWindow):
                 self._sig_ocr_done.emit(text, target)
             except Exception as e:
                 self._sig_error.emit(str(e))
+            finally:
+                # 纯属性赋值，不涉及 UI；即使对话框已关闭也不会卡住防重入
+                self._home_ocr_busy = False
+                self._status_bus.clear('ocr')
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -1324,7 +1726,12 @@ class MainWindow(FluentWindow):
             self._sig_trans_done.emit(self._last_trans_result)
             return
         self._on_status("正在翻译...", "#eab308")
-        self._sync_target_lang()
+        try:
+            self._sync_target_lang()
+        except Exception as e:
+            # 同步阶段失败不会起后台线程，必须走错误信号复位「翻译中…」按钮
+            self._sig_error.emit(f"翻译参数无效：{e}")
+            return
 
         def run():
             try:
@@ -1519,6 +1926,16 @@ class MainWindow(FluentWindow):
 
         threading.Thread(target=run, daemon=True).start()
 
+    @Slot(list)
+    def _on_av_polished_sources(self, lines):
+        self.av.set_polished_sources(lines)
+        self._on_status("AI 润色完成", "#4ade80")
+
+    @Slot(list)
+    def _on_av_polished_translations(self, lines):
+        self.av.set_polished_translations(lines)
+        self._on_status("AI 润色完成", "#4ade80")
+
     @Slot()
     def _on_polish_failed(self):
         self.home.finish_polish()
@@ -1574,6 +1991,8 @@ class MainWindow(FluentWindow):
         if self._caption_window is not None:
             self._caption_window.set_mode(
                 self.cfg.get('subtitle_display_mode', 'both'))
+            # 字号 / 行数 / 底色原本只在浮层构造时读一次，改完设置看不到变化
+            self._caption_window.apply_appearance(self.cfg)
         # 配置写盘后全局快照已刷新，重建翻译引擎让新 API / 密钥立即生效
         from config import DEFAULT_TRANSLATION_API
         self.translator.set_api_type(
@@ -1583,6 +2002,9 @@ class MainWindow(FluentWindow):
         if old_hotkeys != new_hotkeys and self._hotkeys is not None:
             # 只重建本应用注册过的钩子，不碰其它模块的键盘监听
             self._hotkeys.reload(new_hotkeys)
+        # 窗口内快捷键（如主页 Ctrl+Enter 翻译）由 QShortcut 注册，不归
+        # HotkeyManager 管；配置一变就重建，用户不用重启程序。
+        self.home.refresh_shortcuts()
         if old_engine != new_engine:
             self._init_ocr_async()
         # 实时字幕运行中改了相关设置：引擎用的是启动时的配置快照，需停止后

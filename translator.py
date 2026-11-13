@@ -16,7 +16,7 @@ import socket
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import user_config, TRANSLATION_APIS, DEFAULT_TRANSLATION_API, FREE_APIS, FREE_API_KEY_FIELDS
-from free_translator import get_free_translator, invalidate_free_translator
+from free_translator import get_free_translator
 
 
 class TranslationError(Exception):
@@ -180,10 +180,15 @@ class VolcengineTranslator:
 
 
 class Translator:
-    def __init__(self, source_lang='auto', target_lang='zh-CN', api_type=None):
+    def __init__(self, source_lang='auto', target_lang='zh-CN', api_type=None,
+                 config_override=None):
         self.source_lang = source_lang
         self.target_lang = target_lang
-        self.api_type = api_type or user_config.get('translation_api', DEFAULT_TRANSLATION_API)
+        # 设置页「测试连接」传入的是界面上还没保存的密钥快照。独立保存一份，
+        # 绝不写进全局 user_config（会污染主窗口正在用的翻译器）。
+        self._cfg = config_override
+        cfg = self._cfg if self._cfg is not None else user_config
+        self.api_type = api_type or cfg.get('translation_api', DEFAULT_TRANSLATION_API)
         self.translator = None
         self._free_engine = None
         self._free_api_key = ''
@@ -199,25 +204,28 @@ class Translator:
         }
 
     def _init_translator(self):
+        cfg = self._cfg if self._cfg is not None else user_config
         if self.translator is None:
             if self.api_type in FREE_APIS:
                 # 获取用户可能填写的 API key
                 key_field = FREE_API_KEY_FIELDS.get(self.api_type)
-                user_key = user_config.get(key_field, '') if key_field else ''
+                user_key = cfg.get(key_field, '') if key_field else ''
                 # Azure 区域仅对 bing_free + 密钥（Azure）生效
-                self._free_region = user_config.get(
+                self._free_region = cfg.get(
                     'bing_azure_region', '') if self.api_type == 'bing_free' else ''
-                invalidate_free_translator(self.api_type)
+                # 不要在这里清全局免费引擎缓存：缓存键已含 api_type / 密钥 /
+                # 区域，换配置自然会拿到新实例；而清缓存会把主窗口正在用的
+                # 实例一并删掉，测试连接 / 批量翻译都会干扰前台翻译。
                 self._free_engine = self.api_type
                 self._free_api_key = user_key
                 self.translator = "FREE_ENGINE"
             elif self.api_type == 'deepl':
                 target = self.deepl_lang_map.get(self.target_lang, 'ZH')
-                api_key = user_config.get('deepl_api_key', '')
+                api_key = cfg.get('deepl_api_key', '')
                 if api_key:
                     # DeepL 免费版密钥（通常以 :fx 结尾）必须走免费端点，否则 403
                     use_free = api_key.rstrip().endswith(':fx') or bool(
-                        user_config.get('deepl_use_free_api'))
+                        cfg.get('deepl_use_free_api'))
                     self.translator = DeeplTranslator(
                         api_key=api_key, target=target,
                         use_free_api=bool(use_free))
@@ -226,8 +234,8 @@ class Translator:
                     self._free_api_key = ''
                     self.translator = "FREE_ENGINE"
             elif self.api_type == 'baidu':
-                appid = user_config.get('baidu_appid', '')
-                secret = user_config.get('baidu_secret', '')
+                appid = cfg.get('baidu_appid', '')
+                secret = cfg.get('baidu_secret', '')
                 target = self.baidu_lang_map.get(self.target_lang, 'zh')
                 if appid and secret:
                     self.translator = BaiduTranslator(api_key=appid, secret_key=secret, target=target)
@@ -236,8 +244,8 @@ class Translator:
                     self._free_api_key = ''
                     self.translator = "FREE_ENGINE"
             elif self.api_type == 'tencent':
-                secret_id = user_config.get('tencent_secret_id', '')
-                secret_key = user_config.get('tencent_secret_key', '')
+                secret_id = cfg.get('tencent_secret_id', '')
+                secret_key = cfg.get('tencent_secret_key', '')
                 if secret_id and secret_key:
                     self.translator = TencentTranslator(secret_id, secret_key,
                                                         self.target_lang)
@@ -246,8 +254,8 @@ class Translator:
                     self._free_api_key = ''
                     self.translator = "FREE_ENGINE"
             elif self.api_type == 'volcengine':
-                app_id = user_config.get('volcengine_app_id', '')
-                access_token = user_config.get('volcengine_token', '')
+                app_id = cfg.get('volcengine_app_id', '')
+                access_token = cfg.get('volcengine_token', '')
                 if app_id and access_token:
                     self.translator = VolcengineTranslator(app_id, access_token,
                                                            self.target_lang)
@@ -377,3 +385,60 @@ def get_translator_instance(source_lang='auto', target_lang='zh-CN', api_type=No
         if api_type:
             _translator_instance.set_api_type(api_type)
     return _translator_instance
+
+
+# 「测试连接」用的短文本：所有引擎都支持，且不会消耗多少额度
+_TEST_TEXT = "Hello, world"
+
+# 付费引擎必填凭证；免费引擎的密钥是可选的，不做检查
+_REQUIRED_CREDENTIALS = {
+    'deepl': (('deepl_api_key', 'DeepL API 密钥'),),
+    'baidu': (('baidu_appid', '百度 AppID'),
+              ('baidu_secret', '百度 SecretKey')),
+    'tencent': (('tencent_secret_id', '腾讯 SecretId'),
+                ('tencent_secret_key', '腾讯 SecretKey')),
+    'volcengine': (('volcengine_app_id', '火山 AppID'),
+                   ('volcengine_token', '火山 Token')),
+}
+
+
+def test_translation(api_type=None, keys=None, target_lang='zh-CN',
+                     text=_TEST_TEXT, cancel_event=None):
+    """测试当前填写的翻译引擎能否用，返回 ``(ok, message)``。
+
+    ``keys`` 是设置页控件的快照：没点「保存」也能测刚填的密钥，且不会把
+    测试用的配置写进 user_config。免费引擎的实例缓存键本身包含密钥与区域，
+    因此测试不会复用主窗口的连接，也不必去清全局缓存干扰正在跑的翻译。
+    """
+    from cancelable import CallCancelled, run_cancelable
+    from user_messages import friendly_service_error
+
+    keys = dict(keys or {})
+    api_type = str(api_type or keys.get('translation_api')
+                   or DEFAULT_TRANSLATION_API)
+    missing = [label for key, label in _REQUIRED_CREDENTIALS.get(api_type, ())
+               if not str(keys.get(key) or '').strip()]
+    if missing:
+        return False, "请先填写 " + "、".join(missing)
+
+    def probe():
+        engine = Translator('auto', target_lang, api_type,
+                            config_override=keys)
+        return engine.translate(text)
+
+    try:
+        out = run_cancelable(probe, cancel_event, poll=0.1)
+    except CallCancelled:
+        return False, "已取消测试"
+    except Exception as exc:
+        return False, friendly_service_error(exc, "翻译服务")
+
+    result = str(out or '').strip()
+    if not result:
+        return False, "服务返回空译文，请检查目标语言与账户额度"
+    if result == text:
+        # 免费引擎降级 / 密钥无效时可能原样回显。此时绝不能报「连接正常」，
+        # 否则用户以为测过了，真正翻译时才发现全是原文。
+        return False, ("服务原样返回了测试文本，疑似未翻译；"
+                       "请检查目标语言、密钥与账户额度")
+    return True, f"连接正常：{text} → {result[:40]}"

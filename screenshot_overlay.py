@@ -51,6 +51,7 @@ class ScreenshotOverlay(QWidget):
     """全屏覆盖层：选区 → 菜单 → 提取(浮动文字框) / 翻译(叠加译文，可切换)。"""
 
     screenshotTaken = Signal(str)
+    imageCopied = Signal(str)       # 复制图片成功，参数是图片尺寸说明
     extractRequested = Signal(str)
     translateRequested = Signal(str)
     polishRequested = Signal(str, str)  # (kind, text)
@@ -138,7 +139,9 @@ class ScreenshotOverlay(QWidget):
         self._menu_timer.timeout.connect(self._sync_menu)
         self._status_timer = QTimer(self)
         self._status_timer.setSingleShot(True)
-        self._status_timer.setInterval(1200)
+        # 教学类提示（"拖动蓝点移动 · 拖边缘缩放"）1.2 秒根本来不及读完，
+        # 用户还没试就没了，且之后不再出现。留足阅读 + 尝试的时间。
+        self._status_timer.setInterval(4000)
         self._status_timer.timeout.connect(self._clear_status)
 
     # ── 截图启动 ──────────────────────────────────────────────
@@ -388,9 +391,11 @@ class ScreenshotOverlay(QWidget):
         hint_font.setPixelSize(15)
         p.setFont(hint_font)
         if self._live_select:
-            hint = "拖动框选要实时翻译的区域 | ESC/右键 取消"
+            hint = "拖动框选要实时翻译的区域 | 回车开始 | ESC/右键 取消"
         else:
-            hint = "拖动鼠标选择区域 | ESC/右键 取消"
+            # 选完区才有工具栏，11 个功能此前在主界面一字未提
+            hint = ("拖动鼠标选择区域 | 松开后：提取 / 翻译 / 编辑标注 / "
+                    "复制或保存图片 | ESC/右键 取消")
         tw = p.fontMetrics().horizontalAdvance(hint)
         hx = self.width() // 2 - tw // 2
         hy = self.height() - 50
@@ -562,6 +567,9 @@ class ScreenshotOverlay(QWidget):
     def _menu_button(self, text, on_click, checkable=False, checked=False):
         btn = QPushButton(text, self._menu)
         btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        if text == "取消":
+            btn.setToolTip("编辑标注时：放弃当前全部标注并返回（会先确认）\n"
+                           "其它情况：关闭本次截图")
         if checkable:
             btn.setCheckable(True)
             btn.setChecked(checked)
@@ -1077,6 +1085,9 @@ class ScreenshotOverlay(QWidget):
 
     def _on_extract_popup_close(self):
         self._hide_extract_popup()
+        # 关闭弹窗必须退出 extract 模式：否则 _crop_hit 一直返回空（手柄消失）、
+        # mousePressEvent 末尾被 `if self._mode: return` 吞掉，选区再也调不动。
+        self._mode = None
         self._show_menu = True
         self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
         self.update()
@@ -1509,6 +1520,11 @@ class ScreenshotOverlay(QWidget):
         if event.key() == Qt.Key.Key_Escape:
             if self._mode:
                 self._reset_mode()
+            elif self._edit_overlay is not None:
+                # 编辑模式不设置 _mode，直接 _cancel() 会关掉整个浮层、
+                # 丢掉全部标注；ESC 应该只退出编辑回到选区菜单。
+                self._exit_edit_mode()
+                self.update()
             else:
                 self._cancel()
 
@@ -1549,6 +1565,15 @@ class ScreenshotOverlay(QWidget):
 
     def _cancel(self):
         self._hide_extract_popup()
+        # 框选完又点「取消」/ 右键 / ESC 时，别把这张图直接丢掉：存一份到
+        # 主页「截图预览」，用户仍能用「复制截图」或「保存」继续处理。
+        if (not self._live_select and self._crop_rect
+                and self._raw_pixmap is not None):
+            image = self._crop_image()
+            if image is not None and not image.isNull():
+                path = self._save_to_temp(image)
+                if path:
+                    self.screenshotTaken.emit(path)
         self.close()
         self.finished.emit()
 
@@ -1766,10 +1791,20 @@ class ScreenshotOverlay(QWidget):
         elif name in ("复制", "复制图片"):
             # 菜单在有识别文字时把「复制」改名成「复制图片」，两个名字必须都
             # 走这里；否则会落到末尾的 _cancel()，图片没复制还把截图作废了。
-            self._show_menu = False
             image = self._crop_image()
-            if image:
-                QApplication.clipboard().setPixmap(image)
+            if not image or image.isNull():
+                # 选区无效时别静默关掉浮层，否则用户以为复制成功了
+                self._status_text = "截图区域无效，未能复制图片"
+                self._status_timer.start()
+                self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+                self._show_menu = True
+                self.update()
+                return
+            QApplication.clipboard().setPixmap(image)
+            # 浮层马上就要关闭，自己在上面闪提示用户根本看不到；交给主窗口
+            # 的状态栏 / 托盘气泡，跨窗口明确告知「可以直接去粘贴了」。
+            self.imageCopied.emit(f"{image.width()}×{image.height()}")
+            self._show_menu = False
             path = self._save_to_temp()
             self._hide_extract_popup()
             self.close()
@@ -1787,7 +1822,15 @@ class ScreenshotOverlay(QWidget):
                         self, "保存截图", "screenshot.png",
                         "PNG 图片 (*.png);;JPG 图片 (*.jpg)")
                     if save_path:
-                        image.save(save_path)
+                        if image.save(save_path):
+                            self._status_text = (
+                                f"已保存到 {os.path.basename(save_path)}")
+                        else:
+                            self._status_text = "保存失败，请检查路径或磁盘空间"
+                        self._status_timer.start()
+                else:
+                    self._status_text = "截图区域无效，未能保存"
+                    self._status_timer.start()
                 self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
                 self._show_menu = True
                 self.update()
@@ -1796,6 +1839,14 @@ class ScreenshotOverlay(QWidget):
             path = self._save_to_temp()
             if path:
                 self.extractRequested.emit(path)
+            else:
+                # 临时图保存失败时不能零动作：否则菜单被隐藏、光标停在沙漏，
+                # 浮层变成点不动的死锁态。
+                self._status_text = "截图保存失败，无法提取文字"
+                self._status_timer.start()
+                self._show_menu = True
+                self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+                self.update()
         elif name in ("翻译", "原文"):
             if self._mode == "translate" and self._ocr_text:
                 self._showing_trans = not self._showing_trans
@@ -1808,6 +1859,12 @@ class ScreenshotOverlay(QWidget):
                 path = self._save_to_temp()
                 if path:
                     self.translateRequested.emit(path)
+                else:
+                    self._status_text = "截图保存失败，无法翻译"
+                    self._status_timer.start()
+                    self._show_menu = True
+                    self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+                    self.update()
         elif name == "开始实时翻译":
             cr = self._crop_rect
             if cr:
@@ -1862,6 +1919,7 @@ class ScreenshotOverlay(QWidget):
                     self._edit_selected_text_idx,
                 ))
                 self._restore_edit_snapshot(self._edit_undo.pop())
+            self._set_edit_cursor()
             self.update()
         elif name == "重做":
             if self._edit_redo:
@@ -1871,9 +1929,24 @@ class ScreenshotOverlay(QWidget):
                     self._edit_selected_text_idx,
                 ))
                 self._restore_edit_snapshot(self._edit_redo.pop())
+            self._set_edit_cursor()
             self.update()
         elif name == "取消":
             if self._edit_overlay is not None:
+                # 有标注时「取消」= 全部丢弃且撤销栈一起清空，属于不可逆操作；
+                # 与「关闭整个截图」共用同一个词，用户无法预判后果，先确认一次。
+                if self._edit_undo or self._edit_text_items:
+                    from PySide6.QtWidgets import QMessageBox
+                    answer = QMessageBox.question(
+                        self, "放弃标注？",
+                        "将丢弃当前所有标注且无法撤销，确定要返回吗？",
+                        QMessageBox.StandardButton.Yes
+                        | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No)
+                    if answer != QMessageBox.StandardButton.Yes:
+                        self._set_edit_cursor()
+                        self.update()
+                        return
                 self._exit_edit_mode()
                 self.update()
             else:

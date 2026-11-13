@@ -223,7 +223,11 @@ class GoogleFreeTranslator:
             body = resp.json()
             data = body.get("data", {}).get("translations", [])
             if data:
-                results.append(data[0].get("translatedText", chunk))
+                # 缺 translatedText 时不能拿原文冒充译文
+                translated = str(data[0].get("translatedText") or "").strip()
+                if not translated:
+                    raise RuntimeError("Google Cloud 翻译未返回译文")
+                results.append(translated)
             else:
                 raise RuntimeError("Google Cloud 翻译返回空结果")
         return "\n".join(results)

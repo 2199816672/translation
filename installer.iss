@@ -2,10 +2,12 @@
 ;
 ; 版本号由 build_installer.py 通过 /dMyAppVersion 注入，唯一来源是
 ; config.py 的 APP_VERSION，避免脚本与实际程序版本不同步。
+; 下面的 #ifndef 兜底值只在手工直接编译本脚本时生效；改版本号请用
+; python bump_version.py <版本>，它会把兜底值一起同步（CI 也会校验）。
 ; 本文件必须保存为 UTF-8 with BOM，否则中文会乱码。
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.5.1"
+  #define MyAppVersion "1.5.2"
 #endif
 ; 待打包的程序目录。手工编译时使用默认 dist\TranslationTool；
 ; build_installer.py 会通过 /dSourceDir 指向每次构建的全新暂存目录。

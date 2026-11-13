@@ -38,6 +38,9 @@ jobs:
       - name: 回归测试（核心逻辑 + 升级链路 + 批量转录）
         run: python -m unittest discover -s tests -v
 
-      - name: 版本号与发布资产命名一致性
+      # 除了校验 APP_VERSION 格式，还要防止 README 标题 / installer.iss
+      # 手工编译兜底值漏改，出现「文档写旧版本、实际是新版本」。
+      - name: 版本号一致性与发布资产命名
         run: |
-          python -c "import config, re; assert re.fullmatch(r'\d+\.\d+\.\d+', config.APP_VERSION), config.APP_VERSION; print('APP_VERSION =', config.APP_VERSION, '| asset = TranslationTool-Setup-v' + config.APP_VERSION + '.exe')"
+          python bump_version.py --check
+          python -c "import config; print('APP_VERSION =', config.APP_VERSION, '| asset = TranslationTool-Setup-v' + config.APP_VERSION + '.exe')"

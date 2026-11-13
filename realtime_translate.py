@@ -277,13 +277,19 @@ class LiveTranslateWindow(QWidget):
         self._closed = True
         if self._bar is not None:
             self._bar.close()
+        # 后台 _process 线程可能正持有该 PNG 的文件句柄，Windows 上直接
+        # os.remove 会抛 PermissionError；失败时交给 _process 的 finally
+        # 兜底删除，避免临时帧文件永久残留。
+        self._drop_frame_file()
+        super().closeEvent(event)
+        self.closed.emit()
+
+    def _drop_frame_file(self):
         try:
             if os.path.exists(self._frame_path):
                 os.remove(self._frame_path)
         except OSError:
             pass
-        super().closeEvent(event)
-        self.closed.emit()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
@@ -479,6 +485,11 @@ class LiveTranslateWindow(QWidget):
             self._process_inner(path)
         except Exception as e:
             self._sig_error.emit(f"实时翻译异常：{e}")
+        finally:
+            # 关闭窗口时若文件仍被占用，closeEvent 的删除会失败，
+            # 这里在最后一次读取结束后再删一次。
+            if self._closed:
+                self._drop_frame_file()
 
     def _process_inner(self, path):
         # 优先取带坐标的行块；引擎不支持或失败时回退到纯文本 OCR
@@ -508,24 +519,37 @@ class LiveTranslateWindow(QWidget):
             return
         positioned = []
         try:
+            groups = []
             if blocks:
                 img = QImage(path)
                 groups = normalize_groups(
                     group_blocks(blocks), img.width(), img.height())
+            if not groups:
+                # 无位置信息、或行块被分组全部过滤时，整段压平翻译。
+                # 否则 results 为空会给出空译文（旧代码靠回填原文掩盖了它）。
+                translated = self._translator.translate(flatten_text(text)) or ""
+                if not translated.strip():
+                    self._sig_error.emit("翻译失败，未获取到译文")
+                    return
+            else:
                 results = []
+                failed = 0
                 for g in groups:
                     src = str(g.get("text", ""))
                     try:
-                        results.append(
-                            self._translator.translate_paragraph(src) or src)
+                        r = self._translator.translate_paragraph(src) or ""
                     except Exception:
-                        results.append(src)
+                        r = ""
+                    # 翻译失败必须留空，绝不能把原文塞进译文位置
+                    if not str(r).strip():
+                        failed += 1
+                    results.append(r)
+                if failed == len(groups):
+                    self._sig_error.emit("翻译失败，未获取到译文")
+                    return
                 positioned = [dict(g, trans=r)
                               for g, r in zip(groups, results)]
                 translated = "\n\n".join(results)
-            else:
-                # 没有位置信息：沿用整段压平翻译
-                translated = self._translator.translate(flatten_text(text)) or ""
         except Exception as e:
             self._sig_error.emit(f"翻译失败：{e}")
             return
@@ -559,7 +583,8 @@ class LiveTranslateWindow(QWidget):
         self._last_translation = translated
         self._last_blocks = blocks or []
         self._source_text = source
-        self._translated = translated.strip() or source
+        # 译文为空就是没译出来，不能拿原文顶替（复制译文会拿到原文）
+        self._translated = translated.strip()
         self._blocks = blocks or []
         self.update()
         self._bar.set_status(

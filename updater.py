@@ -31,6 +31,7 @@ from urllib.parse import urlsplit
 
 from config import APP_VERSION, GITHUB_REPO
 from subprocess_util import run_quiet
+from user_messages import friendly_network_error
 
 REPO = GITHUB_REPO
 API_URL = f"https://api.github.com/repos/{REPO}/releases/latest"
@@ -40,8 +41,10 @@ USER_AGENT = "TranslationTool-Updater"
 TOKEN_ENV_VARS = ("GITHUB_TOKEN", "GH_TOKEN", "GITHUB_ACCESS_TOKEN")
 
 # 只认官方命名的一键安装包，避免误下便携 zip 或被改名的资产
+# 用 \Z 而不是 $：Python 的 $ 允许匹配「末尾换行符之前」，带 \n 的资产名
+# 会绕过白名单，随后在 Windows 上因文件名含控制字符导致写文件失败。
 SETUP_NAME_RE = re.compile(
-    r"^TranslationTool-Setup-v[0-9][0-9A-Za-z.\-]*\.exe$", re.I)
+    r"^TranslationTool-Setup-v[0-9][0-9A-Za-z.\-]*\.exe\Z", re.I)
 SHA256_RE = re.compile(r"\b([0-9a-f]{64})\b", re.I)
 DIGEST_RE = re.compile(r"^sha256:([0-9a-f]{64})$", re.I)
 
@@ -182,7 +185,9 @@ def _http_error(exc) -> str:
         return "找不到发布信息（HTTP 404），新版本可能尚未发布。"
     if code in (401, 403):
         return "GitHub 接口限流或凭据无效，请稍后重试。"
-    return f"更新服务器返回 HTTP {code or '错误'}：{exc}"
+    if code:
+        return f"更新服务器返回 HTTP {code}，请稍后重试或打开发布页手动下载。"
+    return friendly_network_error(exc)
 
 
 def _payload_via_gh() -> Optional[str]:
@@ -225,7 +230,7 @@ def fetch_latest_release(timeout: float = 10, api_url: str = API_URL,
                     continue
                 break
             except (UpdateError, urllib.error.URLError, OSError, TimeoutError) as exc:
-                last_error = UpdateError(f"无法连接更新服务器：{exc}")
+                last_error = UpdateError(friendly_network_error(exc))
                 break
         if payload is None:
             payload = _payload_via_gh()
@@ -252,7 +257,7 @@ def fetch_latest_release(timeout: float = 10, api_url: str = API_URL,
         if not isinstance(asset, dict):
             continue
         name = str(asset.get("name") or "")
-        if not SETUP_NAME_RE.match(name):
+        if not SETUP_NAME_RE.fullmatch(name):
             continue
         info.setup_name = name
         info.setup_url = str(asset.get("browser_download_url") or "")
@@ -297,7 +302,7 @@ def update_dir() -> Path:
 def safe_download_path(info: ReleaseInfo) -> Path:
     """资产名来自远端，已经过白名单，这里再防一次路径穿越。"""
     name = Path(info.setup_name).name
-    if not SETUP_NAME_RE.match(name):
+    if not SETUP_NAME_RE.fullmatch(name):
         raise UpdateError("安装包文件名不合法，已取消下载")
     return update_dir() / name
 
@@ -379,7 +384,7 @@ def check_update() -> dict:
             info=info,
         )
     except Exception as exc:
-        result["error"] = f"检测失败：{exc}"
+        result["error"] = f"检测失败：{friendly_network_error(exc)}"
     return result
 
 

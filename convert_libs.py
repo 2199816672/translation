@@ -40,12 +40,26 @@ def safe_output_stem(raw):
     return ''.join(out).strip() or 'output'
 
 
+def missing_component(pip_name):
+    """缺少可选组件时给用户一条真正走得通的指引。
+
+    安装版（PyInstaller 冻结态）用户机器上通常没有 Python / pip，
+    显示「pip install xxx」等于给了一条死路；程序本身就有在线安装入口。
+    """
+    import sys
+    if getattr(sys, "frozen", False):
+        return (f"缺少「{pip_name}」组件。请打开「设置」页，"
+                "点对应功能旁的「安装」按钮在线安装（无需重启）")
+    return (f"缺少「{pip_name}」组件：可执行 pip install {pip_name} 安装，"
+            "或在程序「设置」页点安装按钮在线安装")
+
+
 def _need(module, pip_name):
     """延迟导入，缺失时给出中文安装提示。"""
     try:
         return __import__(module)
     except ImportError:
-        raise RuntimeError(f"请先安装依赖: pip install {pip_name}")
+        raise RuntimeError(missing_component(pip_name))
 
 
 def read_text(path):
@@ -161,7 +175,7 @@ def images_to_pdf_bytes(paths, progress_cb=None):
     try:
         from PIL import Image
     except ImportError:
-        raise RuntimeError("请先安装依赖: pip install Pillow")
+        raise RuntimeError(missing_component("Pillow"))
     pages = []
     for p in paths:
         with Image.open(p) as src:
@@ -185,7 +199,7 @@ def xlsx_to_csv_bytes(src, progress_cb=None):
     try:
         import openpyxl
     except ImportError:
-        raise RuntimeError("请先安装依赖: pip install openpyxl")
+        raise RuntimeError(missing_component("openpyxl"))
     wb = openpyxl.load_workbook(src, read_only=True, data_only=True)
     buf = io.StringIO()
     try:
@@ -203,7 +217,7 @@ def text_to_docx_bytes(text, progress_cb=None):
     try:
         from docx import Document
     except ImportError:
-        raise RuntimeError("请先安装依赖: pip install python-docx")
+        raise RuntimeError(missing_component("python-docx"))
     doc = Document()
     for line in text.split('\n'):
         doc.add_paragraph(line)
@@ -230,27 +244,34 @@ def entries_to_subtitle_bytes(entries, target):
     return serialize_subtitle(entries, '.' + target).encode('utf-8')
 
 
+def _read_csv_rows(src):
+    """整表解码成功后再返回，避免编码回退把前几行重复追加进 worksheet。
+
+    TextIOWrapper 按块增量解码：大文件前段是 ASCII、后段是 GBK 时，
+    UTF-8 会先成功读出上千行再抛 UnicodeDecodeError。若边读边 append，
+    每轮换编码都会把已读的行再写一遍，产出静默重复数据的 xlsx。
+    """
+    for enc in ('utf-8-sig', 'utf-8', 'gbk', 'gb18030'):
+        try:
+            with open(src, 'r', encoding=enc, newline='') as f:
+                return list(csv.reader(f))
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    raise RuntimeError("无法读取 CSV，请检查文件编码")
+
+
 def csv_to_xlsx_bytes(src, progress_cb=None):
     """CSV -> Excel（自动尝试 UTF-8 / GBK）。"""
     try:
         import openpyxl
     except ImportError:
-        raise RuntimeError("请先安装依赖: pip install openpyxl")
+        raise RuntimeError(missing_component("openpyxl"))
+    rows = _read_csv_rows(src)
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = 'Sheet1'
-    ok = False
-    for enc in ('utf-8-sig', 'utf-8', 'gbk'):
-        try:
-            with open(src, 'r', encoding=enc, newline='') as f:
-                for row in csv.reader(f):
-                    ws.append(row)
-            ok = True
-            break
-        except (UnicodeDecodeError, UnicodeError):
-            continue
-    if not ok:
-        raise RuntimeError("无法读取 CSV，请检查文件编码")
+    for row in rows:
+        ws.append(row)
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -297,6 +318,11 @@ def convert_bytes(src, target, progress_cb=None):
         from office_bridge import docx_to_pdf_bytes
         return [(stem + _SUFFIX['pdf'],
                  docx_to_pdf_bytes(src, progress_cb))]
+
+    # TXT -> Word（CONVERSION_MAP 里声明了，缺这个分支会必然抛「暂不支持」）
+    if ext == '.txt' and target == 'docx':
+        return [(stem + _SUFFIX['docx'],
+                 text_to_docx_bytes(read_text(src), progress_cb))]
 
     # TXT -> PDF
     if ext == '.txt' and target == 'pdf':

@@ -3,12 +3,13 @@
 """设置页：翻译 API、密钥、AI 润色、OCR 引擎、快捷键与自动化。"""
 import threading
 
-from PySide6.QtCore import Qt, Signal, Slot, QTimer
-from PySide6.QtGui import QColor, QKeySequence, QPalette, QShortcut
+from PySide6.QtCore import Qt, Signal, Slot, QTimer, QUrl
+from PySide6.QtGui import (QColor, QDesktopServices, QKeySequence, QPalette,
+                           QShortcut)
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-    QMessageBox, QPushButton, QProgressBar, QScrollArea, QSizePolicy,
-    QSlider, QStackedWidget, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QFrame, QGridLayout, QHBoxLayout,
+    QLabel, QLineEdit, QMessageBox, QPushButton, QProgressBar, QScrollArea,
+    QPlainTextEdit, QSizePolicy, QSlider, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from config import (
@@ -22,8 +23,13 @@ from config import (
 )
 from widgets import HotKeyInput, FlatCheckBox
 from theme import Palette
-from hotkeys import (DEFAULT_HOTKEYS, HOTKEY_ACTIONS, config_key,
-                     find_conflicts, get_hotkeys, normalize)
+from hotkeys import (DEFAULT_HOTKEYS, HOTKEY_ACTIONS,
+                     LOCAL_HOTKEY_ACTIONS, all_hotkeys, config_key,
+                     default_hotkeys, display_hotkey, find_conflicts,
+                     get_hotkeys, normalize, reserved_conflicts)
+from user_messages import friendly_install_error, friendly_model_error
+from task_center import TASK_CENTER
+import ui_feedback
 
 
 def _safe_int(cfg, key, default):
@@ -239,6 +245,22 @@ class SettingsPage(QWidget):
     _sig_polish_test = Signal(bool, str)
     _sig_caption_install = Signal(bool, str)
     _sig_caption_model = Signal(bool, str)
+    _sig_model_progress = Signal(int, int)
+    _sig_translation_test = Signal(bool, str)
+    _sig_subtitle_test = Signal(bool, str)
+
+    # 同一个按钮兼任「开始」与「取消」：进行中点它就中断，避免用户被
+    # 一个 100MB 的下载 / 数百 MB 的 pip 安装锁住几分钟。
+    _TASK_IDLE_TEXT = {
+        'ocr': '安装',
+        'loopback': '安装组件',
+        'model': '下载所选模型',
+    }
+    _TASK_NAMES = {
+        'ocr': '安装 OCR 组件',
+        'loopback': '安装音频采集组件',
+        'model': '下载字幕模型',
+    }
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -249,12 +271,69 @@ class SettingsPage(QWidget):
         self._cfg = load_user_config()
         # 保存基线：写盘时只提交相对它变化的键，避免覆盖其它页面刚写入的配置
         self._saved_cfg = dict(self._cfg)
+        self._task_cancel = {}      # key -> threading.Event
+        self._task_busy = set()     # 正在跑的 key
+        self._task_buttons = {}     # key -> 按钮
         self._sig_install_progress.connect(self._update_install_progress)
         self._sig_install_result.connect(self._on_install_result)
         self._sig_polish_test.connect(self._on_polish_test_result)
         self._sig_caption_install.connect(self._on_caption_install_done)
         self._sig_caption_model.connect(self._on_caption_model_done)
+        self._sig_model_progress.connect(self._on_model_progress)
+        self._sig_translation_test.connect(self._on_translation_test_result)
+        self._sig_subtitle_test.connect(self._on_subtitle_test_result)
         self._build_ui()
+
+    # ── 可取消的安装 / 下载 ──────────────────────────────────
+
+    def _task_toggle(self, key, start_fn, busy_text="取消安装"):
+        """同一个按钮：空闲时开始任务，运行中再点则立即取消。"""
+        btn = self._task_buttons.get(key)
+        if btn is None:
+            return
+        if key in self._task_busy:
+            event = self._task_cancel.get(key)
+            if event is not None:
+                event.set()
+            btn.setEnabled(False)
+            btn.setText("正在取消…")
+            return
+        event = threading.Event()
+        self._task_cancel[key] = event
+        self._task_busy.add(key)
+        TASK_CENTER.start(key, self._TASK_NAMES.get(key, key),
+                          cancelable=True, cancel=event, detail="进行中")
+        btn.setText(busy_text)
+        btn.setToolTip("点这里立即中断当前操作；已下载的文件会保留，下次自动续传")
+        try:
+            start_fn(event)
+        except Exception as exc:
+            # 启动就失败也要把按钮还原，否则永久停在「取消安装」
+            self._task_finish(key)
+            QMessageBox.warning(self, "无法开始", str(exc))
+
+    def _task_was_cancelled(self, key):
+        event = self._task_cancel.get(key)
+        return bool(event is not None and event.is_set())
+
+    def _task_finish(self, key, idle_text=None):
+        """收尾并还原按钮，返回这次是否由用户取消。"""
+        TASK_CENTER.finish(key)
+        cancelled = self._task_was_cancelled(key)
+        self._task_busy.discard(key)
+        self._task_cancel.pop(key, None)
+        btn = self._task_buttons.get(key)
+        if btn is not None:
+            btn.setEnabled(True)
+            btn.setText(idle_text or self._TASK_IDLE_TEXT.get(key, '重试'))
+            btn.setToolTip("")
+        return cancelled
+
+    def cancel_running_tasks(self):
+        """程序退出前调用：中断仍在跑的安装 / 下载，别留下 pip 子进程。"""
+        for event in list(self._task_cancel.values()):
+            event.set()
+        TASK_CENTER.cancel_all()
 
     # ── 构建界面 ────────────────────────────────────────────
 
@@ -287,10 +366,30 @@ class SettingsPage(QWidget):
         title = QLabel("设置", self)
         title.setObjectName("pageTitle")
         head.addWidget(title)
-        subtitle = QLabel("翻译引擎、AI 润色、OCR 识别、启动方式与自动化选项", self)
+        subtitle = QLabel(
+            "开箱即用，默认无需填密钥 · 翻译引擎、AI 润色、OCR、字幕、"
+            "快捷键与启动选项", self)
         subtitle.setObjectName("caption")
         head.addWidget(subtitle)
         layout.addLayout(head)
+
+        # 配置健康卡：配置损坏 / 数据目录降级时持久显示，不被滚动冲掉
+        self._health_bar = QFrame()
+        self._health_bar.setObjectName("card")
+        self._health_bar.setVisible(False)
+        health_lay = QHBoxLayout(self._health_bar)
+        health_lay.setContentsMargins(14, 10, 14, 10)
+        health_lay.setSpacing(10)
+        self._health_label = QLabel()
+        self._health_label.setWordWrap(True)
+        self._health_label.setStyleSheet("color: #eab308;")
+        health_lay.addWidget(self._health_label, 1)
+        health_btn = QPushButton("打开目录", self._health_bar)
+        health_btn.setProperty("kind", "ghost")
+        health_btn.clicked.connect(self._open_health_dir)
+        health_lay.addWidget(health_btn)
+        layout.addWidget(self._health_bar)
+        self._refresh_health()
 
         self._sections = []
         for build in (
@@ -302,7 +401,9 @@ class SettingsPage(QWidget):
                 self._build_subtitle_section,
                 self._build_hotkey_section,
                 self._build_general_section,
-                self._build_auto_section):
+                self._build_auto_section,
+                self._build_checklist_section,
+                self._build_diagnostics_section):
             section = build()
             self._sections.append(section)
             layout.addWidget(section)
@@ -331,7 +432,8 @@ class SettingsPage(QWidget):
         self._search_edit.setObjectName("settingsSearch")
         self._search_edit.setClearButtonEnabled(True)
         self._search_edit.setPlaceholderText(
-            "搜索设置：输入关键字即时筛选（如 字幕、快捷键、OCR、模型、密钥…）")
+            "搜索设置：Ctrl+F 聚焦 · 输入关键字即时筛选"
+            "（如 字幕、快捷键、OCR、模型、密钥…）")
         self._search_edit.setMinimumHeight(32)
         self._search_edit.textChanged.connect(self._apply_search)
         search_row.addWidget(self._search_edit, 1)
@@ -344,6 +446,9 @@ class SettingsPage(QWidget):
         # Ctrl+F 直接聚焦搜索框
         QShortcut(QKeySequence('Ctrl+F'), self).activated.connect(
             self.focus_search)
+        # 搜索到一半想退出：Esc 直接清空，不用手动删字符
+        QShortcut(QKeySequence('Esc'), self._search_edit).activated.connect(
+            self._search_edit.clear)
 
         # 固定底栏：保存按钮始终可见
         footer = QWidget(self)
@@ -354,7 +459,7 @@ class SettingsPage(QWidget):
         foot_row = QHBoxLayout(footer)
         foot_row.setContentsMargins(28, 10, 28, 16)
         foot_row.setSpacing(12)
-        hint = QLabel("修改后点击右侧按钮保存生效", footer)
+        hint = QLabel("修改后点右侧「保存设置」生效 · 字幕外观即时生效", footer)
         hint.setObjectName("caption")
         foot_row.addWidget(hint)
         foot_row.addStretch(1)
@@ -512,31 +617,44 @@ class SettingsPage(QWidget):
     def _build_hotkey_section(self) -> _Section:
         section = _Section(
             "快捷键",
-            "默认全部为空，不占用任何系统按键。点输入框后按下组合键即可录入；"
-            "按 Delete / Backspace 或点「清除」可清空。全局生效，最小化到托盘也能用")
-        keys = get_hotkeys(self._cfg)
+            "分两类：全局（默认全部为空，不占用系统按键，最小化到托盘也能用）、"
+            "窗口内（只在本程序有焦点时生效，默认就有组合键）。"
+            "点输入框后按下组合键即可录入；按 Delete / Backspace 或点「清除」可清空")
+        keys = all_hotkeys(self._cfg)
         self._hotkey_inputs = {}
-        for action, (label, _cfg_key, tip) in HOTKEY_ACTIONS.items():
-            row = QWidget()
-            lay = QHBoxLayout(row)
-            lay.setContentsMargins(0, 0, 0, 0)
-            lay.setSpacing(8)
-            entry = HotKeyInput(keys.get(action) or '', row)
-            entry.setMinimumWidth(200)
-            clear_btn = QPushButton("清除", row)
-            clear_btn.setProperty("kind", "ghost")
-            clear_btn.setFixedWidth(68)
-            clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            clear_btn.setToolTip("清空这个快捷键（不占用任何按键）")
-            clear_btn.clicked.connect(entry.clear_hotkey)
-            lay.addWidget(entry, 1)
-            lay.addWidget(clear_btn)
-            self._hotkey_inputs[action] = entry
-            section.add(label + ":", row, tip=tip)
+
+        def add_group(title, actions):
+            section.add_caption("── " + title + " ──")
+            for action, (label, _cfg_key, tip) in actions.items():
+                row = QWidget()
+                lay = QHBoxLayout(row)
+                lay.setContentsMargins(0, 0, 0, 0)
+                lay.setSpacing(8)
+                entry = HotKeyInput(keys.get(action) or '', row)
+                entry.setMinimumWidth(200)
+                clear_btn = QPushButton("清除", row)
+                clear_btn.setProperty("kind", "ghost")
+                clear_btn.setFixedWidth(68)
+                clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                clear_btn.setToolTip("清空这个快捷键（不占用任何按键）")
+                clear_btn.clicked.connect(entry.clear_hotkey)
+                lay.addWidget(entry, 1)
+                lay.addWidget(clear_btn)
+                self._hotkey_inputs[action] = entry
+                section.add(label + ":", row, tip=tip)
+
         section.add_caption(
-            "冲突提示：同一个组合只能绑定一个功能；组合被其它软件占用时会提示"
-            "注册失败，换一个即可。改完记得点「保存设置」。\n"
-            "「恢复默认」会把这里全部清空。")
+            "不设快捷键也能用：截图、字幕启停 / 暂停 / 清空等动作都可在"
+            "托盘右键菜单触发；这里设置的是可选的快捷组合")
+        add_group("全局快捷键 · 任何界面都能触发", HOTKEY_ACTIONS)
+        add_group("窗口内快捷键 · 只在本程序窗口内触发",
+                  LOCAL_HOTKEY_ACTIONS)
+        section.add_caption(
+            "冲突提示：同一个组合只能绑定一个功能；Ctrl+F、Ctrl+A、Ctrl+C 等是"
+            "程序内固定组合，设成它们会与搜索 / 全选 / 复制打架。组合被其它软件"
+            "占用时会提示注册失败，换一个即可。\n"
+            "改完点「保存设置」：全局快捷键会重新注册，窗口内快捷键立即生效，都无需重启。\n"
+            "「恢复默认」会清空全部全局快捷键，并把窗口内快捷键恢复为默认组合。")
         return section
 
     # ── 翻译设置 ────────────────────────────────────────────
@@ -651,9 +769,30 @@ class SettingsPage(QWidget):
         self._on_api_changed(self.api_combo.currentText())
         section.add_row(self._api_container)
 
+        test_row = QWidget()
+        test_lay = QHBoxLayout(test_row)
+        test_lay.setContentsMargins(0, 0, 0, 0)
+        test_lay.setSpacing(10)
+        self.translation_test_btn = QPushButton("测试翻译连接", test_row)
+        self.translation_test_btn.setProperty("kind", "ghost")
+        self.translation_test_btn.setFixedWidth(130)
+        self.translation_test_btn.setCursor(
+            Qt.CursorShape.PointingHandCursor)
+        self.translation_test_btn.setToolTip(
+            "用上面当前填写的引擎和密钥翻译一句短文本，验证是否可用")
+        self.translation_test_btn.clicked.connect(self._test_translation)
+        test_lay.addWidget(self.translation_test_btn)
+        self.translation_test_label = QLabel("", test_row)
+        self.translation_test_label.setObjectName("caption")
+        self.translation_test_label.setWordWrap(True)
+        test_lay.addWidget(self.translation_test_label, 1)
+        section.add_row(test_row)
+
         section.add_caption(
             "免费：Bing 微软 · MyMemory · Google（均可选填自己的密钥）\n"
-            "付费：DeepL · 百度 · 腾讯 · 火山（需自备密钥）")
+            "付费：DeepL · 百度 · 腾讯 · 火山（需自备密钥）\n"
+            "「测试翻译连接」直接用当前输入框里的值，不必先点保存；"
+            "只翻译一句短文本，不会写入配置")
         return section
 
     # ── AI 润色设置 ─────────────────────────────────────────
@@ -808,6 +947,105 @@ class SettingsPage(QWidget):
             InfoBar.error("润色失败", msg[:240], duration=6000,
                           position=InfoBarPosition.TOP, parent=self)
 
+    # ── 连接测试 ────────────────────────────────────────────
+
+    def _test_translation(self):
+        """用当前输入框里的引擎 / 密钥试翻一句，不必先点保存。"""
+        api_name = self.api_combo.currentText()
+        api_type = TRANSLATION_APIS.get(api_name, DEFAULT_TRANSLATION_API)
+        keys = {
+            'translation_api': api_type,
+            'bing_azure_key': self.bing_azure_key.text().strip(),
+            'bing_azure_region': self.bing_azure_region.text().strip(),
+            'mymemory_api_key': self.mymemory_api_key.text().strip(),
+            'google_cloud_key': self.google_cloud_key.text().strip(),
+            'deepl_api_key': self.deepl_key.text().strip(),
+            'baidu_appid': self.baidu_appid.text().strip(),
+            'baidu_secret': self.baidu_secret.text().strip(),
+            'tencent_secret_id': self.tencent_secret_id.text().strip(),
+            'tencent_secret_key': self.tencent_secret_key.text().strip(),
+            'volcengine_app_id': self.volcengine_appid.text().strip(),
+            'volcengine_token': self.volcengine_token.text().strip(),
+        }
+        self.translation_test_btn.setEnabled(False)
+        self.translation_test_btn.setText("测试中…")
+        # 测试中锁定引擎下拉：切换会触发 _on_api_changed 清掉「正在测试」
+        # 文案，用户也分不清结果对应哪个引擎。
+        self.api_combo.setEnabled(False)
+        self.translation_test_label.setStyleSheet("")
+        self.translation_test_label.setText(
+            f"正在测试：{api_name}（网络慢时可能要等半分钟）")
+
+        def run():
+            try:
+                from translator import test_translation
+                ok, msg = test_translation(api_type, keys)
+                # 结果里带上引擎名，切换引擎后仍能分辨是哪一次测试
+                msg = f"[{api_name}] {msg}"
+            except Exception as exc:
+                ok, msg = False, f"测试组件加载失败：{exc}"
+            self._sig_translation_test.emit(ok, msg)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_translation_test_result(self, ok, msg):
+        self.api_combo.setEnabled(True)
+        self.translation_test_btn.setEnabled(True)
+        self.translation_test_btn.setText("测试翻译连接")
+        self.translation_test_label.setText(("✅ " if ok else "⚠ ") + msg)
+        self.translation_test_label.setStyleSheet(
+            "color: #4ade80;" if ok else "color: #e5635f;")
+        from qfluentwidgets import InfoBar, InfoBarPosition
+        (InfoBar.success if ok else InfoBar.warning)(
+            "翻译服务可用" if ok else "翻译服务不可用", msg,
+            duration=3500 if ok else 6000,
+            position=InfoBarPosition.TOP, parent=self)
+
+    def _test_subtitle_service(self):
+        """只探测识别服务连通性 / 密钥，不上传音频、不写配置。"""
+        engine = str(self.subtitle_engine_combo.currentData() or 'local')
+        if engine == 'local':
+            self.subtitle_test_label.setText(
+                "当前用本地模型，无需测试服务连接")
+            return
+        url = self.subtitle_api_url.text().strip()
+        if not url:
+            self.subtitle_test_label.setText("⚠ 请先填写服务地址")
+            self.subtitle_test_label.setStyleSheet("color: #e5635f;")
+            return
+        key = self.subtitle_api_key.text().strip()
+        self.subtitle_test_btn.setEnabled(False)
+        self.subtitle_test_btn.setText("测试中…")
+        # 测试中锁定识别引擎：切换会触发 _refresh_subtitle_model_status，
+        # 它会把「测试中…」按钮重新启用，用户就能发起第二次测试。
+        self.subtitle_engine_combo.setEnabled(False)
+        self.subtitle_test_label.setStyleSheet("")
+        self.subtitle_test_label.setText("正在连接识别服务…（最多 6 秒）")
+
+        def run():
+            try:
+                import speech_recognizer as asr
+                ok, msg = asr.test_api_connection(
+                    url, key, allow_private=(engine == 'local_service'))
+            except Exception as exc:
+                ok, msg = False, f"测试失败：{exc}"
+            self._sig_subtitle_test.emit(ok, msg)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_subtitle_test_result(self, ok, msg):
+        self.subtitle_engine_combo.setEnabled(True)
+        self.subtitle_test_btn.setEnabled(True)
+        self.subtitle_test_btn.setText("测试连接")
+        self.subtitle_test_label.setText(("✅ " if ok else "⚠ ") + msg)
+        self.subtitle_test_label.setStyleSheet(
+            "color: #4ade80;" if ok else "color: #e5635f;")
+        from qfluentwidgets import InfoBar, InfoBarPosition
+        (InfoBar.success if ok else InfoBar.warning)(
+            "识别服务可用" if ok else "识别服务不可用", msg,
+            duration=3500 if ok else 6000,
+            position=InfoBarPosition.TOP, parent=self)
+
     def _mk_edit(self, placeholder):
         edit = QLineEdit()
         edit.setPlaceholderText(placeholder)
@@ -870,6 +1108,382 @@ class SettingsPage(QWidget):
             row += 1
         return page
 
+    # ── 上手检查 / 诊断 ─────────────────────────────────────
+
+    def _build_checklist_section(self) -> _Section:
+        section = _Section(
+            "上手检查",
+            "一眼看清哪些开箱可用、哪些要先装组件或下载模型；不用挨个页签试")
+        self.checklist_label = QLabel()
+        self.checklist_label.setObjectName("caption")
+        self.checklist_label.setWordWrap(True)
+        section.add_row(self.checklist_label)
+        row = QWidget(self)
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(10)
+        btn = QPushButton("重新检测", row)
+        btn.setProperty("kind", "ghost")
+        btn.setToolTip("重新检查 OCR 引擎、OCR 模型、字幕模型与快捷键状态")
+        btn.clicked.connect(lambda: self._refresh_checklist(show_feedback=True))
+        lay.addWidget(btn)
+        advice = QPushButton("查看建议", row)
+        advice.setProperty("kind", "ghost")
+        advice.setToolTip("把还没就绪的项目整理成一步一步的操作清单")
+        advice.clicked.connect(self._show_checklist_advice)
+        lay.addWidget(advice)
+        lay.addStretch(1)
+        section.add_row(row)
+        self._refresh_checklist()
+        return section
+
+    def _refresh_checklist(self, show_feedback=False):
+        """只读体检：明确标出「开箱可用」与「需配置 / 需下载」。"""
+        import ocr_models
+        import diagnostics
+        import ui_theme
+        from ocr_recognizer import check_engine_available
+        try:
+            win_ocr = check_engine_available('windows')
+        except Exception:
+            win_ocr = False
+        try:
+            easy_ocr = check_engine_available('easy')
+        except Exception:
+            easy_ocr = False
+        try:
+            import speech_recognizer as asr
+            model_ready = any(asr.is_model_ready(n) for n in
+                              ('tiny', 'base', 'small'))
+        except Exception:
+            model_ready = False
+        try:
+            detect = ocr_models.detect_local_models()
+            ocr_models_ready = bool(detect['ready'])
+        except Exception:
+            ocr_models_ready = False
+        try:
+            from hotkeys import get_hotkeys
+            has_hotkey = any(bool(v) for v in get_hotkeys().values())
+        except Exception:
+            has_hotkey = False
+        rows = [
+            (win_ocr, "截图文字识别",
+             "开箱可用（Windows 自带 OCR）" if win_ocr
+             else "需安装 winrt 组件，或改用 EasyOCR"),
+            (True, "翻译", "开箱可用（默认免费引擎，无需密钥）"),
+            (model_ready, "实时字幕 / 音视频识别",
+             "本地模型已就绪，完全离线可用" if model_ready
+             else "需先下载或导入语音模型（几十 MB ~ 数 GB）"),
+            (easy_ocr or ocr_models_ready, "高精度 OCR",
+             "EasyOCR 已可用" if easy_ocr
+             else ("本地 EasyOCR 模型已齐全，装引擎后即可离线识别"
+                   if ocr_models_ready else
+                   "可选：安装 EasyOCR，或手动下载模型导入")),
+            (has_hotkey, "全局快捷键",
+             "已设置" if has_hotkey
+             else "未设置（不影响使用）；可在「快捷键」分区或首次引导里启用"),
+        ]
+        import datetime
+        ready = sum(1 for ok, _, _ in rows if ok)
+        optional = len(rows) - ready
+        stamp = datetime.datetime.now().strftime('%H:%M:%S')
+        text = (f"最近检测 {stamp} · {ready} 项就绪 / {optional} 项可选增强\n"
+                + "\n".join(
+                    ("✅ " if ok else "⚠  ") + f"{name}：{desc}"
+                    for ok, name, desc in rows))
+        self.checklist_label.setText(text)
+        self.checklist_label.setToolTip(
+            "带 ⚠ 的是可选增强，不影响「截图 → 识别 → 翻译」主流程；"
+            "点「重新检测」可在装完组件后刷新")
+        self._checklist_rows = rows
+        diagnostics.record('info', '已完成一次上手检查', source='上手检查')
+        if show_feedback:
+            # 以前点「重新检测」只改一行文字，结果没变化时用户完全看不出
+            # 按钮有没有生效；给一条明确反馈并指出下一步在哪里。
+            from qfluentwidgets import InfoBar, InfoBarPosition
+            InfoBar.success(
+                "检测完成",
+                f"{ready} 项开箱可用，{optional} 项为可选增强；"
+                "点「查看建议」可看具体该怎么做",
+                duration=4000, position=InfoBarPosition.TOP, parent=self)
+
+    def _show_checklist_advice(self):
+        rows = getattr(self, '_checklist_rows', None) or []
+        todo = [f"• {name}：{desc}" for ok, name, desc in rows if not ok]
+        if not todo:
+            QMessageBox.information(
+                self, "上手检查 · 全部就绪",
+                "所有检查项都已就绪，可以直接开始使用。\n\n"
+                "主流程：点「区域截图」框选 → 自动识别文字 → 点「翻译」。")
+            return
+        QMessageBox.information(
+            self, "上手检查 · 接下来可以做什么",
+            "下面这些都是可选增强，不影响「截图 → 识别 → 翻译」主流程，"
+            "按需处理即可：\n\n" + "\n".join(todo)
+            + "\n\n操作位置：设置页「OCR 设置」「语音识别设置」"
+              "「快捷键」分区，以及音视频页的「下载模型」。")
+
+    def _build_diagnostics_section(self) -> _Section:
+        section = _Section(
+            "诊断与帮助",
+            "运行记录实时更新，最新消息出现在末尾并自动滚动到可见；"
+            "复制出去的信息不含任何密钥")
+        self.diag_view = QPlainTextEdit()
+        self.diag_view.setReadOnly(True)
+        self.diag_view.setMaximumHeight(190)
+        self.diag_view.setPlaceholderText("暂无诊断信息")
+        section.add_row(self.diag_view)
+        row = QWidget(self)
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        for text, slot in (
+                ("复制诊断信息", self._copy_diagnostics),
+                ("立即刷新", lambda: self._refresh_diagnostics(force=True)),
+                ("清空错误记录", self._clear_diagnostics)):
+            btn = QPushButton(text, row)
+            btn.setProperty("kind", "ghost")
+            btn.clicked.connect(slot)
+            lay.addWidget(btn)
+        lay.addStretch(1)
+        section.add_row(row)
+        self._diag_revision = -1
+        self._refresh_diagnostics(force=True)
+        # 以前只能手动点「刷新」，而且 setPlainText 会把视图弹回顶部，
+        # 最新一条错误反而看不见。按事件版本号轮询，有变化才重绘。
+        self._diag_timer = QTimer(self)
+        self._diag_timer.setInterval(1200)
+        self._diag_timer.timeout.connect(self._poll_diagnostics)
+        self._diag_timer.start()
+        return section
+
+    def _set_diag_text(self, text):
+        """替换报告内容后把光标移到末尾，保证最新消息可见。"""
+        from PySide6.QtGui import QTextCursor
+        self.diag_view.setPlainText(text)
+        cursor = self.diag_view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.diag_view.setTextCursor(cursor)
+        self.diag_view.ensureCursorVisible()
+        # 设置页还没显示时 ensureCursorVisible() 不会真正推动滚动条，
+        # 显式置底才能保证「刷新后第一眼就看到最新一条」。
+        bar = self.diag_view.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _poll_diagnostics(self):
+        import diagnostics
+        if diagnostics.revision() != self._diag_revision:
+            self._refresh_diagnostics()
+
+    def _refresh_diagnostics(self, force=False):
+        import diagnostics
+        rev = diagnostics.revision()
+        if not force and rev == self._diag_revision:
+            return
+        self._set_diag_text(diagnostics.build_report())
+        self._diag_revision = rev
+
+    def _copy_diagnostics(self):
+        import ui_feedback
+        from qfluentwidgets import InfoBar, InfoBarPosition
+        text = ui_feedback.copy_diagnostic_report()
+        self._set_diag_text(text)
+        InfoBar.success("已复制", "诊断信息已放进剪贴板，可直接粘贴给排查人员",
+                        duration=3000, position=InfoBarPosition.TOP,
+                        parent=self)
+
+    def _clear_diagnostics(self):
+        import diagnostics
+        diagnostics.clear()
+        self._refresh_diagnostics(force=True)
+
+    def _refresh_health(self):
+        """配置损坏 / 数据目录降级时，设置页顶部保留一条持久横幅。"""
+        import diagnostics
+        issues = diagnostics.health_issues()
+        bar = getattr(self, '_health_bar', None)
+        if bar is None:
+            return
+        if not issues:
+            bar.setVisible(False)
+            return
+        issue = issues[0]
+        self._health_label.setText(
+            f"⚠  {issue['title']}：{issue['text']}")
+        self._health_path = issue.get('path') or ''
+        bar.setVisible(True)
+
+    def _open_health_dir(self):
+        path = getattr(self, '_health_path', '')
+        if path:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    # ── OCR 本地模型（手动下载保底）─────────────────────────
+
+    def _refresh_ocr_models(self):
+        import ocr_models
+        import ui_theme
+        detect = ocr_models.detect_local_models()
+        cache = ocr_models.model_cache_info()
+        if cache['models']:
+            summary = ocr_models.model_cache_summary(cache)
+        elif detect['legacy_files']:
+            # 老版本把模型下在 ~/.EasyOCR/model；统一目录还是空的，别一边
+            # 说「还缺 1 个文件」一边又说「尚无本地模型」，自相矛盾。
+            summary = (f"旧版目录 ~/.EasyOCR/model 已有 "
+                       f"{len(detect['legacy_files'])} 个模型文件"
+                       f"（{ocr_models.human_size(detect['total_bytes'])}）")
+        else:
+            summary = "尚无本地 OCR 模型（可点「检测本地模型」或手动导入）"
+        # 单一前缀 + 单一后缀，避免「尚未检测到… · 尚无本地模型…」重复，
+        # 也别出现「没有模型 · 旧版目录已有 N 个」这种自相矛盾。
+        if detect['ready']:
+            prefix, color = "✅ 本地模型齐全，识别时完全不联网 · ", ui_theme.COLOR_OK
+        elif detect['can_use_offline']:
+            prefix = (f"⚠ 可用但还缺 {len(detect['missing'])} 个文件 · ")
+            color = ui_theme.COLOR_WARN
+        elif detect['legacy_files']:
+            prefix, color = "⚠ 旧版目录有模型但不完整 · ", ui_theme.COLOR_WARN
+        else:
+            prefix, color = "", ui_theme.COLOR_MUTED
+        text = prefix + summary
+        self.ocr_model_label.setText(text)
+        self.ocr_model_label.setStyleSheet(f"color: {color};")
+        self.ocr_model_label.setToolTip(
+            "目录：点「打开模型文件夹」查看，或点「复制路径」取得本机实际目录"
+            "（每台电脑不同，说明里不写死路径）\n"
+            "缺少：" + ("、".join(detect['missing']) or "无") + "\n"
+            + ocr_models.manual_download_hint())
+        return detect
+
+    def _detect_ocr_models(self):
+        import ui_feedback
+        from qfluentwidgets import InfoBar, InfoBarPosition
+        detect = self._refresh_ocr_models()
+        if detect['ready']:
+            InfoBar.success("模型已就绪",
+                            "本地 OCR 模型齐全，EasyOCR 将直接使用，不再联网下载",
+                            duration=4000, position=InfoBarPosition.TOP,
+                            parent=self)
+        else:
+            hint = (f"还缺 {len(detect['missing'])} 个模型文件"
+                    if detect['missing'] else
+                    "模型分散在两个目录，建议导入到统一目录")
+            ui_feedback.show_info_bar(
+                self, "检测结果",
+                hint + "，可点「手动下载说明」查看文件名与放置目录",
+                duration=6000)
+
+    def _import_ocr_model(self):
+        import ocr_models
+        from PySide6.QtWidgets import QFileDialog
+        from qfluentwidgets import InfoBar, InfoBarPosition
+        folder = QFileDialog.getExistingDirectory(
+            self, "选择包含 EasyOCR 模型文件（.pth）的目录",
+            ocr_models.MODEL_ROOT)
+        if not folder:
+            return
+        try:
+            count, names = ocr_models.import_local_model(folder)
+        except Exception as exc:
+            ui_feedback.show_error_bar(
+                self, "导入失败", str(exc),
+                actions=[("查看说明", self._show_ocr_manual_hint)],
+                source="OCR 模型导入")
+            return
+        self._refresh_ocr_models()
+        InfoBar.success(
+            "导入完成",
+            f"模型目录现有 {count} 个文件"
+            + (f"（新增 {len(names)} 个）" if names else "，文件已就位"),
+            duration=4000, position=InfoBarPosition.TOP, parent=self)
+
+    def _open_ocr_model_dir(self):
+        import ocr_models
+        path = ocr_models.ensure_model_root()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        self._refresh_ocr_models()
+
+    def _copy_ocr_model_path(self):
+        import ocr_models
+        from qfluentwidgets import InfoBar, InfoBarPosition
+        QApplication.clipboard().setText(ocr_models.MODEL_ROOT)
+        self.ocr_model_label.setToolTip(
+            "已复制路径：" + ocr_models.MODEL_ROOT)
+        InfoBar.success("已复制", "OCR 模型目录路径已放进剪贴板",
+                        duration=3000, position=InfoBarPosition.TOP,
+                        parent=self)
+
+    def _show_ocr_catalog(self):
+        import ocr_models
+        box = QMessageBox(self)
+        box.setWindowTitle("OCR 方案对比 · 每种模型的优势与代价")
+        box.setText("安装包只内置 Windows 系统自带 OCR（0 MB 模型文件）："
+                    "开箱即用、零下载，打包体积和时间都不受影响。\n"
+                    "EasyOCR 等其它方案按需下载，不随包分发；"
+                    "点下方「Show Details…」展开每种方案的优势、代价与获取方式。")
+        box.setDetailedText(ocr_models.engine_catalog_text())
+        box.setIcon(QMessageBox.Icon.Information)
+        box.exec()
+
+    def _show_ocr_manual_hint(self):
+        import ocr_models
+        box = QMessageBox(self)
+        box.setWindowTitle("手动下载 OCR 模型（网络不好时的保底）")
+        box.setText("把模型文件放进模型文件夹后点「检测本地模型」，"
+                    "识别会优先用本地文件，不再联网。\n"
+                    "目录请用「打开模型文件夹」按钮定位："
+                    "每台电脑都不一样，说明里不写死路径。")
+        box.setDetailedText(ocr_models.manual_download_hint())
+        box.setIcon(QMessageBox.Icon.Information)
+        box.exec()
+
+    def _show_ocr_download_menu(self):
+        """其它 OCR 模型 / 引擎的官方获取入口。
+
+        安装包里一个模型文件都不放（打包体积和时间才可控），所以这里只给
+        官方下载页；EasyOCR 的引擎安装与模型自动/手动下载都在本分区完成。
+        网页下载的文件不会自动进入模型目录，且三个「选型参考」方案当前没有
+        实现，所以每项标出可用性，点开后再补一条可操作的提示。
+        """
+        import ocr_models
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        for label, url, kind in ocr_models.download_menu_items():
+            action = menu.addAction(label)
+            action.triggered.connect(
+                lambda _checked=False, u=url, k=kind:
+                    self._on_ocr_download_link(u, k))
+        menu.addSeparator()
+        for text in (
+                "✅ 下载完请点「导入本地模型」，或拖进「打开模型文件夹」",
+                "📋 当前版本未内置该引擎，仅供了解，下载后还不能使用",
+                "放进模型目录后，升级软件不会删除，无需重新下载"):
+            note = menu.addAction(text)
+            note.setEnabled(False)
+        btn = getattr(self, '_ocr_download_btn', None)
+        if btn is not None:
+            menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+
+    def _on_ocr_download_link(self, url, kind):
+        """打开官方页后说明「下载 ≠ 已装好」，别让人白等或白下载。"""
+        QDesktopServices.openUrl(QUrl(url))
+        if kind == 'usable':
+            ui_feedback.show_info_bar(
+                self, "已打开下载页",
+                "文件会保存在浏览器下载目录，不会自动进入程序。下载完请点"
+                "「导入本地模型」，或把文件拖进「打开模型文件夹」；放进模型"
+                "目录后升级仍会保留，无需重下。",
+                duration=9000)
+        else:
+            ui_feedback.show_info_bar(
+                self, "已打开介绍页",
+                "这是选型参考：当前版本尚未内置该引擎，下载的模型暂时无法在"
+                "程序中使用。现在可用的是 Windows 自带 OCR，以及按需安装的"
+                " EasyOCR。",
+                duration=9000)
+
     # ── OCR 设置 ────────────────────────────────────────────
 
     def _build_ocr_section(self) -> _Section:
@@ -886,8 +1500,16 @@ class SettingsPage(QWidget):
                     tip="选择文字识别引擎，切换后需保存生效")
 
         section.add_caption(
-            "💡 Windows 自带：开箱即用，无需下载，速度快\n"
-            "   EasyOCR：识别更准确，首次需下载约 100MB 模型")
+            "💡 安装包只内置 Windows 系统自带 OCR：开箱即用、零下载、"
+            "零模型文件，所以打包快、体积小。\n"
+            "   EasyOCR 等其它方案按需下载（不随包分发）：选中引擎后点「安装」，"
+            "模型会自动下载；装完无需重启。\n"
+            "   安装中按钮会变成「取消安装」，可随时中断，"
+            "已下载的文件下次自动续传。\n"
+            "   网络不好时可点「手动下载说明」自己下模型，"
+            "再点「导入本地模型」即可离线识别。\n"
+            "   模型与已装组件都放在用户数据目录，覆盖升级 / 一键升级后"
+            "原样保留，不用重新下载或重装。")
 
         self.ocr_status_label = QLabel()
         self.ocr_status_label.setObjectName("caption")
@@ -900,9 +1522,13 @@ class SettingsPage(QWidget):
         install_layout.setSpacing(12)
         self.ocr_install_btn = QPushButton("安装")
         self.ocr_install_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.ocr_install_btn.setToolTip("通过 pip 安装所选 OCR 引擎，安装过程显示在下方的进度条")
-        self.ocr_install_btn.clicked.connect(self._install_ocr_engine)
+        self.ocr_install_btn.setToolTip(
+            "通过 pip 安装所选 OCR 引擎；安装中点它可以取消")
+        self.ocr_install_btn.clicked.connect(
+            lambda: self._task_toggle(
+                'ocr', self._install_ocr_engine, "取消安装"))
         self.ocr_install_btn.setVisible(False)
+        self._task_buttons['ocr'] = self.ocr_install_btn
         install_layout.addWidget(self.ocr_install_btn)
         self.ocr_progress = QProgressBar()
         self.ocr_progress.setVisible(False)
@@ -911,8 +1537,65 @@ class SettingsPage(QWidget):
         install_layout.addWidget(self.ocr_progress, 1)
         section.add_row(install_row)
 
+        # ── 本地 OCR 模型：检测 / 导入 / 打开文件夹 / 复制路径 ──
+        model_row = QWidget(self)
+        model_lay = QHBoxLayout(model_row)
+        model_lay.setContentsMargins(0, 0, 0, 0)
+        model_lay.setSpacing(8)
+        for text, slot, tip in (
+                ("检测本地模型", self._detect_ocr_models,
+                 "看看本机已有哪些 .pth 模型、还缺哪些文件"),
+                ("导入本地模型…", self._import_ocr_model,
+                 "选择手动下载的模型目录，复制进统一管理目录，不改动原文件"),
+                ("打开模型文件夹", self._open_ocr_model_dir,
+                 "打开模型存放目录，可直接把文件拖进去"),
+                ("复制路径", self._copy_ocr_model_path,
+                 "复制模型目录路径，方便在下载工具里粘贴")):
+            btn = QPushButton(text, model_row)
+            btn.setProperty("kind", "ghost")
+            btn.setToolTip(tip)
+            btn.clicked.connect(slot)
+            model_lay.addWidget(btn)
+        model_lay.addStretch(1)
+        section.add_row(model_row)
+
+        self.ocr_model_label = QLabel()
+        self.ocr_model_label.setObjectName("caption")
+        self.ocr_model_label.setWordWrap(True)
+        self.ocr_model_label.setMinimumWidth(120)
+        section.add_row(self.ocr_model_label)
+
+        catalog_row = QWidget(self)
+        catalog_lay = QHBoxLayout(catalog_row)
+        catalog_lay.setContentsMargins(0, 0, 0, 0)
+        catalog_lay.setSpacing(8)
+        catalog_btn = QPushButton("查看全部 OCR 方案对比", catalog_row)
+        catalog_btn.setProperty("kind", "ghost")
+        catalog_btn.setToolTip(
+            "列出 Windows OCR / EasyOCR / RapidOCR / PaddleOCR / Tesseract "
+            "各自的优势、代价与适用场景")
+        catalog_btn.clicked.connect(self._show_ocr_catalog)
+        catalog_lay.addWidget(catalog_btn)
+        manual_btn = QPushButton("手动下载说明", catalog_row)
+        manual_btn.setProperty("kind", "ghost")
+        manual_btn.setToolTip("手动下载保底：需要哪些文件、怎么定位目录")
+        manual_btn.clicked.connect(self._show_ocr_manual_hint)
+        catalog_lay.addWidget(manual_btn)
+        download_btn = QPushButton("下载 / 了解更多 ▾", catalog_row)
+        download_btn.setProperty("kind", "ghost")
+        download_btn.setToolTip(
+            "打开各方案的官方下载页（菜单里标了能否在当前版本使用）；"
+            "网页下载的文件需点「导入本地模型」才会被程序使用，"
+            "导入后升级会保留")
+        download_btn.clicked.connect(self._show_ocr_download_menu)
+        catalog_lay.addWidget(download_btn)
+        self._ocr_download_btn = download_btn
+        catalog_lay.addStretch(1)
+        section.add_row(catalog_row)
+
         self.ocr_engine_combo.currentTextChanged.connect(self._on_ocr_engine_changed)
         self._refresh_ocr_status()
+        self._refresh_ocr_models()
         return section
 
     # ── 语音识别设置 ────────────────────────────────────────
@@ -1054,7 +1737,7 @@ class SettingsPage(QWidget):
         section = _Section(
             "实时字幕",
             "主页「实时字幕」按钮：直接在屏幕下方打开字幕框（无需框选，可拖动/缩放，位置会记住），"
-            "听写麦克风或电脑内部声音；关闭字幕框后识别继续，结果同步显示在「翻译」页的"
+            "听写麦克风或电脑声音；关闭字幕框后识别继续，结果同步显示在「翻译」页的"
             "识别文本 / 翻译结果，直到点「停止实时字幕」。翻译使用主页「翻译到」的语言")
         cfg = get_subtitle_settings()
 
@@ -1071,7 +1754,7 @@ class SettingsPage(QWidget):
             self._refresh_subtitle_devices)
         section.add(
             "音频来源:", self.subtitle_source_combo,
-            tip="麦克风：听你说话；电脑内部声音：听视频 / 音乐 / 线上会议\n"
+            tip="麦克风：听你说话；电脑声音：听视频 / 音乐 / 线上会议\n"
                 "主页底部动作条也能快速切换这一项")
 
         device_row = QWidget()
@@ -1133,9 +1816,43 @@ class SettingsPage(QWidget):
         self.subtitle_download_btn.setProperty("kind", "ghost")
         self.subtitle_download_btn.setFixedWidth(120)
         self.subtitle_download_btn.clicked.connect(
-            self._download_subtitle_model)
+            lambda: self._task_toggle(
+                'model', self._download_subtitle_model, "取消下载"))
         model_lay.addWidget(self.subtitle_download_btn)
+        self._task_buttons['model'] = self.subtitle_download_btn
         section.add_row(model_row)
+
+        # 模型缓存：占用空间 / 路径 / 一键打开与复制，避免「不知道下到哪、
+        # 也不知道占了多少磁盘」，取消下载留下的半成品也会如实标出来。
+        cache_row = QWidget()
+        cache_lay = QHBoxLayout(cache_row)
+        cache_lay.setContentsMargins(0, 0, 0, 0)
+        cache_lay.setSpacing(8)
+        self.model_cache_label = QLabel("", cache_row)
+        self.model_cache_label.setObjectName("caption")
+        self.model_cache_label.setWordWrap(True)
+        # 三个固定宽按钮合计 252px，极窄窗口下给文字留个下限，让横向
+        # 滚动接管，而不是把长路径挤成竖排。
+        self.model_cache_label.setMinimumWidth(120)
+        self.model_cache_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        cache_lay.addWidget(self.model_cache_label, 1)
+        self.model_cache_open_btn = QPushButton("打开目录", cache_row)
+        self.model_cache_copy_btn = QPushButton("复制路径", cache_row)
+        self.model_cache_refresh_btn = QPushButton("刷新", cache_row)
+        for btn in (self.model_cache_open_btn, self.model_cache_copy_btn,
+                    self.model_cache_refresh_btn):
+            btn.setProperty("kind", "ghost")
+            btn.setFixedWidth(84)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            cache_lay.addWidget(btn)
+        self.model_cache_open_btn.clicked.connect(self._open_model_cache)
+        self.model_cache_copy_btn.clicked.connect(
+            self._copy_model_cache_path)
+        self.model_cache_refresh_btn.clicked.connect(
+            self._refresh_model_cache)
+        section.add_row(cache_row)
+        self._refresh_model_cache()
         self._refresh_subtitle_model_status()
 
         self.subtitle_api_url = self._mk_edit(
@@ -1147,12 +1864,39 @@ class SettingsPage(QWidget):
         self.subtitle_api_key = self._mk_edit("免费本地服务可留空")
         self.subtitle_api_key.setText(str(cfg.get('subtitle_api_key') or ''))
         self.subtitle_api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        section.add("API 密钥:", self.subtitle_api_key)
+        section.add("API 密钥:", self.subtitle_api_key,
+                    tip="从服务方控制台获取；免费本地服务可留空。\n"
+                        "保存后建议启动一次实时字幕验证是否可用")
 
         self.subtitle_api_model = self._mk_edit("whisper-1")
         self.subtitle_api_model.setText(
             str(cfg.get('subtitle_api_model') or 'whisper-1'))
-        section.add("服务模型名:", self.subtitle_api_model)
+        section.add("服务模型名:", self.subtitle_api_model,
+                    tip="填服务方文档里的模型 ID，例如 whisper-1；\n"
+                        "填错会在启动实时字幕时提示「模型不存在」")
+
+        svc_row = QWidget()
+        svc_lay = QHBoxLayout(svc_row)
+        svc_lay.setContentsMargins(0, 0, 0, 0)
+        svc_lay.setSpacing(10)
+        self.subtitle_test_btn = QPushButton("测试连接", svc_row)
+        self.subtitle_test_btn.setProperty("kind", "ghost")
+        self.subtitle_test_btn.setFixedWidth(110)
+        self.subtitle_test_btn.setCursor(
+            Qt.CursorShape.PointingHandCursor)
+        self.subtitle_test_btn.setToolTip(
+            "只探测服务地址与密钥是否可用（不上传音频、不写配置）")
+        self.subtitle_test_btn.clicked.connect(self._test_subtitle_service)
+        svc_lay.addWidget(self.subtitle_test_btn)
+        self.subtitle_test_label = QLabel("", svc_row)
+        self.subtitle_test_label.setObjectName("caption")
+        self.subtitle_test_label.setWordWrap(True)
+        svc_lay.addWidget(self.subtitle_test_label, 1)
+        section.add_row(svc_row)
+        section.add_caption(
+            "选「在线 API / 免费本地服务」时，填完地址就能点「测试连接」："
+            "最多等 6 秒，会告诉你是地址不通、密钥不对还是服务正常；"
+            "不必先保存，也不会上传任何音频。")
 
         self.subtitle_lang_combo = QComboBox()
         self.subtitle_lang_combo.addItem("自动检测", "auto")
@@ -1189,20 +1933,23 @@ class SettingsPage(QWidget):
             self.subtitle_font_combo.addItem(f"{size} px", size)
         _select(self.subtitle_font_combo, cfg.get('subtitle_font_size'))
         section.add("字幕字号:", self.subtitle_font_combo,
-                    tip="浮层控制条的 A- / A+ 也能临时调整")
+                    tip="浮层控制条的 A- / A+ 也能临时调整；\n"
+                        "在这里保存会立即同步到已打开的字幕框")
 
         self.subtitle_lines_combo = QComboBox()
         for n in (2, 3, 4, 5):
             self.subtitle_lines_combo.addItem(f"{n} 条", n)
         _select(self.subtitle_lines_combo, cfg.get('subtitle_max_lines'))
-        section.add("保留行数:", self.subtitle_lines_combo)
+        section.add("保留行数:", self.subtitle_lines_combo,
+                    tip="字幕框最多同时显示几条；保存后立即生效")
 
         self.subtitle_alpha_combo = QComboBox()
         for label, value in (("很淡", 110), ("偏淡", 150), ("标准", 190),
                              ("偏浓", 220), ("不透明", 250)):
             self.subtitle_alpha_combo.addItem(label, value)
         _select(self.subtitle_alpha_combo, cfg.get('subtitle_bg_alpha'))
-        section.add("底色深浅:", self.subtitle_alpha_combo)
+        section.add("底色深浅:", self.subtitle_alpha_combo,
+                    tip="调淡可少遮挡视频画面；保存后立即生效")
 
         self.subtitle_through_check = FlatCheckBox("鼠标穿透字幕框")
         self.subtitle_through_check.setChecked(
@@ -1219,10 +1966,15 @@ class SettingsPage(QWidget):
         self.subtitle_dep_label.setObjectName("caption")
         self.subtitle_dep_label.setWordWrap(True)
         dep_lay.addWidget(self.subtitle_dep_label, 1)
-        self.subtitle_install_btn = QPushButton("安装内录组件")
+        self.subtitle_install_btn = QPushButton("安装组件")
         self.subtitle_install_btn.setProperty("kind", "ghost")
         self.subtitle_install_btn.setFixedWidth(120)
-        self.subtitle_install_btn.clicked.connect(self._install_loopback)
+        self.subtitle_install_btn.setToolTip(
+            "安装当前音源缺少的采集组件；安装中点它可以取消")
+        self.subtitle_install_btn.clicked.connect(
+            lambda: self._task_toggle(
+                'loopback', self._install_loopback, "取消安装"))
+        self._task_buttons['loopback'] = self.subtitle_install_btn
         dep_lay.addWidget(self.subtitle_install_btn)
         section.add_row(dep_row)
         self._refresh_subtitle_devices(
@@ -1260,25 +2012,37 @@ class SettingsPage(QWidget):
         deps = dependency_status()
         if source == 'loopback':
             if deps['loopback']:
-                msg = "电脑内部声音：WASAPI 环回组件已就绪，可选具体扬声器"
+                msg = "电脑声音：WASAPI 环回组件已就绪，可选具体扬声器"
             else:
-                msg = ("电脑内部声音：缺少 soundcard，点右侧一键安装；"
+                msg = ("电脑声音：缺少 soundcard，点右侧一键安装；"
                        "若系统已启用「立体声混音」也可直接在上方选择")
         else:
             msg = ("麦克风：sounddevice 已就绪" if deps['mic']
-                   else "麦克风：缺少 sounddevice（pip install sounddevice）")
+                   else "麦克风：缺少 sounddevice，点右侧「安装组件」即可在线安装")
         self.subtitle_dep_label.setText(msg)
+        # 麦克风缺 sounddevice 时同样要有可点的安装入口，否则提示是死路
         self.subtitle_install_btn.setVisible(
-            source == 'loopback' and not deps['loopback'])
+            not (deps['loopback'] if source == 'loopback' else deps['mic']))
 
-    def _install_loopback(self):
-        self.subtitle_install_btn.setEnabled(False)
-        self.subtitle_dep_label.setText("正在安装 soundcard 内录组件…")
+    def _install_loopback(self, cancel=None):
+        # 麦克风与内录缺的是不同的包，按当前音源选择要装的组件
+        from live_caption import dependency_status
+        source = str(self.subtitle_source_combo.currentData() or '')
+        mic_mode = (source != 'loopback'
+                    and not dependency_status()['mic'])
+        packages = ('sounddevice',) if mic_mode else ('soundcard',)
+        label = ("麦克风采集组件 sounddevice" if mic_mode
+                 else "soundcard 内录组件")
+        self.subtitle_dep_label.setText(
+            f"正在安装 {label}…（可点右侧按钮取消）")
+        self.subtitle_dep_label.setToolTip("")
+        self.subtitle_dep_label.setStyleSheet("")
 
         def work():
             try:
                 from live_caption import install_loopback_support
-                ok, msg = install_loopback_support()
+                ok, msg = install_loopback_support(
+                    cancel=cancel, packages=packages)
             except Exception as exc:
                 # 任何逃逸异常都要发完成信号，否则「安装」按钮会永久禁用
                 ok, msg = False, f"安装失败：{exc}"
@@ -1287,8 +2051,26 @@ class SettingsPage(QWidget):
         threading.Thread(target=work, daemon=True).start()
 
     def _on_caption_install_done(self, ok, msg):
-        self.subtitle_install_btn.setEnabled(True)
-        self.subtitle_dep_label.setText(("安装成功：" if ok else "") + msg)
+        cancelled = self._task_finish('loopback') and not ok
+        from qfluentwidgets import InfoBar, InfoBarPosition
+        if cancelled:
+            self.subtitle_dep_label.setText(
+                "已取消安装，可重新点「安装组件」")
+            self.subtitle_dep_label.setToolTip("")
+            self.subtitle_dep_label.setStyleSheet("color: #eab308;")
+            InfoBar.info("已取消", "内录组件安装已中断", duration=3000,
+                         position=InfoBarPosition.TOP, parent=self)
+        else:
+            # 与 OCR 组件一致：失败要有醒目颜色和弹窗，不能只显示一行小字
+            short = msg if ok else friendly_install_error(msg)
+            self.subtitle_dep_label.setText(("安装成功：" if ok else "") + short)
+            self.subtitle_dep_label.setToolTip(str(msg))
+            self.subtitle_dep_label.setStyleSheet(
+                "color: #4ade80;" if ok else "color: #e5635f;")
+            (InfoBar.success if ok else InfoBar.error)(
+                "安装成功" if ok else "安装失败", short,
+                duration=4000 if ok else 6000,
+                position=InfoBarPosition.TOP, parent=self)
         self._refresh_subtitle_devices()
 
     def _refresh_subtitle_model_status(self, _index=None):
@@ -1317,30 +2099,140 @@ class SettingsPage(QWidget):
                      getattr(self, 'subtitle_api_model', None)):
             if edit is not None:
                 edit.setEnabled(engine != 'local')
+        if hasattr(self, 'subtitle_test_label'):
+            # 换了引擎，上一次的「✅ 可用」不再适用于当前引擎
+            self.subtitle_test_label.clear()
+            self.subtitle_test_label.setStyleSheet("")
+        if hasattr(self, 'subtitle_test_btn'):
+            self.subtitle_test_btn.setEnabled(engine != 'local')
+            self.subtitle_test_btn.setToolTip(
+                "只探测服务地址与密钥是否可用（不上传音频、不写配置）"
+                if engine != 'local'
+                else "当前用本地模型，不需要测试服务连接；"
+                     "可在「翻译设置」里点「测试翻译连接」")
 
-    def _download_subtitle_model(self):
+    def _download_subtitle_model(self, cancel=None):
         name = str(self.subtitle_model_combo.currentData() or 'tiny')
-        self.subtitle_download_btn.setEnabled(False)
-        self.subtitle_model_status.setText(f"正在下载 {name} 模型…")
+        self._downloading_model = name
+        # 下载中锁定引擎 / 模型下拉：切换会触发 _refresh_subtitle_model_status
+        # 把下载按钮隐藏，用户就找不到「取消下载」了。
+        self.subtitle_model_combo.setEnabled(False)
+        self.subtitle_engine_combo.setEnabled(False)
+        self.subtitle_model_status.setToolTip("")
+        self.subtitle_model_status.setStyleSheet("")
+        self.subtitle_model_status.setText(
+            f"正在下载 {name} 模型…（可点右侧按钮取消）")
 
         def work():
-            import speech_recognizer as asr
+            # import / 回调构造失败也必须发完成信号，否则按钮和两个下拉框
+            # 会永远停在「正在取消…」的禁用状态。
             try:
-                asr.download_model(name)
+                import speech_recognizer as asr
+                import time
+            except Exception as e:
+                self._sig_caption_model.emit(False, f"下载组件加载失败：{e}")
+                return
+            last = [0.0]
+
+            def on_progress(done, total):
+                # 底层是字节级回调，不节流会把 UI 事件队列冲爆
+                now = time.monotonic()
+                if (now - last[0] < 0.2 and done and total
+                        and done < total):
+                    return
+                last[0] = now
+                if cancel is not None and cancel.is_set():
+                    return
+                self._sig_model_progress.emit(int(done), int(total))
+
+            try:
+                asr.download_model(name, on_progress=on_progress,
+                                   cancel_event=cancel)
                 self._sig_caption_model.emit(
                     True, f"{name} 下载完成，可以开始实时字幕")
+            except asr.ModelDownloadCancelled:
+                self._sig_caption_model.emit(False, "已取消下载")
             except Exception as e:
                 self._sig_caption_model.emit(False, f"下载失败：{e}")
 
         threading.Thread(target=work, daemon=True).start()
 
+    @Slot(int, int)
+    def _on_model_progress(self, done, total):
+        # 下载已结束后忽略迟到回调，别把「下载完成」覆盖掉。
+        # 不能用按钮 isEnabled() 判断：下载中按钮必须保持可点才能取消。
+        if 'model' not in self._task_busy:
+            return
+        name = getattr(self, '_downloading_model', '') or '模型'
+        if total > 0:
+            pct = min(100, int(done) * 100 // int(total))
+            self.subtitle_model_status.setText(
+                f"正在下载 {name} · {done / 1048576:.0f} / "
+                f"{total / 1048576:.0f} MB（{pct}%）· 可点右侧取消")
+        else:
+            self.subtitle_model_status.setText(
+                f"正在下载 {name}…（正在连接镜像，请稍候）")
+
     def _on_caption_model_done(self, ok, msg):
-        self.subtitle_download_btn.setEnabled(True)
+        cancelled = self._task_finish('model') and not ok
+        self.subtitle_model_combo.setEnabled(True)
+        self.subtitle_engine_combo.setEnabled(True)
+        self._refresh_model_cache()
+        if cancelled or (not ok and msg == "已取消下载"):
+            self.subtitle_model_status.setText(
+                "已取消下载 · 未完成的文件已保留，下次点下载会自动续传")
+            self.subtitle_model_status.setToolTip("")
+            self.subtitle_model_status.setStyleSheet("color: #eab308;")
+            self.subtitle_download_btn.setVisible(True)
+            return
         if ok:
+            self.subtitle_model_status.setToolTip("")
+            self.subtitle_model_status.setStyleSheet("")
             self._refresh_subtitle_model_status()
         else:
-            self.subtitle_model_status.setText(msg)
+            # 英文 HF 异常原文只放 tooltip，界面给中文原因 + 可操作下一步
+            self.subtitle_model_status.setText(friendly_model_error(msg))
+            self.subtitle_model_status.setToolTip(str(msg))
+            self.subtitle_model_status.setStyleSheet("color: #e5635f;")
             self.subtitle_download_btn.setVisible(True)
+
+    # ── 模型缓存 ────────────────────────────────────────────
+
+    def _refresh_model_cache(self):
+        """只读统计模型缓存占用（只读文件元数据，不读内容）。"""
+        import speech_recognizer as asr
+        info = asr.model_cache_info()
+        self.model_cache_label.setText(asr.model_cache_summary(info))
+        lines = [
+            f"· {m['name']}  {asr.human_size(m['bytes'])}  "
+            f"{'可用' if m['ready'] else '未完成下载（可续传）'}"
+            for m in info.get('models', [])]
+        self.model_cache_label.setToolTip(
+            "本机模型缓存目录（每台电脑不同，请用「打开目录」按钮定位）："
+            + str(info['root']) + "\n"
+            + ("\n".join(lines) if lines else "（暂无模型）"))
+        self.model_cache_open_btn.setEnabled(True)
+
+    def _open_model_cache(self):
+        import os
+        import speech_recognizer as asr
+        root = str(asr.model_cache_info()['root'])
+        try:
+            os.makedirs(root, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(self, "无法打开目录", str(exc))
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(root))
+        self._refresh_model_cache()
+
+    def _copy_model_cache_path(self):
+        import speech_recognizer as asr
+        QApplication.clipboard().setText(
+            str(asr.model_cache_info()['root']))
+        from qfluentwidgets import InfoBar, InfoBarPosition
+        InfoBar.success("已复制", "模型缓存目录路径已复制到剪贴板",
+                        duration=2500, position=InfoBarPosition.TOP,
+                        parent=self)
 
     def _refresh_gpu_status(self, refresh=False):
         """更新 GPU 检测结果文字（供用户判断能否开 GPU 加速）。"""
@@ -1427,6 +2319,10 @@ class SettingsPage(QWidget):
     # ── 逻辑（保持原有行为）────────────────────────────────
 
     def _on_api_changed(self, api_name):
+        if hasattr(self, 'translation_test_label'):
+            # 换了引擎，旧的「✅ 可用」已经失效，别留着误导
+            self.translation_test_label.clear()
+            self.translation_test_label.setStyleSheet("")
         api_value = TRANSLATION_APIS.get(api_name, "")
         if api_value in self._api_page_map:
             self._api_stack.setCurrentIndex(self._api_page_map[api_value])
@@ -1465,12 +2361,13 @@ class SettingsPage(QWidget):
     def _on_ocr_engine_changed(self, _text):
         self._refresh_ocr_status()
 
-    def _install_ocr_engine(self):
+    def _install_ocr_engine(self, cancel=None):
         from ocr_recognizer import install_engine_with_progress
         engine = self._get_selected_engine_key()
-        self.ocr_install_btn.setEnabled(False)
-        self.ocr_install_btn.setText("安装中...")
-        self.ocr_status_label.setText("正在安装，请稍候...")
+        # 安装中锁定引擎下拉：切换会刷新状态并把「取消安装」按钮覆盖掉
+        self.ocr_engine_combo.setEnabled(False)
+        self.ocr_status_label.setText("正在安装，请稍候…（可点左侧按钮取消）")
+        self.ocr_status_label.setToolTip("")
         self.ocr_status_label.setStyleSheet("color: #eab308;")
         self.ocr_progress.setVisible(True)
         self.ocr_progress.setRange(0, 0)
@@ -1483,7 +2380,8 @@ class SettingsPage(QWidget):
 
         def do_install():
             try:
-                ok, msg = install_engine_with_progress(engine, on_progress)
+                ok, msg = install_engine_with_progress(
+                    engine, on_progress, cancel=cancel)
             except Exception as exc:
                 # 线程里抛出未捕获异常会让进度条与按钮永远停在「安装中」
                 ok, msg = False, f"安装失败：{exc}"
@@ -1519,23 +2417,41 @@ class SettingsPage(QWidget):
             self.ocr_status_label.setText(line[:100])
 
     def _on_install_result(self, ok, msg):
-        self.ocr_install_btn.setEnabled(True)
+        # 底层已经成功时，即使用户在收尾瞬间又点了一下按钮置位了取消，
+        # 也要如实显示「安装成功」。
+        cancelled = self._task_finish(
+            'ocr', "安装" if ok else "重试安装") and not ok
+        self.ocr_engine_combo.setEnabled(True)
         self.ocr_progress.setVisible(False)
+        from qfluentwidgets import InfoBar, InfoBarPosition
+        if cancelled:
+            self.ocr_install_btn.setText("重新安装")
+            self.ocr_status_label.setText(
+                "已取消安装 · 可重新点按钮安装，已下载的文件会自动续传")
+            self.ocr_status_label.setToolTip("")
+            self.ocr_status_label.setStyleSheet("color: #eab308;")
+            InfoBar.info("已取消", "OCR 组件安装已中断，可随时继续",
+                         duration=3000, position=InfoBarPosition.TOP,
+                         parent=self)
+            return
         if ok:
-            self.ocr_install_btn.setText("安装")
             self._refresh_ocr_status()
-            from qfluentwidgets import InfoBar, InfoBarPosition
             InfoBar.success("安装成功", "OCR 引擎已安装，可直接切换使用；升级后无需重装",
                             duration=3000, position=InfoBarPosition.TOP,
                             parent=self)
         else:
-            self.ocr_install_btn.setText("重试安装")
-            # pip 的多行错误日志塞进单行标签会把文字撑到界面外，压成一行
-            self.ocr_status_label.setText(f"安装失败: {msg[:100]}".replace("\n", " "))
+            # pip 英文原始日志不要再直接抛给桌面用户：主界面只留一句
+            # 中文可操作提示，原始日志放进 tooltip / 悬停可见。
+            friendly = friendly_install_error(msg)
+            self.ocr_status_label.setText(friendly)
+            self.ocr_status_label.setToolTip(str(msg)[:2000])
             self.ocr_status_label.setStyleSheet("color: #e5635f;")
-            from qfluentwidgets import InfoBar, InfoBarPosition
-            InfoBar.error("安装失败", msg[:200], duration=5000,
-                          position=InfoBarPosition.TOP, parent=self)
+            # 错误不能只留一行会被冲掉的状态：给「重试」和「复制诊断」
+            # 两个可点动作，并留足 10 秒阅读时间。
+            ui_feedback.show_error_bar(
+                self, "安装失败", friendly,
+                actions=[("重试", lambda: self.ocr_install_btn.click())],
+                detail=str(msg)[:4000], source="OCR 组件安装")
 
     def _save(self):
         api_name = self.api_combo.currentText()
@@ -1561,15 +2477,29 @@ class SettingsPage(QWidget):
         # 快捷键：空字符串 = 不占用按键，必须允许保存「清空」
         for action, entry in self._hotkey_inputs.items():
             self._cfg[config_key(action)] = normalize(entry.value())
-        conflicts = find_conflicts(get_hotkeys(self._cfg))
-        if conflicts:
-            detail = "\n".join(
-                f"{combo.upper()} → {'、'.join(labels)}"
-                for combo, labels in conflicts)
+        merged = all_hotkeys(self._cfg)
+        conflicts = find_conflicts(merged)
+        reserved = reserved_conflicts(merged)
+        if conflicts or reserved:
+            parts = []
+            if conflicts:
+                parts.append(
+                    "【多个动作用了同一组合】按一次键会触发多个动作：\n"
+                    + "\n".join(
+                        f"  {display_hotkey(combo)} → {'、'.join(labels)}"
+                        for combo, labels in conflicts))
+            if reserved:
+                parts.append(
+                    "【与程序内固定操作冲突】这些组合被搜索 / 全选 / 复制等"
+                    "占用，设了也不会生效：\n"
+                    + "\n".join(
+                        f"  {display_hotkey(combo)} → 已被「{use}」占用"
+                        f"（{'、'.join(labels)}）"
+                        for combo, use, labels in reserved))
             QMessageBox.warning(
                 self, "快捷键冲突",
-                "以下组合被多个功能占用，只有第一个会生效：\n\n"
-                + detail + "\n\n建议改成不同组合（设置仍会保存）。")
+                "\n\n".join(parts)
+                + "\n\n建议改成不同组合（设置仍会保存，改好后自动重新注册）。")
         self._cfg["auto_translate"] = self.auto_translate_check.isChecked()
         self._cfg["auto_copy"] = self.auto_copy_check.isChecked()
         self._cfg["auto_copy_target"] = (
@@ -1674,11 +2604,19 @@ class SettingsPage(QWidget):
 
     def _restore_defaults(self):
         """把本页所有设置恢复为默认值（需点保存后生效）。"""
+        if self._task_busy:
+            # 恢复默认会重设各 combo，即使控件被禁用也会发
+            # currentIndexChanged，可能把「取消下载」按钮隐藏掉。
+            QMessageBox.information(
+                self, "请先结束当前操作",
+                "正在安装组件或下载模型，请先完成或点按钮取消，"
+                "再恢复默认设置。")
+            return
         ret = QMessageBox.question(
             self, "恢复默认设置",
             "将把本页所有设置恢复为默认值，包括：\n"
             "  · 清空已填写的 API 密钥 / Token / Cookie\n"
-            "  · 清空全部快捷键（默认都不占用按键）\n"
+            "  · 清空全部全局快捷键；窗口内快捷键恢复为默认组合\n"
             "  · 重置实时字幕、OCR、翻译引擎等选项\n\n"
             "需要再点一次「保存设置」才会写入配置文件。确定吗？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -1707,14 +2645,19 @@ class SettingsPage(QWidget):
                      self.polish_model):
             edit.clear()
         self.polish_test_label.clear()
+        self.translation_test_label.clear()
+        self.translation_test_label.setStyleSheet("")
+        self.subtitle_test_label.clear()
+        self.subtitle_test_label.setStyleSheet("")
 
         default_engine_name = SUPPORTED_OCR_ENGINES.get(OCR_ENGINE, "")
         if default_engine_name:
             self.ocr_engine_combo.setCurrentText(default_engine_name)
 
-        # 默认快捷键全部为空；清空后保存也必须真的写回空值
+        # 全局清空、窗口内恢复默认组合；保存时必须真的把值写回配置
+        defaults = default_hotkeys()
         for action, entry in self._hotkey_inputs.items():
-            entry.setValue(DEFAULT_HOTKEYS.get(action, ''))
+            entry.setValue(defaults.get(action, ''))
         self.minimize_to_tray_check.setChecked(True)
         self.autostart_check.setChecked(False)
         self.auto_check_update_check.setChecked(True)
@@ -1768,6 +2711,17 @@ class SettingsPage(QWidget):
 
     def get_config(self):
         return self._cfg
+
+    def show_hotkey_warning(self, msg):
+        """配置里快捷键撞车时用警告色，别和「被其它程序占用」混为一谈。"""
+        from qfluentwidgets import InfoBar, InfoBarPosition
+        InfoBar.warning(
+            "部分快捷键未生效",
+            f"{msg}\n改好组合后会自动重新注册，无需重启程序",
+            duration=6000,
+            position=InfoBarPosition.TOP,
+            parent=self,
+        )
 
     def show_hotkey_error(self, msg):
         """快捷键注册失败时显示错误提示。"""

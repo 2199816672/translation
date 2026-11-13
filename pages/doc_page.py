@@ -254,6 +254,9 @@ class DocPage(QWidget):
         self.lang_combo.setMinimumWidth(100)
         self.lang_combo.setMaxVisibleItems(6)  # 最多显示 6 项，超出滚动
         layout.addWidget(self.lang_combo)
+        import ui_theme
+        ui_theme.align_lang_row(src_lang_label, self.src_lang_combo,
+                                lang_label, self.lang_combo)
 
         layout.addStretch(1)
         return card

@@ -14,7 +14,8 @@
     dist/installer/TranslationTool-v<版本>-win64.zip（仅 --portable）
 
 版本号唯一来源是 config.py 的 APP_VERSION，安装脚本通过 ISCC 的
-/dMyAppVersion 注入，避免多处硬编码不同步。
+/dMyAppVersion 注入，避免多处硬编码不同步。发版改版本号请用
+`python bump_version.py <版本>`（会同步 README 标题与 iss 兜底值）。
 """
 import argparse
 import hashlib

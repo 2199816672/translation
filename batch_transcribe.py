@@ -132,11 +132,18 @@ def _default_transcribe(path, settings, progress_cb, cancel):
             progress_cb(percent, text)
 
     if settings.get('mode') == 'api':
-        return asr.transcribe_api(
-            path, settings.get('api_base', ''), settings.get('api_key', ''),
-            settings.get('api_model', ''),
-            language=settings.get('src_lang', 'auto'),
-            progress_cb=guarded)
+        try:
+            return asr.transcribe_api(
+                path, settings.get('api_base', ''), settings.get('api_key', ''),
+                settings.get('api_model', ''),
+                language=settings.get('src_lang', 'auto'),
+                progress_cb=guarded, cancel_event=cancel)
+        except Exception as exc:
+            # 停止时底层可能抛 Cancelled / 网络中断 / socket 被关闭，
+            # 统一归一成「用户已停止」，不要记成「识别失败」。
+            if cancel is not None and cancel.is_set():
+                raise Cancelled() from exc
+            raise
 
     opts = settings.get('asr_opts') or {}
     return asr.transcribe_local(
@@ -157,6 +164,7 @@ def _default_translate(texts, settings, progress_cb, cancel):
     返回 (results, failed, last_error)：last_error 保留首个真实异常，
     便于「全部失败」时向用户展示根因（密钥错误 / 网络超时等）。
     """
+    from cancelable import CallCancelled, run_cancelable
     from translator import Translator
 
     translator = Translator(settings.get('src_lang', 'auto'),
@@ -169,9 +177,14 @@ def _default_translate(texts, settings, progress_cb, cancel):
             raise Cancelled()
         translated = ''
         try:
-            value = translator.translate(text)
+            # 单次翻译请求最长 15 秒；停止时不必干等它返回，
+            # 取消的请求留在后台自生自灭，绝不能塞进译文列表。
+            value = run_cancelable(lambda t=text: translator.translate(t),
+                                   cancel, poll=0.1)
             if value is not None and str(value).strip():
                 translated = str(value)
+        except CallCancelled:
+            raise Cancelled()
         except Exception as e:
             # 保留首个真实错误，便于全部失败时展示根因，而非只报「X 条失败」
             if not last_error:
@@ -204,15 +217,18 @@ class BatchRunner:
     """依次处理队列；单个文件失败不会中断，取消会跳过剩余项。
 
     resume=True 时跳过已完成项（重试失败项场景），保留它们的输出记录。
+    only_rows 传入 0 基行号集合时只处理这些行（表格右键「重试此项」），
+    其余行保持原状态，只推进界面总进度。
     """
 
     def __init__(self, jobs, settings, cancel=None,
                  transcribe=None, translate=None, export=None,
-                 resume=False):
+                 resume=False, only_rows=None):
         self.jobs = [j if isinstance(j, Job) else Job(str(j)) for j in jobs]
         self.settings = dict(settings)
         self.cancel = cancel
         self.resume = bool(resume)
+        self.only_rows = (set(only_rows) if only_rows is not None else None)
         self.transcribe = transcribe or _default_transcribe
         self.translate = translate or _default_translate
         self.export = export or _default_export
@@ -223,6 +239,11 @@ class BatchRunner:
     def run(self, on_start=None, on_progress=None, on_finish=None):
         total = len(self.jobs)
         for index, job in enumerate(self.jobs, 1):
+            if self.only_rows is not None and (index - 1) not in self.only_rows:
+                # 「重试此项」：其它行保持原状态与输出，只推进界面总进度
+                if on_finish:
+                    on_finish(index, total, job)
+                continue
             if self.resume and job.status == DONE:
                 # 已完成项保持原状态与输出路径，只推进 UI 总进度
                 if on_finish:

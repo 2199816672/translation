@@ -47,8 +47,15 @@ def install_engine(engine):
     return install_engine_with_progress(engine)
 
 
-def install_engine_with_progress(engine, on_progress=None):
-    """通过 pip 安装指定 OCR 引擎，实时回调进度。"""
+def install_engine_with_progress(engine, on_progress=None, cancel=None):
+    """通过 pip 安装指定 OCR 引擎，实时回调进度。
+
+    ``cancel`` 是可选的 ``threading.Event``：用户在设置页点「取消安装」时
+    置位，看门狗随即 kill 掉 pip 子进程，读取循环立刻退出并返回「已取消」，
+    不会留下一个装到一半却仍显示「安装中」的界面。
+    """
+    from subprocess_util import (CANCELLED_TEXT, pip_cmd,
+                                 pip_install_with_mirrors)
     packages = {
         'easy': 'easyocr',
         'windows': 'winrt-runtime winrt-Windows.Media.Ocr winrt-Windows.Globalization winrt-Windows.Graphics.Imaging winrt-Windows.Storage.Streams winrt-Windows.Foundation winrt-Windows.Foundation.Collections',
@@ -56,33 +63,48 @@ def install_engine_with_progress(engine, on_progress=None):
     pkg = packages.get(engine)
     if not pkg:
         return False, f"{engine} 无法安装"
+    if cancel is not None and cancel.is_set():
+        return False, CANCELLED_TEXT
     cmd, hint = pip_cmd(pkg.split())
     if cmd is None:
         return False, hint
-    try:
-        # pip_process 自带看门狗：网络/SSL 卡死时 kill 子进程，避免
-        # readline() 永久阻塞让设置页停在「安装中…」。
-        with pip_process(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True) as proc:
-            last_lines = []
-            while True:
-                line = proc.stdout.readline()
-                if not line and proc.poll() is not None:
-                    break
-                if line:
-                    last_lines.append(line.strip())
-                    if on_progress:
-                        on_progress(line)
-        if proc.returncode == 0:
-            return True, "安装成功"
-        tail = '\n'.join(last_lines[-5:])
-        return False, f"安装失败 (code {proc.returncode}): {tail}"
-    except Exception as e:
-        return False, f"安装失败: {e}"
+
+    def on_attempt(i, total, name):
+        # 让用户看见「正在换源」，而不是 403 之后长时间黑屏
+        if on_progress:
+            try:
+                on_progress(f"[{i}/{total}] 正在使用{name}安装…\n")
+            except Exception:
+                pass
+
+    label = 'winrt OCR 组件' if engine == 'windows' else 'EasyOCR 引擎'
+    # 以前不指定 -i，完全听用户 pip.ini 的；清华 / 其它失效镜像返回 403
+    # 时安装必然失败。这里显式换源重试，失败也给出可照做的手动命令。
+    return pip_install_with_mirrors(
+        pkg.split(), on_progress=on_progress, cancel=cancel,
+        on_attempt=on_attempt, label=label)
 
 
 # ── Windows 系统 OCR 后端 ─────────────────────────────────────
+
+class _ThreadLocalEngineCache:
+    """按线程缓存 winrt OcrEngine：线程退出即自动释放 COM 引擎。
+
+    实时翻译浮层每帧都新建一次性线程，用 {threading.get_ident(): engine}
+    缓存会无限累积句柄；Windows 线程 ID 还会复用，复用时会命中上一个已销毁
+    线程留下的、COM 单元已失效的引擎。threading.local 两个问题都不存在。
+    这里刻意保留 dict 的 get / __setitem__ 接口，_ensure_engine 无需改动。
+    """
+
+    def __init__(self):
+        self._local = threading.local()
+
+    def get(self, _tid, default=None):
+        return getattr(self._local, 'engine', default)
+
+    def __setitem__(self, _tid, engine):
+        self._local.engine = engine
+
 
 class WindowsOCRRecognizer:
     # 用户所选语言（PaddleOCR 命名）→ Windows BCP-47 语言码
@@ -100,7 +122,7 @@ class WindowsOCRRecognizer:
         # 因此不在构造时创建，改为按调用线程惰性创建并缓存（见 _ensure_engine）。
         self._lang_code = ''
         self._lang_codes = []
-        self._engines = {}
+        self._engines = _ThreadLocalEngineCache()
         self._compute_codes()
 
     def _compute_codes(self):
@@ -236,22 +258,10 @@ EASY_MODEL_DIR = os.path.join(os.path.expanduser("~"), '.EasyOCR', 'model')
 
 
 def _check_easy_model_exists(languages):
-    """检查EasyOCR模型文件是否已存在"""
-    if not os.path.exists(EASY_MODEL_DIR):
-        return False
-    if not os.path.exists(os.path.join(EASY_MODEL_DIR, 'craft_mlt_25k.pth')):
-        return False
-    lang_map = {
-        'ch_sim': 'zh_sim_g2.pth',
-        'en': 'en_g2.pth',
-        'ja': 'ja_g2.pth',
-        'ko': 'ko_g2.pth',
-    }
-    for lang in languages:
-        model_name = lang_map.get(lang, f"{lang}_g2.pth")
-        if os.path.exists(os.path.join(EASY_MODEL_DIR, model_name)):
-            return True
-    return False
+    """EasyOCR 模型是否已存在（含用户手动导入与老版本默认目录）。"""
+    import ocr_models
+    directory = ocr_models.resolve_model_dir(languages)
+    return ocr_models.has_required_models(directory, languages)
 
 
 class EasyOCRRecognizer:
@@ -281,10 +291,22 @@ class EasyOCRRecognizer:
                 use_gpu = torch.cuda.is_available()
             except Exception:
                 use_gpu = False
+            import ocr_models
+            model_dir = ocr_models.resolve_model_dir(self.languages)
+            # 手动下载 / 导入的模型齐全时彻底关掉联网下载，国内网络不会再
+            # 卡在 easyocr 自动拉模型上；缺文件时仍保留自动下载兜底。
+            offline_ready = ocr_models.models_complete(
+                model_dir, self.languages)
             if not self.model_exists:
                 print("EasyOCR: 开始下载模型文件...")
-            self.reader = easyocr.Reader(self.languages, gpu=use_gpu,
-                                          download_enabled=True)
+            try:
+                self.reader = easyocr.Reader(
+                    self.languages, gpu=use_gpu,
+                    model_storage_directory=model_dir,
+                    download_enabled=not offline_ready)
+            except TypeError:
+                # 极旧版 easyocr 不接受这两个参数，退回原行为
+                self.reader = easyocr.Reader(self.languages, gpu=use_gpu)
             if not self.model_exists:
                 print("EasyOCR: 模型下载完成！")
                 self.model_exists = True

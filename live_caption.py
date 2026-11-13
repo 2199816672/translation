@@ -19,7 +19,8 @@
 
 from __future__ import annotations
 
-from subprocess_util import pip_cmd, run_quiet
+from subprocess_util import (CANCELLED_TEXT, pip_cmd, pip_process,
+                             run_quiet)
 
 import importlib.util
 import os
@@ -56,7 +57,7 @@ def dependency_status():
     if not mic:
         parts.append('缺少 sounddevice（麦克风采集）')
     if not loopback:
-        parts.append('缺少 soundcard（电脑内部声音），可在设置里一键安装')
+        parts.append('缺少 soundcard（电脑声音），可在设置里一键安装')
     if not local_asr:
         parts.append('缺少 faster-whisper（本地模型）')
     return {
@@ -67,8 +68,14 @@ def dependency_status():
     }
 
 
-def install_loopback_support(progress_cb=None):
-    """安装 soundcard（WASAPI 内录支持）。返回 (ok, message)。"""
+def install_loopback_support(progress_cb=None, cancel=None, packages=None):
+    """安装音频采集组件（默认 soundcard / WASAPI 内录）。返回 (ok, message)。
+
+    ``packages`` 可传 ``('sounddevice',)`` 安装麦克风采集依赖；
+    ``cancel`` 置位时立刻中断当前 pip 子进程并停止后续镜像重试。
+    """
+    pkgs = tuple(packages or ('soundcard',))
+    label = '内录组件' if pkgs == ('soundcard',) else '音频采集组件'
     mirrors = (
         'https://pypi.org/simple',
         'https://mirrors.aliyun.com/pypi/simple/',
@@ -76,23 +83,36 @@ def install_loopback_support(progress_cb=None):
     )
     last = ''
     for index in mirrors:
+        if cancel is not None and cancel.is_set():
+            return False, CANCELLED_TEXT
         cmd, hint = pip_cmd(
-            ['soundcard'],
+            list(pkgs),
             ['-i', index, '--disable-pip-version-check'],
         )
         if cmd is None:
             return False, hint
         if progress_cb:
-            progress_cb(f'正在安装内录组件…（{index.split("/")[2]}）')
+            progress_cb(f'正在安装{label}…（{index.split("/")[2]}）')
         try:
-            out = run_quiet(cmd, capture_output=True, text=True,
-                            timeout=180)
-            if out.returncode == 0:
-                return True, 'soundcard 安装成功，重新打开下拉框即可看到扬声器设备'
-            last = (out.stderr or out.stdout or '').strip()[-300:]
+            # 用可取消的进程包装替代 run_quiet：后者一旦开始等 180 秒超时，
+            # 用户点「取消」也毫无反应。
+            with pip_process(
+                    cmd, timeout=180, cancel=cancel,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True) as proc:
+                output = proc.stdout.read() or ''
+            if cancel is not None and cancel.is_set():
+                return False, CANCELLED_TEXT
+            if proc.returncode == 0:
+                return True, (f'{"、".join(pkgs)} 安装成功，'
+                              '重新打开下拉框即可看到设备')
+            last = output.strip()[-300:]
         except Exception as e:
+            if cancel is not None and cancel.is_set():
+                return False, CANCELLED_TEXT
             last = str(e)
-    return False, f'自动安装失败：{last}\n可手动执行 pip install soundcard'
+    return False, (f'自动安装失败：{last}\n'
+                   f'可手动执行 pip install {" ".join(pkgs)}')
 
 
 def _is_mix_name(name):
@@ -336,6 +356,10 @@ class LiveCaptionEngine:
         self._model = None
         self._model_lock = None
         self._seq = 0
+        # 会话编号：stop() 后线程可能仍阻塞在网络请求里，start() 递增编号后
+        # 旧线程的迟到回调必须丢弃，否则会串进新一轮字幕且序号错位。
+        self._session = 0
+        self._thread_session = threading.local()
 
     # ── 对外 ──
 
@@ -360,6 +384,13 @@ class LiveCaptionEngine:
         self._stop.clear()
         self._paused.clear()
         self._seq = 0
+        # 新一轮会话：旧线程即便还阻塞在请求里，其回调也会被 _call 丢弃
+        self._session += 1
+        while not self._translate_queue.empty():
+            try:
+                self._translate_queue.get_nowait()
+            except queue.Empty:
+                break
         if self._capture is None:
             self._capture = AudioCapture(
                 self.cfg.get('subtitle_audio_source', 'mic'),
@@ -393,6 +424,12 @@ class LiveCaptionEngine:
     # ── 回调 ──
 
     def _call(self, name, *args):
+        # 工作线程在 loop 开头写入本会话编号；stop() 后 start() 会递增
+        # _session，旧线程从阻塞请求返回时编号已过期，回调直接丢弃。
+        # 主线程发起的调用没有该标记，保持原行为。
+        session = getattr(self._thread_session, 'value', None)
+        if session is not None and session != self._session:
+            return
         fn = self.cb.get(name)
         if fn:
             try:
@@ -458,12 +495,16 @@ class LiveCaptionEngine:
             return self._injected_transcriber(audio)
         engine = str(self.cfg.get('subtitle_engine') or 'local')
         if engine == 'local':
-            if self._model is None:
+            # stop() 会把 model / lock 置空，旧线程迟到时必须安全退出，
+            # 不能对着 None 用 with（会抛 AttributeError）。
+            model, lock = self._model, self._model_lock
+            if model is None or lock is None:
                 return ''
-            # CTranslate2 模型实例非线程安全：持该模型专属锁串行调用，
-            # 即便与音视频页共享同一模型也不会并发崩溃
-            with self._model_lock:
-                segments, _info = self._model.transcribe(
+            # transcribe() 返回的是生成器，真正的推理发生在迭代 segments 时；
+            # 迭代必须留在锁内，否则与音视频页共享同一模型时仍会并发进
+            # CTranslate2（非线程安全）导致崩溃或结果错乱。
+            with lock:
+                segments, _info = model.transcribe(
                     audio,
                     language=self._language(),
                     beam_size=1,
@@ -472,9 +513,10 @@ class LiveCaptionEngine:
                     condition_on_previous_text=False,
                     no_speech_threshold=0.6,
                 )
-            return clean_text(' '.join(s.text for s in segments))
+                return clean_text(' '.join(s.text for s in segments))
         # 在线 API / 免费本地服务：短片段写临时 wav，用完即删
         import speech_recognizer as asr
+        from cancelable import CallCancelled
         fd, path = tempfile.mkstemp(prefix='caption_', suffix='.wav')
         os.close(fd)
         try:
@@ -485,9 +527,13 @@ class LiveCaptionEngine:
                 str(self.cfg.get('subtitle_api_key') or '').strip(),
                 str(self.cfg.get('subtitle_api_model') or 'whisper-1'),
                 language=str(self.cfg.get('subtitle_language') or 'auto'),
-                allow_private=(engine == 'local_service'))
+                allow_private=(engine == 'local_service'),
+                cancel_event=self._stop)
             return clean_text(' '.join(
                 str(s.get('text', '')) for s in result.get('segments', [])))
+        except CallCancelled:
+            # stop() 已置位：这是正常退出，别弹「识别失败」吓用户
+            return ''
         finally:
             try:
                 os.unlink(path)
@@ -496,6 +542,7 @@ class LiveCaptionEngine:
 
     def _asr_loop(self):
         """线程入口：逃逸异常必须回调 on_error，否则界面会一直卡在「运行中」。"""
+        self._thread_session.value = self._session
         try:
             self._asr_loop_inner()
         except Exception as e:
@@ -525,6 +572,7 @@ class LiveCaptionEngine:
         speech_seen = False
         last_text = ''
         chunks = self._capture.chunks
+        warned = False
 
         while not self._stop.is_set():
             try:
@@ -566,7 +614,11 @@ class LiveCaptionEngine:
                 cost = time.perf_counter() - t0
                 self._call('on_speed', cost)
             except Exception as e:
-                self._call('on_error', f'识别失败：{e}')
+                # 模型损坏 / GPU 报错会每 2.5 秒刷一条同样的错误，
+                # 只报一次，避免状态栏和字幕框被反复覆盖。
+                if not warned:
+                    self._call('on_error', f'识别失败：{e}')
+                    warned = True
                 continue
             text = trim_repeated_prefix(text, last_text)
             if self._stop.is_set():
@@ -589,6 +641,7 @@ class LiveCaptionEngine:
                     self._translate_queue.put_nowait((seq, text))
 
     def _translate_loop(self):
+        self._thread_session.value = self._session
         from translator import Translator
         try:
             translator = Translator(
@@ -596,6 +649,7 @@ class LiveCaptionEngine:
         except Exception as e:
             self._call('on_error', f'翻译引擎初始化失败：{e}')
             return
+        warned = False
         while not self._stop.is_set():
             try:
                 seq, text = self._translate_queue.get(timeout=0.2)
@@ -604,9 +658,13 @@ class LiveCaptionEngine:
             if self._stop.is_set():
                 break
             try:
-                translated = translator.translate(text) or text
-            except Exception:
-                translated = text       # 翻译失败保留原文，不丢字幕
+                translated = translator.translate(text) or ""
+            except Exception as e:
+                # 翻译失败必须留空：把原文写进「翻译结果」等于用原文冒充译文
+                translated = ""
+                if not warned:
+                    self._call('on_error', f'字幕翻译失败：{e}')
+                    warned = True
             if self._stop.is_set():
                 break
             self._call('on_translation', seq, translated)

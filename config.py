@@ -172,7 +172,7 @@ DEFAULT_LIVE_SETTINGS = {
 # 实时字幕：音频来源 / 识别引擎 / 显示模式
 SUBTITLE_AUDIO_SOURCES = {
     '麦克风': 'mic',
-    '电脑内部声音': 'loopback',
+    '电脑声音': 'loopback',
 }
 SUBTITLE_ENGINES = {
     '本地模型（免费下载 · 离线 · 最快）': 'local',
@@ -292,7 +292,7 @@ def get_subtitle_settings():
 # 加载保存的配置
 user_config = load_user_config()
 
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 BILIBILI_DYNAMIC_URL = "https://space.bilibili.com/382966397/dynamic"
 GITHUB_REPO = "2199816672/translation"
 

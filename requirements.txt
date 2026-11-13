@@ -32,7 +32,7 @@ zhconv>=1.4.3
 av>=10.0.0
 ctranslate2>=4.0.0
 
-# 实时字幕：麦克风采集 + 电脑内部声音（WASAPI 环回）
+# 实时字幕：麦克风采集 + 电脑声音（WASAPI 环回）
 # soundcard 也可在「设置 → 实时字幕」里一键安装
 sounddevice>=0.4.6
 soundcard>=0.2.2

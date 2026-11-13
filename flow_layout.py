@@ -35,9 +35,11 @@ from PySide6.QtWidgets import (
 # 输入框内部可横向滚动，轻微压缩不会丢内容；其他控件一律不压：
 # QPushButton / QLabel 在 QSS 下哪怕只窄 3~4px，中文就会被裁掉半个字。
 _INPUT_SHRINK = 8
-# QComboBox 右侧要给下拉箭头留位，再加左右 padding 和一点余量。
-# 它的 sizeHint 由「最长的候选项」决定，往往远大于当前显示文本；
-# 用当前文本算宽度才既能显示完整、又不白白占掉一整行。
+# QComboBox 的文字区要扣掉左右 padding、::drop-down 箭头位与边框
+# （theme.py 现在是 10 + 8 + 20 + 2 = 40px），再留余量给高 DPI 缩放
+# 和更长的候选项。它的 sizeHint 由「最长的候选项」决定，往往远大于
+# 当前显示文本；用当前文本算宽度才既能显示完整、又不白白占掉一整行。
+# 余量刻意留得保守：为省几十像素把「自动检测」又裁掉半个字不划算。
 _COMBO_EXTRA = 68
 
 

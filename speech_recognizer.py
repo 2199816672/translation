@@ -207,6 +207,72 @@ def resolve_model_path(name):
     return None, False
 
 
+def human_size(num):
+    """字节数转人类可读文本：1.53 GB / 480 MB / 12 KB。"""
+    num = float(num or 0)
+    if num >= 1024 ** 3:
+        return f"{num / 1024 ** 3:.2f} GB"
+    if num >= 1024 ** 2:
+        return f"{num / 1024 ** 2:.0f} MB"
+    if num >= 1024:
+        return f"{num / 1024:.0f} KB"
+    return f"{int(num)} B"
+
+
+def model_cache_info(root=None):
+    """统计本地模型缓存占用（只读，零依赖）。
+
+    返回 ``{root, exists, total_bytes, models: [{name, path, bytes, ready}]}``。
+    只扫描一级子目录、不跟随符号链接；取消下载留下的半成品也会被列出并
+    标成 ``ready=False``，用户能一眼看出哪些占着空间却还不能用。
+    """
+    root = str(root or MODEL_ROOT)
+    info = {'root': root, 'exists': os.path.isdir(root),
+            'total_bytes': 0, 'models': []}
+    if not info['exists']:
+        return info
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return info
+    for name in names:
+        path = os.path.join(root, name)
+        if os.path.islink(path) or not os.path.isdir(path):
+            continue
+        size = 0
+        for base, _dirs, files in os.walk(path):
+            for filename in files:
+                try:
+                    size += os.path.getsize(os.path.join(base, filename))
+                except OSError:
+                    pass
+        info['total_bytes'] += size
+        info['models'].append({
+            'name': name, 'path': path, 'bytes': size,
+            'ready': _model_complete(path),
+        })
+    return info
+
+
+def model_cache_summary(info=None):
+    """把 :func:`model_cache_info` 的结果压成一句中文，供界面直接显示。"""
+    info = info or model_cache_info()
+    models = info.get('models') or []
+    if not models:
+        return ("尚无本地模型（下载后才占用磁盘）· 目录 "
+                + str(info.get('root') or ''))
+    ready = sum(1 for m in models if m.get('ready'))
+    text = (f"共 {len(models)} 个模型目录，占用 "
+            f"{human_size(info.get('total_bytes'))}（{ready} 个已就绪）")
+    # 刚点取消时可能只留下 0 字节的空目录，把它算成「未完成下载」会和
+    # 前面的「占用 0 B」自相矛盾，也吓到用户。
+    partial = sum(1 for m in models
+                  if not m.get('ready') and (m.get('bytes') or 0) > 0)
+    if partial:
+        text += f" · {partial} 个未完成下载（可继续下载补全）"
+    return text
+
+
 def import_local_model(folder):
     """校验一个本地 faster-whisper 模型目录，返回登记名（目录名）。
 
@@ -244,11 +310,12 @@ def check_dependencies():
     return True, ""
 
 
-# 依次尝试的 pip 源（默认配置 → 阿里云 → PyPI 官方 → 清华）
+# 依次尝试的 pip 源。显式可用的镜像放前面：用户 pip.ini 里配了失效的
+# 清华源时，第一项「默认配置」必然 403，白白等一轮才轮到好源。
 _PIP_INDEXES = (
-    ("默认配置", ()),
     ("阿里云镜像", ("-i", "https://mirrors.aliyun.com/pypi/simple/")),
     ("PyPI 官方", ("-i", "https://pypi.org/simple")),
+    ("默认配置", ()),
     ("清华镜像", ("-i", "https://pypi.tuna.tsinghua.edu.cn/simple/")),
 )
 
@@ -299,7 +366,7 @@ def install_dependencies(progress_cb=None):
         if ok:
             return True, f"语音识别组件安装成功（{label}）"
     manual = (
-        "安装失败（已自动尝试默认配置 / 阿里云 / PyPI 官方 / 清华镜像）。\n\n"
+        "安装失败（已依次尝试阿里云 / PyPI 官方 / 本机默认 / 清华镜像）。\n\n"
         "可在命令行手动安装：\n"
         "  pip install faster-whisper\n"
         "若镜像报 403，换官方源：\n"
@@ -311,54 +378,83 @@ def install_dependencies(progress_cb=None):
 
 # ── 模型下载（带进度）───────────────────────────────────────
 
-class _ProgressTqdm(object):
-    """把 tqdm 下载进度回调给 UI。"""
+class ModelDownloadCancelled(Exception):
+    """用户主动取消模型下载；不应被当成失败去重试另一个镜像。"""
 
-    callback = None
+
+class _ProgressTqdm(object):
+    """把 tqdm 下载进度回调给 UI，并在取消时中断下载。
+
+    callback / cancel 走闭包而不是类属性：后者是全局状态，两个页面同时
+    下载不同模型时会互相串进度，甚至把另一个下载提前中断。
+    """
 
     @classmethod
-    def make(cls, base_cls):
+    def make(cls, base_cls, callback=None, cancel=None):
         class _Tqdm(base_cls):
             def update(self, n=1):
+                if cancel is not None and cancel.is_set():
+                    raise ModelDownloadCancelled()
                 super().update(n)
-                cb = _ProgressTqdm.callback
                 # 只回报字节级（大文件）进度，忽略"文件个数"等小计数条
-                if cb and self.total and self.total >= 1_000_000:
+                if callback and self.total and self.total >= 1_000_000:
                     try:
-                        cb(int(self.n), int(self.total))
+                        callback(int(self.n), int(self.total))
+                    except ModelDownloadCancelled:
+                        raise
                     except Exception:
                         pass
         return _Tqdm
 
 
-def download_model(name, on_progress=None):
-    """下载指定模型（镜像优先、官方兜底），进度回调 on_progress(done, total)。"""
+def download_model(name, on_progress=None, cancel_event=None):
+    """下载指定模型（镜像优先、官方兜底），进度回调 on_progress(done, total)。
+
+    ``cancel_event`` 置位时立刻抛 :class:`ModelDownloadCancelled` 中断下载，
+    不再重试其它镜像。未下载完的文件保留在缓存目录里由 huggingface_hub
+    断点续传，界面会把它标成「未完成下载」，不做任何删除操作。
+    """
     if name not in MODEL_CATALOG:
         raise RuntimeError(f"未知模型: {name}")
+    if cancel_event is not None and cancel_event.is_set():
+        raise ModelDownloadCancelled()
     try:
         from huggingface_hub import snapshot_download
     except ImportError:
-        raise RuntimeError("请先安装依赖: pip install huggingface-hub")
+        import sys
+        if getattr(sys, "frozen", False):
+            raise RuntimeError("缺少模型下载组件，请到「设置」页"
+                               "点对应功能旁的「安装」按钮在线安装（无需重启）")
+        raise RuntimeError("缺少模型下载组件，可执行 "
+                           "pip install huggingface-hub 安装，"
+                           "或在程序「设置」页在线安装")
 
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
     repo = MODEL_CATALOG[name]['repo']
     target = model_dir(name)
     os.makedirs(target, exist_ok=True)
 
+    def progress(done, total):
+        if cancel_event is not None and cancel_event.is_set():
+            raise ModelDownloadCancelled()
+        if on_progress:
+            on_progress(done, total)
+
     try:
         from tqdm.auto import tqdm as _base_tqdm
-        progress_cls = _ProgressTqdm.make(_base_tqdm)
+        progress_cls = _ProgressTqdm.make(
+            _base_tqdm, callback=progress, cancel=cancel_event)
     except Exception:
         progress_cls = None
-    _ProgressTqdm.callback = on_progress
 
     endpoints = ["https://hf-mirror.com", "https://huggingface.co"]
     last_error = None
     for endpoint in endpoints:
         kwargs = {"repo_id": repo, "local_dir": target, "endpoint": endpoint}
         try:
-            if on_progress:
-                on_progress(0, 0)
+            if cancel_event is not None and cancel_event.is_set():
+                raise ModelDownloadCancelled()
+            progress(0, 0)
             if progress_cls is not None:
                 try:
                     snapshot_download(tqdm_class=progress_cls, **kwargs)
@@ -366,14 +462,15 @@ def download_model(name, on_progress=None):
                     snapshot_download(**kwargs)
             else:
                 snapshot_download(**kwargs)
+            if cancel_event is not None and cancel_event.is_set():
+                raise ModelDownloadCancelled()
             if is_model_ready(name):
                 return
             last_error = RuntimeError("下载完成但模型文件不完整")
+        except ModelDownloadCancelled:
+            raise
         except Exception as e:
             last_error = e
-        finally:
-            _ProgressTqdm.callback = None
-    _ProgressTqdm.callback = None
     raise RuntimeError(f"模型下载失败: {last_error}")
 
 
@@ -882,7 +979,7 @@ def transcribe_local(audio_path, model_name, language='auto',
     if not entries:
         raise RuntimeError(
             "未识别到语音内容。\n"
-            "若是歌曲或纯音乐，请到「设置 → 语音识别」关闭人声检测后重试；\n"
+            "若是歌曲或纯音乐，请到「设置 → 语音识别设置」关闭人声检测后重试；\n"
             "也可指定音频语言，或换用更大的模型（small / large-v3-turbo）。")
 
     if progress_cb:
@@ -934,6 +1031,90 @@ def validate_api_url(base_url, allow_private=False):
     """供界面提前校验 API 根地址，返回规范化地址。"""
     return _validate_api_url(
         str(base_url or '').strip().rstrip('/'), allow_private=allow_private)
+
+
+def test_api_connection(base_url, api_key='', allow_private=False,
+                        timeout=6, cancel_event=None):
+    """测试 OpenAI 兼容识别服务是否可达：GET ``{base}/models``。
+
+    只探测连通性与鉴权，不上传音频、不写配置、不改动任何状态，因此用户在
+    设置页还没点「保存」也能直接测刚填进去的地址和密钥。
+    返回 ``(ok, message)``，message 一律是中文可操作提示。
+    """
+    from cancelable import CallCancelled, run_cancelable
+    from user_messages import friendly_service_error
+
+    base = str(base_url or '').strip().rstrip('/')
+    if not base:
+        return False, "请先填写服务地址（一般填到 /v1 即可）"
+    try:
+        url = _validate_api_url(base + '/models',
+                                allow_private=allow_private)
+    except Exception as exc:
+        raw = str(exc)
+        # 校验函数抛的是中文可操作提示，直接展示；底层 socket / DNS 异常是
+        # 英文（getaddrinfo failed 之类），统一转成中文再给用户。
+        if any(ord(ch) > 127 for ch in raw):
+            return False, "服务地址不可用：" + raw
+        return False, "服务地址不可用：" + friendly_service_error(
+            exc, "识别服务")
+
+    headers = {'Accept': 'application/json',
+               'User-Agent': 'TranslationTool/1.0'}
+    key = str(api_key or '').strip()
+    if key:
+        headers['Authorization'] = 'Bearer ' + key
+    req = urllib.request.Request(url, headers=headers, method='GET')
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+
+    def probe():
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                code = int(getattr(resp, 'status', 200) or 200)
+                body = resp.read(4096).decode('utf-8', 'replace')
+            return code, body
+        except urllib.error.HTTPError as exc:
+            detail = ''
+            try:
+                detail = exc.read().decode('utf-8', 'replace')[:160].strip()
+            except Exception:
+                pass
+            return exc.code, detail
+
+    try:
+        code, detail = run_cancelable(probe, cancel_event, poll=0.1)
+    except CallCancelled:
+        return False, "已取消测试"
+    except Exception as exc:
+        return False, friendly_service_error(exc, "识别服务")
+
+    if 200 <= code < 300:
+        # 地址填成任意可达的普通网页也会返回 200，必须确认响应确实是
+        # OpenAI 兼容的 /models 列表，否则「测试连接」会误报成功。
+        try:
+            payload = json.loads(detail)
+        except Exception:
+            payload = None
+        looks_like_models = isinstance(payload, dict) and (
+            isinstance(payload.get('data'), list)
+            or str(payload.get('object') or '').lower() == 'list')
+        if looks_like_models:
+            return True, "服务连接正常，可以启动实时字幕"
+        return False, ("服务地址可达，但响应不是标准的模型列表；"
+                       "请确认地址是否填到 /v1，或启动实时字幕实际验证")
+    if code in (401, 403):
+        return False, "服务可达，但密钥无效或权限不足，请检查 API 密钥"
+    if code == 404:
+        # 端口通不等于识别服务可用：/models 缺失时只能说「未验证」，
+        # 不能报测试成功让用户以为万事大吉。
+        return False, ("服务已连通，但未提供 /models 列表，无法确认识别能力；"
+                       "可启动实时字幕实际验证")
+    if code == 429:
+        return False, "服务限流（429），请稍后再试"
+    if code >= 500:
+        return False, f"服务端错误（HTTP {code}），请稍后再试"
+    suffix = f"：{detail}" if detail else ""
+    return False, f"服务返回 HTTP {code}{suffix}"
 
 
 class _MultipartBody:
@@ -1013,11 +1194,16 @@ def _build_multipart(fields, file_field, file_path):
 
 
 def transcribe_api(audio_path, base_url, api_key, model, language='auto',
-                   progress_cb=None, allow_private=False):
+                   progress_cb=None, allow_private=False,
+                   cancel_event=None):
     """OpenAI 兼容接口转录：POST {base}/audio/transcriptions。
 
     请求前对最终 URL 做协议 / 主机 / 解析 IP 校验，并禁止跟随重定向。
     allow_private=True 允许指向本机或局域网的自建免费识别服务。
+
+    ``cancel_event`` 置位时立刻抛 :class:`cancelable.CallCancelled` 返回，
+    不再等这个最长 600 秒的请求；同时尝试关闭已建立的响应，让后台的
+    守护线程尽早结束。调用方应把「取消」和「识别失败」分开处理。
     """
     base = str(base_url or '').strip().rstrip('/')
     url = base + '/audio/transcriptions'
@@ -1030,6 +1216,10 @@ def transcribe_api(audio_path, base_url, api_key, model, language='auto',
     if language not in ('auto', '', None):
         fields['language'] = WHISPER_LANG_MAP.get(language, language)
 
+    from cancelable import run_cancelable
+
+    open_responses = []
+
     def _send(fmt_fields):
         body, content_type, holder = _build_multipart(
             fmt_fields, 'file', audio_path)
@@ -1041,9 +1231,35 @@ def transcribe_api(audio_path, base_url, api_key, model, language='auto',
                 url, data=body, headers=headers, method='POST')
             opener = urllib.request.build_opener(_NoRedirectHandler())
             with opener.open(req, timeout=600) as resp:
+                open_responses.append(resp)
                 return resp.read()
         finally:
             holder.close()
+
+    def _close_open_responses():
+        # 取消时主动断开 socket，后台线程的 resp.read() 会立刻报错退出，
+        # 不用空等服务器 600 秒超时。
+        for resp in list(open_responses):
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    def _request():
+        fmt = dict(fields)
+        try:
+            return _send(fmt)
+        except urllib.error.HTTPError as e:
+            if e.code != 400:
+                raise RuntimeError(f"API 请求失败: HTTP {e.code}")
+            # 部分服务不支持 verbose_json，退回普通 json
+            fmt['response_format'] = 'json'
+            try:
+                return _send(fmt)
+            except urllib.error.HTTPError as e2:
+                raise RuntimeError(f"API 请求失败: HTTP {e2.code}")
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"无法连接 API: {e.reason}")
 
     if progress_cb:
         try:
@@ -1056,19 +1272,8 @@ def transcribe_api(audio_path, base_url, api_key, model, language='auto',
                 f"正在上传 {size_mb:.0f} MB 文件…（多数在线接口限制 25 MB，"
                 "文件过大建议改用本地模型或先提取音频）")
         progress_cb(5, upload_msg)
-    try:
-        raw = _send(fields)
-    except urllib.error.HTTPError as e:
-        if e.code != 400:
-            raise RuntimeError(f"API 请求失败: HTTP {e.code}")
-        # 部分服务不支持 verbose_json，退回普通 json
-        fields = dict(fields, response_format='json')
-        try:
-            raw = _send(fields)
-        except urllib.error.HTTPError as e2:
-            raise RuntimeError(f"API 请求失败: HTTP {e2.code}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"无法连接 API: {e.reason}")
+    raw = run_cancelable(_request, cancel_event, poll=0.15,
+                         on_cancel=_close_open_responses)
 
     try:
         body = json.loads(raw.decode('utf-8', errors='replace'))

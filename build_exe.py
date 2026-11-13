@@ -37,7 +37,9 @@ HIDDEN_IMPORTS = [
     "format_convert", "doc_parser", "office_bridge", "convert_libs",
     "resize_util", "batch_transcribe", "batch_dialog", "flow_layout",
     "pages", "pages.home_page", "pages.doc_page",
-    "pages.av_page", "pages.settings_page",
+    "pages.av_page", "pages.settings_page", "user_messages", "cancelable",
+    "ocr_models", "diagnostics", "status_bus", "task_center", "ui_theme",
+    "ui_feedback", "onboarding", "command_palette",
     # 第三方
     "keyboard", "winrt", "winrt.windows.media.ocr",
     "winrt.windows.globalization", "winrt.windows.graphics.imaging",
@@ -76,6 +78,9 @@ def main() -> int:
         "--noconfirm", "--clean", "--windowed",
         "--name", APP_NAME,
         "--icon", str(icon),
+        # 只收这两个静态资源目录：models / screenshots / user_libs 全是
+        # 运行时生成的用户数据，绝不进包。OCR 只内置 Windows 系统自带引擎
+        # （0 MB 模型文件），其它模型一律按需下载，避免打包体积与时间失控。
         "--add-data", "assets;assets",
         "--add-data", "pages;pages",
     ]

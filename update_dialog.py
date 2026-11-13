@@ -176,6 +176,7 @@ class DownloadDialog(_BaseDialog):
         self._cancel = cancel
         self._ready = False
         self._failed = False
+        self.cancelled_by_user = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 22, 24, 20)
@@ -267,6 +268,10 @@ class DownloadDialog(_BaseDialog):
             self.reject()
 
     def reject(self) -> None:
+        # 下载中点「取消下载」/ X / ESC 都会到这里。对话框随即关闭，worker
+        # 的完成回调已经找不到窗口，因此记一个标志让主窗口补一条可见反馈。
+        self.cancelled_by_user = bool(
+            self._cancel is not None and not self._ready and not self._failed)
         if self._cancel is not None:
             self._cancel.set()
         super().reject()
