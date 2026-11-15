@@ -29,7 +29,7 @@ import uuid
 from urllib.parse import urlsplit
 
 # 本地模型缓存目录（用户目录下，不写入项目）
-from subprocess_util import pip_cmd, pip_process, run_quiet
+from subprocess_util import pip_cmd, pip_env, pip_process, run_quiet
 
 MODEL_ROOT = os.path.join(os.path.expanduser("~"), ".cache", "trans_asr", "models")
 
@@ -310,14 +310,14 @@ def check_dependencies():
     return True, ""
 
 
-# 依次尝试的 pip 源，与 subprocess_util.PIP_INDEXES 保持同一顺序：腾讯云
-# 镜像首选（国内同步快、稳定），PyPI 官方兜底，最后才用用户 pip.ini 的
-# 默认配置和清华镜像。阿里云镜像频繁返回 403，已从所有安装链路移除。
+# 依次尝试的 pip 源，与 subprocess_util.PIP_INDEXES 完全一致：腾讯云镜像
+# 首选（国内同步快、稳定），PyPI 官方兜底，华为云镜像作为第三个独立兜底。
+# 不再回落到「用户 pip.ini 的默认配置」：实测该配置常指向已 403 的清华源，
+# 让最后一次错误日志全是失效镜像；也不再显式尝试清华。
 _PIP_INDEXES = (
     ("腾讯云镜像", ("-i", "https://mirrors.cloud.tencent.com/pypi/simple/")),
-    ("PyPI 官方", ("-i", "https://pypi.org/simple")),
-    ("默认配置", ()),
-    ("清华镜像", ("-i", "https://pypi.tuna.tsinghua.edu.cn/simple/")),
+    ("PyPI 官方", ("-i", "https://pypi.org/simple/")),
+    ("华为云镜像", ("-i", "https://repo.huaweicloud.com/repository/pypi/simple/")),
 )
 
 _PIP_PACKAGES = ("faster-whisper>=1.0.0", "zhconv>=1.4.3")
@@ -334,8 +334,8 @@ def _run_pip(extra_args, progress_cb=None):
     try:
         # 看门狗超时会 kill 子进程，readline() 随即返回空串，不会永久卡住
         with pip_process(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True) as proc:
+                cmd, env=pip_env(), stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True) as proc:
             tail = []
             while True:
                 line = proc.stdout.readline()
@@ -367,12 +367,13 @@ def install_dependencies(progress_cb=None):
         if ok:
             return True, f"语音识别组件安装成功（{label}）"
     manual = (
-        "安装失败（已依次尝试腾讯云 / PyPI 官方 / 本机默认 / 清华镜像）。\n\n"
-        "可在命令行手动安装（推荐腾讯云镜像）：\n"
+        "安装失败（已依次尝试腾讯云 / PyPI 官方 / 华为云镜像，"
+        "本机 pip 全局配置已自动忽略）。\n\n"
+        "源码版可在命令行手动安装（推荐腾讯云镜像）：\n"
         "  pip install faster-whisper "
         "-i https://mirrors.cloud.tencent.com/pypi/simple/\n"
         "若仍报 403，换官方源：\n"
-        "  pip install faster-whisper -i https://pypi.org/simple\n\n"
+        "  pip install faster-whisper -i https://pypi.org/simple/\n\n"
         f"最后一次错误输出：\n{last_tail}"
     )
     return False, manual

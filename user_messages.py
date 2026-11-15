@@ -8,16 +8,28 @@
 """
 
 
-def friendly_install_error(msg):
-    """把 pip 原始英文日志压成一句中文可操作提示。"""
+def friendly_install_error(msg, engine=None):
+    """把 pip 原始英文日志压成一句中文可操作提示。
+
+    ``engine`` 是本次正在安装的 OCR 引擎：装的就是 windows（winrt）时不能再
+    把「改用 Windows 自带 OCR」当退路，否则用户被支使回刚失败的那条链路。
+    """
     low = str(msg or '').lower()
-    # 国内镜像常见 403（限流 / 同步未完成）。安装链路已自动换源重试，
-    # 这里要说明「已经换过源」而不是笼统地让用户检查网络。
+    # 403 最常见的原因是本机 pip.ini 把全局源设成了失效镜像（清华源
+    # /simple/easyocr/ 实测直接 403）。安装链路已隔离这份配置并换用其它源
+    # 重试（首选腾讯云镜像）；能走到这句说明全部源都失败了，要如实说结论
+    # 并给出退路，别让用户以为还在自动恢复中。
     if ('403' in low or 'forbidden' in low
             or 'http error 403' in low):
-        return ("下载源返回 403（镜像限流或同步异常），已自动换用其它源重试"
-                "（首选腾讯云镜像）；若仍失败，请点「重试安装」，或按状态文字"
-                "悬停提示里的命令改用腾讯云镜像 / PyPI 官方源手动安装。")
+        base = ("下载源返回 403（镜像限流或本机 pip 全局配置失效）；已忽略失效"
+                "配置并自动换用其它源重试（首选腾讯云镜像），但本次全部源都"
+                "失败了。请点「重试安装」")
+        if engine == 'windows':
+            return (base + "或稍后再试；这次装的就是 Windows 自带 OCR 所需的 "
+                    "winrt 组件，请检查网络后重试，"
+                    "把鼠标移到状态文字上可看各源失败原因。")
+        return (base + "；装不上也能在设置页改用「Windows 系统自带」OCR"
+                "（无需下载模型），把鼠标移到状态文字上可看各源失败原因。")
     if 'timed out' in low or 'timeout' in low or 'read timed out' in low:
         return "安装超时，通常是网络不稳定。请检查网络后点「重试安装」。"
     if 'no space left' in low or 'not enough space' in low or 'disk full' in low:

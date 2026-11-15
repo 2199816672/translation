@@ -19,7 +19,7 @@
 
 from __future__ import annotations
 
-from subprocess_util import (CANCELLED_TEXT, pip_cmd, pip_process,
+from subprocess_util import (CANCELLED_TEXT, pip_cmd, pip_env, pip_process,
                              run_quiet)
 
 import importlib.util
@@ -76,12 +76,12 @@ def install_loopback_support(progress_cb=None, cancel=None, packages=None):
     """
     pkgs = tuple(packages or ('soundcard',))
     label = '内录组件' if pkgs == ('soundcard',) else '音频采集组件'
-    # 与 subprocess_util.PIP_INDEXES 一致：腾讯云镜像首选，阿里云频繁 403
-    # 已移除；PyPI 官方兜底，清华镜像最后。
+    # 与 subprocess_util.PIP_INDEXES 一致：腾讯云镜像首选，PyPI 官方兜底，
+    # 华为云镜像第三；清华 / 阿里云等失效源全部移除，并隔离本机 pip.ini。
     mirrors = (
         'https://mirrors.cloud.tencent.com/pypi/simple/',
-        'https://pypi.org/simple',
-        'https://pypi.tuna.tsinghua.edu.cn/simple',
+        'https://pypi.org/simple/',
+        'https://repo.huaweicloud.com/repository/pypi/simple/',
     )
     last = ''
     for index in mirrors:
@@ -99,7 +99,7 @@ def install_loopback_support(progress_cb=None, cancel=None, packages=None):
             # 用可取消的进程包装替代 run_quiet：后者一旦开始等 180 秒超时，
             # 用户点「取消」也毫无反应。
             with pip_process(
-                    cmd, timeout=180, cancel=cancel,
+                    cmd, timeout=180, cancel=cancel, env=pip_env(),
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True) as proc:
                 output = proc.stdout.read() or ''
@@ -114,7 +114,8 @@ def install_loopback_support(progress_cb=None, cancel=None, packages=None):
                 return False, CANCELLED_TEXT
             last = str(e)
     return False, (f'自动安装失败：{last}\n'
-                   f'可手动执行 pip install {" ".join(pkgs)}')
+                   f'源码版可手动执行 pip install {" ".join(pkgs)} '
+                   '-i https://mirrors.cloud.tencent.com/pypi/simple/')
 
 
 def _is_mix_name(name):

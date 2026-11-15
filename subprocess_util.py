@@ -138,15 +138,45 @@ def pip_cmd(packages, extra_args=()):
     return [sys.executable, "-m", "pip", "install"] + list(extra_args) + args, ""
 
 
-# 显式 ``-i`` 能覆盖用户 pip.ini 里配置的默认源。国内镜像偶发 403 /
-# 同步延迟，只走单源会让「点一次安装」变成必然失败。腾讯云 PyPI 镜像同步
-# 快、国内访问稳定（实测 /simple/easyocr/ 200），作为首选；PyPI 官方兜底，
-# 最后回落到用户自己的配置。阿里云镜像频繁 403，已从全部安装链路移除。
+# 显式 ``-i`` 能覆盖用户 pip.ini 的 index-url，但「系统默认源」那一跳会
+# 完整读回本机配置：实测不少机器把全局源设成清华，而清华
+# /simple/easyocr/ 现在直接 403，于是用户看到的「最后一次错误输出」全是
+# 失效镜像，还以为程序一直在用坏源。这里只列明确、实测可用的镜像，
+# 全部带 ``-i``，并由 :func:`pip_env` 隔离本机失效的 pip 配置。
+# 腾讯云同步快、国内稳定（实测 /simple/easyocr/ 200）为首选；PyPI 官方
+# 兜底；华为云镜像同为国内可达（实测 200），作为第三个独立兜底。
+# 阿里云与清华镜像均已从全部安装链路移除。
 PIP_INDEXES = (
     ("腾讯云镜像", ("-i", "https://mirrors.cloud.tencent.com/pypi/simple/")),
-    ("PyPI 官方", ("-i", "https://pypi.org/simple")),
-    ("系统默认源", ()),
+    ("PyPI 官方", ("-i", "https://pypi.org/simple/")),
+    ("华为云镜像", ("-i", "https://repo.huaweicloud.com/repository/pypi/simple/")),
 )
+
+
+def pip_env():
+    """给 pip 子进程用的环境变量：隔离本机失效的 pip.ini / pip.conf。
+
+    ``-i`` 只覆盖 index-url，配置里的 extra-index-url / no-index 仍会把失效
+    源掺进解析；用户自己配的 PIP_INDEX_URL 环境变量也可能捣乱。这里把配置
+    文件指向空设备、清掉会改源的几个变量，但**保留**代理 / 证书 / 缓存等
+    环境变量，需要走代理的用户不受影响。
+    """
+    env = os.environ.copy()
+    env["PIP_CONFIG_FILE"] = os.devnull
+    for key in ("PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL",
+                "PIP_NO_INDEX", "PIP_FIND_LINKS"):
+        env.pop(key, None)
+    return env
+
+
+def _failure_line(tail):
+    """从 pip 尾部日志里挑最有信息的一行，别把进度条当失败原因。"""
+    for line in reversed(tail or []):
+        low = line.lower()
+        if ('error' in low or 'failed' in low or '403' in low
+                or 'timed out' in low or 'no matching' in low):
+            return line.strip()[:180]
+    return (tail[-1].strip()[:180] if tail else "无输出")
 
 
 def pip_install_with_mirrors(packages, on_progress=None, cancel=None,
@@ -155,10 +185,11 @@ def pip_install_with_mirrors(packages, on_progress=None, cancel=None,
                              timeout=PIP_TIMEOUT):
     """依次用多个 pip 源安装组件，返回 ``(ok, message)``。
 
-    * 每个源显式带 ``-i``（「系统默认源」除外），避开失效的全局镜像；
-    * ``--retries/--timeout`` 让坏源快速失败，不在 403 上干等；
+    * 每个源都显式带 ``-i``，并通过 ``pip_env()`` 忽略本机失效镜像配置；
+    * ``--retries/--timeout`` 放宽到能下完 torch 这类大依赖，也不会干等；
     * ``cancel`` 置位立即收手，不会再尝试下一个源；
-    * 全部失败返回中文可操作提示 + 最后一次原始日志，UI 把日志放 tooltip。
+    * 全部失败时给出「每个源各自为什么失败」的摘要，而不是只把最后一次
+      （常常来自用户 pip.ini 的 403）甩给用户；UI 把完整日志放 tooltip。
     """
     import subprocess
     if cancel is not None and cancel.is_set():
@@ -169,8 +200,10 @@ def pip_install_with_mirrors(packages, on_progress=None, cancel=None,
         return False, hint
     indexes = tuple(indexes if indexes is not None else PIP_INDEXES)
     base_args = list(extra_args) if extra_args else [
-        '--retries', '2', '--timeout', '30']
+        '--retries', '3', '--timeout', '60']
     last = ""
+    failures = []
+    env = pip_env()
     total = len(indexes)
     for i, (name, extra) in enumerate(indexes, 1):
         if cancel is not None and cancel.is_set():
@@ -185,7 +218,7 @@ def pip_install_with_mirrors(packages, on_progress=None, cancel=None,
             return False, hint
         try:
             with pip_process(cmd, cancel=cancel, timeout=timeout,
-                             stdout=subprocess.PIPE,
+                             env=env, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True) as proc:
                 tail = []
                 while True:
@@ -204,18 +237,26 @@ def pip_install_with_mirrors(packages, on_progress=None, cancel=None,
             # 的组件显示成「已取消安装」（设置页也有同样的守卫）。
             if proc.returncode == 0:
                 return True, f"{label}安装成功（{name}）"
+            failures.append(f"  {name}：{_failure_line(tail)}")
             if cancel is not None and cancel.is_set():
                 return False, CANCELLED_TEXT
         except Exception as exc:
             last = f"执行失败: {exc}"
+            failures.append(f"  {name}：{last}")
     tried = " / ".join(name for name, _ in indexes)
     manual = " ".join(packages)
     return False, (
-        f"安装失败（已依次尝试：{tried}）。\n"
-        "可点「重试安装」再试一次；也可在命令行手动执行：\n"
+        f"安装失败（已依次尝试：{tried}，共 {total} 个源均失败）。\n"
+        "本机 pip 全局配置已自动忽略，不需要手动改 pip.ini；"
+        "请点「重试安装」再试一次。\n"
+        "安装版请勿用系统 Python 的 pip 手动安装：组件会装到别处，程序读不到。\n"
+        "源码版可在命令行手动执行：\n"
         f"  pip install {manual} "
         "-i https://mirrors.cloud.tencent.com/pypi/simple/\n"
-        f"  pip install {manual} -i https://pypi.org/simple\n\n"
+        f"  pip install {manual} -i https://pypi.org/simple/\n"
+        "装不上也不影响主流程：OCR 可先用「Windows 系统自带」方案（免下载模型，\n"
+        "若提示缺 winrt 组件再点「安装 winrt」），其它组件稍后重试。\n\n"
+        "各源失败摘要：\n" + "\n".join(failures) + "\n\n"
         f"最后一次错误输出：\n{last}")
 
 

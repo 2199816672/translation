@@ -1438,11 +1438,93 @@ class SettingsPage(QWidget):
 
     # ── OCR 本地模型（手动下载保底）─────────────────────────
 
+    def _reload_ocr_model_combo(self, select=None):
+        """重建「本地模型」下拉：导入后新目录立即出现，选中即切换。
+
+        和字幕页 ``_reload_models`` 同一个套路：数据来自纯函数
+        ``ocr_models.model_choices()``，导入后重新拉一遍，就不会出现
+        「导入成功了，下拉里却还是原来那几项」。
+        """
+        import ocr_models
+        from PySide6.QtCore import Qt
+        combo = getattr(self, 'ocr_model_combo', None)
+        if combo is None:
+            return []
+        choices = ocr_models.model_choices()
+        target = (select if select is not None
+                  else ocr_models.current_choice_key())
+        target_key = ocr_models.choice_key(target)
+        self._loading_ocr_choices = True
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            selected = 0
+            for choice in choices:
+                combo.addItem(choice['label'], choice['key'])
+                combo.setItemData(combo.count() - 1, choice['tip'],
+                                  Qt.ItemDataRole.ToolTipRole)
+                if ocr_models.choice_key(choice['key']) == target_key:
+                    selected = combo.count() - 1
+            combo.setCurrentIndex(selected)
+        finally:
+            combo.blockSignals(False)
+            self._loading_ocr_choices = False
+        return choices
+
+    def _on_ocr_model_selected(self, _index=None):
+        """切换本地模型：立即保存 + 重建识别器，不必再点「保存设置」。"""
+        import ocr_models
+        from qfluentwidgets import InfoBar, InfoBarPosition
+        if getattr(self, '_loading_ocr_choices', False):
+            return
+        key = self.ocr_model_combo.currentData()
+        if not key:
+            return
+        value = ocr_models.custom_value_for_key(key)
+        current = ocr_models.custom_model_dir()
+        if (ocr_models.choice_key(value or ocr_models.AUTO_MODEL_KEY)
+                == ocr_models.choice_key(current or ocr_models.AUTO_MODEL_KEY)):
+            return
+        if not save_user_config({ocr_models.CUSTOM_MODEL_DIR_KEY: value}):
+            ui_feedback.show_error_bar(
+                self, "切换失败", "无法写入配置文件，模型目录没有改变",
+                source="OCR 本地模型")
+            self._reload_ocr_model_combo()
+            return
+        self._cfg = load_user_config()
+        self._saved_cfg = dict(self._cfg)
+        try:
+            # 已加载的 EasyOCR Reader 绑定旧目录，不重建会继续用旧模型。
+            from ocr_recognizer import reset_ocr_instance
+            reset_ocr_instance()
+        except Exception:
+            pass
+        self.saved.emit()
+        self._after_ocr_model_change(
+            select=value or ocr_models.AUTO_MODEL_KEY)
+        # 选了空目录 / 只有残片的目录时，识别器会按自动规则回落到别的目录；
+        # 这时候不能弹「已切换成功」，否则用户以为模型已经用上了。
+        ready = (not value) or bool(ocr_models.available_languages(value))
+        if ready:
+            InfoBar.success(
+                "已切换本地模型",
+                "现在使用：" + self.ocr_model_combo.currentText()
+                + "；模型文件不会被删除或重新下载，随时可以再切回来",
+                duration=5000, position=InfoBarPosition.TOP, parent=self)
+        else:
+            ui_feedback.show_info_bar(
+                self, "已选择该目录，但暂时还不能离线识别",
+                "这个目录里还没有完整模型文件，识别仍按自动规则读取其它目录；"
+                "点「导入本地模型…」把 .pth 放进来后就会立即生效",
+                duration=7000)
+
     def _refresh_ocr_models(self):
         import ocr_models
         import ui_theme
         detect = ocr_models.detect_local_models()
-        cache = ocr_models.model_cache_info()
+        # 用户「直接指定模型目录」后，统计也必须按识别器真正读取的目录算，
+        # 否则会出现「自选目录已能用、统计却说一个模型都没有」。
+        cache = ocr_models.model_cache_info(detect['resolved_dir'])
         if detect['files']:
             # 统计与检测必须同源：识别器实际读的是 resolved_dir，而统计只看
             # 统一管理目录。模型在旧目录、统一目录只剩残留时，旧实现会同时
@@ -1482,10 +1564,19 @@ class SettingsPage(QWidget):
                 + "）：" + "、".join(split_files[:6])
                 + "\n识别器一次只能读一个目录，点「导入本地模型」把这些文件"
                   "放进统一目录后即可一并启用，不用重新下载\n")
+        if detect.get('custom_dir'):
+            custom_tip = ("当前使用你「直接指定」的模型目录；"
+                          "点「导入本地模型… → 恢复默认模型目录」可改回。\n")
+        elif detect.get('custom_configured'):
+            custom_tip = ("⚠ 你指定的模型目录里已没有可用模型，暂时回落到"
+                          "默认目录；补齐文件或改回默认即可。\n")
+        else:
+            custom_tip = ""
         self.ocr_model_label.setToolTip(
             "当前程序实际读取的模型目录（每台电脑不同，请用按钮定位）：\n"
             + detect['resolved_dir'] + "\n"
-            "目录：点「打开模型文件夹」查看，或点「复制路径」取得本机实际目录"
+            + custom_tip
+            + "目录：点「打开模型文件夹」查看，或点「复制路径」取得本机实际目录"
             "（每台电脑不同，说明里不写死路径）\n"
             "必需缺少：" + ("、".join(detect['missing']) or "无（已可离线识别）") + "\n"
             "可选补充："
@@ -1498,6 +1589,9 @@ class SettingsPage(QWidget):
         import ocr_models
         import ui_feedback
         from qfluentwidgets import InfoBar, InfoBarPosition
+        # 用户可能直接把文件拖进了模型文件夹：检测时下拉也要跟着刷新，
+        # 不然会出现「检测已就绪，下拉还显示暂无模型文件」。
+        self._reload_ocr_model_combo()
         detect = self._refresh_ocr_models()
         split_files = detect.get('split_files') or []
         if detect['ready']:
@@ -1510,11 +1604,38 @@ class SettingsPage(QWidget):
             if split_files:
                 extra += ("；另一目录还有 " + "、".join(split_files[:3])
                           + " 未被读到，点「导入本地模型」合并后即可启用")
-            InfoBar.success("模型已就绪",
-                            f"本地已有{names}模型，EasyOCR 将直接离线识别、"
-                            f"不再联网下载；{extra}",
-                            duration=6000, position=InfoBarPosition.TOP,
-                            parent=self)
+            engine = self._get_selected_engine_key()
+            try:
+                from ocr_recognizer import check_engine_available
+                engine_ready = check_engine_available(engine)
+            except Exception:
+                engine_ready = False
+            if engine != 'easy':
+                # 当前用 Windows 自带 OCR 时这些 .pth 根本不会被读取：不能
+                # 说「可直接离线识别」，也别把用户支使去装用不到的引擎。
+                ui_feedback.show_info_bar(
+                    self, "检测结果",
+                    f"本地已有{names}模型；当前使用 Windows 系统自带 OCR，"
+                    "不会读取这些 .pth 文件。想改用本地模型，请把「OCR 引擎」"
+                    f"切到 EasyOCR 并装好引擎组件。{extra}",
+                    duration=7000)
+            elif engine_ready:
+                InfoBar.success("模型已就绪",
+                                f"本地已有{names}模型，EasyOCR 引擎也已装好，"
+                                f"可直接离线识别、不再联网下载；{extra}",
+                                duration=6000, position=InfoBarPosition.TOP,
+                                parent=self)
+            else:
+                # 以前只查模型文件就宣称「将直接离线识别」，而引擎组件没装
+                # 时根本识别不了，和下面红字「未安装 EasyOCR」直接打架。
+                InfoBar.warning(
+                    "模型文件已就位，还差引擎",
+                    f"本地已有{names}模型，但 EasyOCR 引擎组件还没装好"
+                    "（模型文件 ≠ 引擎）。点「安装」只装组件、不会再下载"
+                    "模型；装不上可点「改用 Windows 自带 OCR」免下载模型使用。"
+                    + extra,
+                    duration=9000, position=InfoBarPosition.TOP,
+                    parent=self)
         else:
             # 「模型分散在两个目录」以前挂在 missing 为空的分支上，而只要
             # 不能离线识别 missing 就必然非空 —— 那句提示永远不会出现。
@@ -1532,13 +1653,48 @@ class SettingsPage(QWidget):
                 hint + "，可点「手动下载说明」查看文件名与放置目录",
                 duration=6000)
 
+    def _after_ocr_model_change(self, select=None):
+        """模型目录变化后同步刷新下拉、统计与「引擎 / 模型」组合状态。"""
+        if hasattr(self, 'ocr_model_combo'):
+            self._reload_ocr_model_combo(select=select)
+        self._refresh_ocr_models()
+        if hasattr(self, 'ocr_use_windows_btn'):
+            self._refresh_ocr_status()
+
     def _import_ocr_model(self):
+        """「导入本地模型…」入口：把选择方式收进一个菜单，按钮不增多。
+
+        用户手里的模型可能是「一个文件夹」、也可能是浏览器下载的一堆散
+        .pth 文件，还可能想直接指向已有目录而不复制几百 MB。以前只能选
+        目录，用户找不到「如何选择本地模型」的入口。
+        """
+        import ocr_models
+        from PySide6.QtGui import QCursor
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        menu.addAction("📁 选择模型文件夹（复制里面的 .pth）").triggered.connect(
+            self._import_ocr_model_dir)
+        menu.addAction("📄 选择 .pth 文件（可多选）").triggered.connect(
+            self._import_ocr_model_files)
+        menu.addSeparator()
+        menu.addAction("📌 直接指定模型目录（不复制文件）").triggered.connect(
+            self._choose_ocr_model_dir)
+        if ocr_models.custom_model_dir():
+            menu.addAction("↩ 恢复默认模型目录").triggered.connect(
+                self._reset_ocr_model_dir)
+        btn = getattr(self, '_ocr_import_btn', None)
+        pos = (btn.mapToGlobal(btn.rect().bottomLeft())
+               if btn is not None else QCursor.pos())
+        # popup 非阻塞：离屏冒烟里也不会卡在 QMenu.exec 的事件循环。
+        menu.popup(pos)
+
+    def _import_ocr_model_dir(self):
         import ocr_models
         from PySide6.QtWidgets import QFileDialog
         from qfluentwidgets import InfoBar, InfoBarPosition
         folder = QFileDialog.getExistingDirectory(
             self, "选择包含 EasyOCR 模型文件（.pth）的目录",
-            ocr_models.MODEL_ROOT)
+            ocr_models.active_model_dir())
         if not folder:
             return
         try:
@@ -1549,25 +1705,140 @@ class SettingsPage(QWidget):
                 actions=[("查看说明", self._show_ocr_manual_hint)],
                 source="OCR 模型导入")
             return
-        self._refresh_ocr_models()
+        # 源目录本身就是一套完整模型时，也把它登记进下拉：用户既能用
+        # 复制进统一目录的副本，也能一键切回原目录（不额外占空间）。
+        added = False
+        if ocr_models.has_required_models(folder):
+            added, _dirs = ocr_models.register_model_dir(folder)
+        self._after_ocr_model_change()
         InfoBar.success(
             "导入完成",
             f"模型目录现有 {count} 个文件"
-            + (f"（新增 {len(names)} 个）" if names else "，文件已就位"),
+            + (f"（新增 {len(names)} 个）" if names else "，文件已就位")
+            + ("；「本地模型」下拉已加入该目录，可随时切换" if added else ""),
             duration=4000, position=InfoBarPosition.TOP, parent=self)
+
+    def _import_ocr_model_files(self):
+        """直接多选网页下载的 .pth 文件，不必先凑成一个文件夹。"""
+        import os
+        import ocr_models
+        from PySide6.QtWidgets import QFileDialog
+        from qfluentwidgets import InfoBar, InfoBarPosition
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "选择 EasyOCR 模型文件（可多选）",
+            ocr_models.active_model_dir(),
+            "OCR 模型文件 (*.pth *.json *.yaml *.yml *.txt *.zip)")
+        if not files:
+            return
+        copied, errors = [], []
+        for path in files:
+            try:
+                _count, names = ocr_models.import_local_model(path)
+                copied.extend(names)
+            except Exception as exc:
+                errors.append(f"{os.path.basename(path)}：{exc}")
+        # 散落的 .pth 若来自同一个完整模型目录，也把它登记成下拉里的一项：
+        # 用户既能用复制进统一目录的副本，也能一键切回原来的模型目录。
+        added = False
+        parents = {os.path.dirname(os.path.abspath(p)) for p in files}
+        if len(parents) == 1:
+            folder = next(iter(parents))
+            if ocr_models.has_required_models(folder):
+                added, _dirs = ocr_models.register_model_dir(folder)
+        self._after_ocr_model_change()
+        if copied:
+            InfoBar.success(
+                "导入完成",
+                "已导入 " + "、".join(sorted(set(copied))[:6])
+                + ("；「本地模型」下拉已加入来源目录，可随时切换" if added
+                   else "，点「检测本地模型」确认状态"),
+                duration=6000, position=InfoBarPosition.TOP, parent=self)
+        if errors:
+            ui_feedback.show_error_bar(
+                self, "部分文件导入失败", "；".join(errors[:3]),
+                source="OCR 模型导入")
+
+    def _choose_ocr_model_dir(self):
+        """把用户已有的模型目录设为读取目录，不复制文件、不额外占空间。"""
+        import ocr_models
+        from PySide6.QtWidgets import QFileDialog
+        from qfluentwidgets import InfoBar, InfoBarPosition
+        folder = QFileDialog.getExistingDirectory(
+            self, "直接指定已有的 EasyOCR 模型目录（不复制文件）",
+            ocr_models.active_model_dir())
+        if not folder:
+            return
+        if not ocr_models.has_required_models(folder):
+            need = "、".join(ocr_models.required_model_files()[:2])
+            ui_feedback.show_error_bar(
+                self, "这个目录还不能离线识别",
+                "所选目录缺少必需的模型文件（至少需要检测模型 + 一门语言模型，"
+                f"例如 {need}）。请改用「选择模型文件夹」把文件复制进统一目录，"
+                "或补齐后再指定。",
+                actions=[("查看说明", self._show_ocr_manual_hint)],
+                source="OCR 模型目录")
+            return
+        # 一次写入「当前目录 + 已登记目录」：导入后下拉里一定有这一项，
+        # 下次打开设置页或升级后仍能在下拉里切换回来。
+        _ok, dirs = ocr_models.register_model_dir(folder, save=False)
+        if not save_user_config({
+                ocr_models.CUSTOM_MODEL_DIR_KEY: folder,
+                ocr_models.KNOWN_MODEL_DIRS_KEY: dirs}):
+            ui_feedback.show_error_bar(
+                self, "保存失败", "无法写入配置文件，模型目录没有改变",
+                source="OCR 模型目录")
+            return
+        self._cfg = load_user_config()
+        self._saved_cfg = dict(self._cfg)
+        try:
+            from ocr_recognizer import reset_ocr_instance
+            reset_ocr_instance()
+        except Exception:
+            pass
+        self.saved.emit()
+        self._after_ocr_model_change(select=folder)
+        InfoBar.success(
+            "已指定模型目录",
+            "程序将直接读取这个目录里的模型（不复制文件）；"
+            "它已出现在「本地模型」下拉里并设为当前项，随时可切换回来",
+            duration=6000, position=InfoBarPosition.TOP, parent=self)
+
+    def _reset_ocr_model_dir(self):
+        import ocr_models
+        if not save_user_config({ocr_models.CUSTOM_MODEL_DIR_KEY: ""}):
+            ui_feedback.show_error_bar(
+                self, "保存失败", "无法写入配置文件，模型目录没有改变",
+                source="OCR 模型目录")
+            return
+        self._cfg = load_user_config()
+        self._saved_cfg = dict(self._cfg)
+        try:
+            from ocr_recognizer import reset_ocr_instance
+            reset_ocr_instance()
+        except Exception:
+            pass
+        self.saved.emit()
+        self._after_ocr_model_change(select=ocr_models.AUTO_MODEL_KEY)
+        ui_feedback.show_info_bar(
+            self, "已恢复默认目录",
+            "现在读取默认模型文件夹；原先导入的目录仍留在「本地模型」下拉里，"
+            "随时可切回来，文件不会被删除",
+            duration=5000)
 
     def _open_ocr_model_dir(self):
         import ocr_models
         path = ocr_models.ensure_model_root()
         QDesktopServices.openUrl(QUrl.fromLocalFile(path))
-        self._refresh_ocr_models()
+        self._after_ocr_model_change()
 
     def _copy_ocr_model_path(self):
         import ocr_models
         from qfluentwidgets import InfoBar, InfoBarPosition
-        QApplication.clipboard().setText(ocr_models.MODEL_ROOT)
-        self.ocr_model_label.setToolTip(
-            "已复制路径：" + ocr_models.MODEL_ROOT)
+        # 复制「程序实际读取」的目录，而不是写死的默认目录：用户直接指定
+        # 过模型目录后，复制默认路径会让人把文件下到用不上的地方。
+        path = ocr_models.detect_local_models()['resolved_dir']
+        QApplication.clipboard().setText(path)
+        self.ocr_model_label.setToolTip("已复制路径：" + path)
         InfoBar.success("已复制", "OCR 模型目录路径已放进剪贴板",
                         duration=3000, position=InfoBarPosition.TOP,
                         parent=self)
@@ -1593,8 +1864,14 @@ class SettingsPage(QWidget):
                     "不会为没下的英文模型联网。\n"
                     "把文件放进模型文件夹后点「检测本地模型」，"
                     "识别会优先用本地文件，不再联网。\n"
-                    "若识别时提示缺少组件，还要先在上方点「安装」把 "
-                    "EasyOCR 引擎装好。\n"
+                    "如何选择本地模型：上方「本地模型」下拉会列出默认模型文件夹、"
+                    "旧版目录和导入过的每个目录，并显示文件数与可识别语言；"
+                    "点「导入本地模型…」选文件夹 / 多个 .pth，也可「直接指定模型目录」"
+                    "使用已有文件夹（不复制文件），导入后立刻出现在下拉里并自动选中，"
+                    "随时能切换回来。\n"
+                    "「模型已就绪」只说明文件齐了；模型文件 ≠ 引擎，"
+                    "还要先在上方点「安装」把 EasyOCR 引擎装好才能识别，"
+                    "装不上可点「改用 Windows 自带 OCR」直接使用。\n"
                     "目录请用「打开模型文件夹」按钮定位："
                     "每台电脑都不一样，说明里不写死路径。")
         box.setDetailedText(ocr_models.manual_download_hint())
@@ -1661,11 +1938,35 @@ class SettingsPage(QWidget):
         section.add("OCR 引擎:", self.ocr_engine_combo,
                     tip="选择文字识别引擎，切换后需保存生效")
 
+        # 与字幕页「本地模型」下拉同一交互：导入 / 指定过的模型目录立刻
+        # 出现在下拉里，选中即切换识别器读取的目录，不用再靠猜路径。
+        self.ocr_model_combo = QComboBox()
+        self.ocr_model_combo.setMinimumContentsLength(26)
+        self.ocr_model_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.ocr_model_combo.setMaxVisibleItems(12)
+        self.ocr_model_combo.currentIndexChanged.connect(
+            self._on_ocr_model_selected)
+        section.add(
+            "本地模型:", self.ocr_model_combo,
+            tip="列出默认模型文件夹、旧版目录和你导入过的每个模型目录；"
+                "点「导入本地模型…」后新目录会立刻出现在这里，选中即切换，"
+                "无需重新下载。每项显示文件数与可识别语言")
+
         section.add_caption(
             "💡 安装包只内置 Windows 系统自带 OCR：开箱即用、零下载、"
-            "零模型文件，所以打包快、体积小。\n"
-            "   EasyOCR 等其它方案按需下载（不随包分发）：选中引擎后点「安装」，"
-            "模型会自动下载；装完无需重启。\n"
+            "零模型文件，所以打包快、体积小。EasyOCR 装不上时可点"
+            "「改用 Windows 自带 OCR」，不影响截图 → 识别 → 翻译主流程。\n"
+            "   如何选择本地模型：上方「本地模型」下拉会列出默认模型文件夹、"
+            "旧版目录和导入过的每个目录，并显示文件数与可识别语言；"
+            "选中即切换识别器读取的目录，立即重建生效、无需重启。\n"
+            "   点「导入本地模型…」选文件夹 / 多个 .pth 文件复制进当前读取目录"
+            "（复制完立即生效，完整来源目录也会加进下拉），或「直接指定模型目录」"
+            "使用已有文件夹（不复制文件），指定后会立刻出现在下拉里"
+            "并自动选中，随时能切换回来。\n"
+            "   ⚠ 模型文件 ≠ 引擎：「模型已就绪」只说明文件齐了，还要装好 "
+            "EasyOCR 引擎组件才能识别；点「安装」只装组件，"
+            "不会再下载已经放好的模型。\n"
             "   安装中按钮会变成「取消安装」，可随时中断，"
             "已下载的文件下次自动续传。\n"
             "   网络不好时可点「手动下载说明」自己下模型：只识别中文只需"
@@ -1694,6 +1995,16 @@ class SettingsPage(QWidget):
         self.ocr_install_btn.setVisible(False)
         self._task_buttons['ocr'] = self.ocr_install_btn
         install_layout.addWidget(self.ocr_install_btn)
+        self.ocr_use_windows_btn = QPushButton(
+            "改用 Windows 自带 OCR", install_row)
+        self.ocr_use_windows_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.ocr_use_windows_btn.setToolTip(
+            "免下载模型：EasyOCR 引擎装不上时先切过去，"
+            "以后装好了再切回来；会立即保存生效。"
+            "若这台机器还缺 winrt 组件，切换后需再点「安装 winrt」")
+        self.ocr_use_windows_btn.clicked.connect(self._switch_to_windows_ocr)
+        self.ocr_use_windows_btn.setVisible(False)
+        install_layout.addWidget(self.ocr_use_windows_btn)
         self.ocr_progress = QProgressBar()
         self.ocr_progress.setVisible(False)
         self.ocr_progress.setTextVisible(True)
@@ -1710,7 +2021,8 @@ class SettingsPage(QWidget):
                 ("检测本地模型", self._detect_ocr_models,
                  "看看本机已有哪些 .pth 模型、还缺哪些文件"),
                 ("导入本地模型…", self._import_ocr_model,
-                 "选择手动下载的模型目录，复制进统一管理目录，不改动原文件"),
+                 "选择模型文件夹 / 多个 .pth 文件复制进模型目录，"
+                 "或直接指定已有模型目录（不复制文件）"),
                 ("打开模型文件夹", self._open_ocr_model_dir,
                  "打开模型存放目录，可直接把文件拖进去"),
                 ("复制路径", self._copy_ocr_model_path,
@@ -1719,6 +2031,8 @@ class SettingsPage(QWidget):
             btn.setProperty("kind", "ghost")
             btn.setToolTip(tip)
             btn.clicked.connect(slot)
+            if text == "导入本地模型…":
+                self._ocr_import_btn = btn
             model_lay.addWidget(btn)
         model_lay.addStretch(1)
         section.add_row(model_row)
@@ -1758,6 +2072,7 @@ class SettingsPage(QWidget):
         section.add_row(catalog_row)
 
         self.ocr_engine_combo.currentTextChanged.connect(self._on_ocr_engine_changed)
+        self._reload_ocr_model_combo()
         self._refresh_ocr_status()
         self._refresh_ocr_models()
         return section
@@ -2612,25 +2927,109 @@ class SettingsPage(QWidget):
         return OCR_ENGINE
 
     def _refresh_ocr_status(self):
+        """「引擎组件」与「模型文件」一起判定，状态不再自相矛盾。
+
+        以前这里只看 ``import easyocr``，而上面「检测本地模型」只看 .pth
+        文件：模型齐了、组件没装好时会同时出现「模型已就绪、可直接离线识别」
+        和「未安装 EasyOCR」，用户完全不知道该信哪个。
+        """
         from ocr_recognizer import check_engine_available
+        import ocr_models
         engine = self._get_selected_engine_key()
-        if check_engine_available(engine):
-            self.ocr_status_label.setText("已安装 ✓")
-            self.ocr_status_label.setStyleSheet("color: #4ade80;")
+        try:
+            available = check_engine_available(engine)
+        except Exception:
+            available = False
+        try:
+            models_ready = bool(ocr_models.detect_local_models()['ready'])
+        except Exception:
+            models_ready = False
+        # 装不上时给一条退路，别让用户卡在反复重试里；但退路文案要按这台
+        # 机器 winrt 是否真的可用，不能无条件说「零安装、开箱可用」。
+        fallback_ocr = engine == 'easy' and not available
+        self.ocr_use_windows_btn.setVisible(fallback_ocr)
+        win_ready = False
+        if fallback_ocr:
+            try:
+                win_ready = check_engine_available('windows')
+            except Exception:
+                win_ready = False
+        fallback_hint = (
+            "；装不上可点「改用 Windows 自带 OCR」直接使用（免下载模型）"
+            if win_ready else
+            "；也可切到 Windows 自带 OCR，若提示缺 winrt 再点「安装 winrt」")
+        if available:
+            if engine == 'easy' and models_ready:
+                text = ("✅ EasyOCR 引擎已安装，本地模型可离线识别"
+                        "（不会再联网下载）")
+            elif engine == 'easy':
+                text = ("✅ EasyOCR 引擎已安装；首次识别会下载模型，"
+                        "可点「导入本地模型…」改用本地文件")
+            else:
+                text = "✅ 已安装（Windows 系统自带 OCR，开箱可用、零下载）"
+            color = "#4ade80"
             self.ocr_install_btn.setVisible(False)
         elif engine == 'windows':
-            self.ocr_status_label.setText(
-                "需要安装 winrt 包，或检查系统是否已安装对应语言包")
-            self.ocr_status_label.setStyleSheet("color: #eab308;")
+            text = "需要安装 winrt 包，或检查系统是否已安装对应语言包"
+            color = "#eab308"
             self.ocr_install_btn.setVisible(True)
             self.ocr_install_btn.setText("安装 winrt")
         else:
             engine_name = SUPPORTED_OCR_ENGINES.get(engine, engine)
-            self.ocr_status_label.setText(
-                f"未安装 {engine_name}，请先安装再使用")
-            self.ocr_status_label.setStyleSheet("color: #e5635f;")
+            if models_ready:
+                text = ("⚠ 本地模型文件已就位，但还差 EasyOCR 引擎组件"
+                        "（模型文件 ≠ 引擎）：点「安装」只装组件、不会再下载"
+                        "模型" + fallback_hint)
+                color = "#eab308"
+            else:
+                text = (f"未安装 {engine_name}，请先安装再使用"
+                        + fallback_hint)
+                color = "#e5635f"
             self.ocr_install_btn.setVisible(True)
             self.ocr_install_btn.setText("安装")
+        self.ocr_status_label.setText(text)
+        self.ocr_status_label.setStyleSheet(f"color: {color};")
+
+    def _switch_to_windows_ocr(self):
+        """一键切到免模型下载的 Windows OCR，立即保存生效（不用再点保存设置）。"""
+        from qfluentwidgets import InfoBar, InfoBarPosition
+        name = SUPPORTED_OCR_ENGINES.get('windows', '')
+        if not name:
+            return
+        # 保存失败时不能改 UI、不能清实例、更不能弹「已切换」：配置里仍是
+        # 旧引擎，重启后会退回去，界面却说已经切好。
+        if not save_user_config({"ocr_engine": "windows"}):
+            ui_feedback.show_error_bar(
+                self, "切换失败", "无法写入配置文件，OCR 引擎仍是原来的设置",
+                source="OCR 引擎切换")
+            return
+        self.ocr_engine_combo.setCurrentText(name)
+        try:
+            from ocr_recognizer import reset_ocr_instance
+            reset_ocr_instance()
+        except Exception:
+            pass
+        self._cfg = load_user_config()
+        self._saved_cfg = dict(self._cfg)
+        self.saved.emit()
+        self._refresh_ocr_status()
+        try:
+            from ocr_recognizer import check_engine_available
+            win_ready = check_engine_available('windows')
+        except Exception:
+            win_ready = False
+        if win_ready:
+            InfoBar.success(
+                "已切换 OCR 引擎",
+                "现在使用 Windows 系统自带 OCR：免下载模型、开箱可用；"
+                "以后装好 EasyOCR 再切回来即可，本地模型文件不会被删除",
+                duration=6000, position=InfoBarPosition.TOP, parent=self)
+        else:
+            ui_feedback.show_info_bar(
+                self, "已切换到 Windows 自带 OCR，还差一个组件",
+                "引擎配置已保存，但这台机器还没装 winrt 组件；"
+                "请点「安装 winrt」后再开始截图识别。本地模型文件不会被删除",
+                duration=7000)
 
     def _on_ocr_engine_changed(self, _text):
         self._refresh_ocr_status()
@@ -2640,6 +3039,7 @@ class SettingsPage(QWidget):
         engine = self._get_selected_engine_key()
         # 安装中锁定引擎下拉：切换会刷新状态并把「取消安装」按钮覆盖掉
         self.ocr_engine_combo.setEnabled(False)
+        self.ocr_use_windows_btn.setVisible(False)
         self.ocr_status_label.setText("正在安装，请稍候…（可点左侧按钮取消）")
         self.ocr_status_label.setToolTip("")
         self.ocr_status_label.setStyleSheet("color: #eab308;")
@@ -2704,6 +3104,8 @@ class SettingsPage(QWidget):
                 "已取消安装 · 可重新点按钮安装，已下载的文件会自动续传")
             self.ocr_status_label.setToolTip("")
             self.ocr_status_label.setStyleSheet("color: #eab308;")
+            self.ocr_use_windows_btn.setVisible(
+                self._get_selected_engine_key() == 'easy')
             InfoBar.info("已取消", "OCR 组件安装已中断，可随时继续",
                          duration=3000, position=InfoBarPosition.TOP,
                          parent=self)
@@ -2716,15 +3118,20 @@ class SettingsPage(QWidget):
         else:
             # pip 英文原始日志不要再直接抛给桌面用户：主界面只留一句
             # 中文可操作提示，原始日志放进 tooltip / 悬停可见。
-            friendly = friendly_install_error(msg)
+            friendly = friendly_install_error(
+                msg, engine=self._get_selected_engine_key())
             self.ocr_status_label.setText(friendly)
             self.ocr_status_label.setToolTip(str(msg)[:2000])
             self.ocr_status_label.setStyleSheet("color: #e5635f;")
             # 错误不能只留一行会被冲掉的状态：给「重试」和「复制诊断」
-            # 两个可点动作，并留足 10 秒阅读时间。
+            # 两个可点动作；EasyOCR 反复装不上时再给一条零安装退路。
+            actions = [("重试", lambda: self.ocr_install_btn.click())]
+            if self._get_selected_engine_key() == 'easy':
+                self.ocr_use_windows_btn.setVisible(True)
+                actions.append(("改用 Windows OCR",
+                                self._switch_to_windows_ocr))
             ui_feedback.show_error_bar(
-                self, "安装失败", friendly,
-                actions=[("重试", lambda: self.ocr_install_btn.click())],
+                self, "安装失败", friendly, actions=actions,
                 detail=str(msg)[:4000], source="OCR 组件安装")
 
     def _save(self):

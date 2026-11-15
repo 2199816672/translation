@@ -2068,6 +2068,11 @@ class MainWindow(FluentWindow):
         from hotkeys import get_hotkeys
         old_hotkeys = get_hotkeys(self.cfg)
         old_engine = self.cfg.get("ocr_engine", OCR_ENGINE)
+        # 设置页切换 / 指定 / 恢复默认模型目录时只改 ocr_model_dir，引擎键
+        # 不变；但已加载的 EasyOCR Reader 绑定的是旧目录，光清模块单例不够，
+        # 主窗口这个 self.ocr 也必须重建，否则界面说「已切换」而截图翻译
+        # 仍读旧模型（文档解析走模块单例，会读到新目录，两边还不一致）。
+        old_model_dir = self.cfg.get("ocr_model_dir", "")
         self.cfg = load_user_config()
         # 设置页改了字幕音源 / 显示模式后，同步主页快捷入口与正在运行的浮层
         # 注意：回退值必须与 DEFAULT_SUBTITLE_SETTINGS 的默认值('mic')一致，
@@ -2084,6 +2089,7 @@ class MainWindow(FluentWindow):
         self.translator.set_api_type(
             self.cfg.get("translation_api", DEFAULT_TRANSLATION_API))
         new_engine = self.cfg.get("ocr_engine", OCR_ENGINE)
+        new_model_dir = self.cfg.get("ocr_model_dir", "")
         new_hotkeys = get_hotkeys(self.cfg)
         if old_hotkeys != new_hotkeys and self._hotkeys is not None:
             # 只重建本应用注册过的钩子，不碰其它模块的键盘监听
@@ -2091,7 +2097,7 @@ class MainWindow(FluentWindow):
         # 窗口内快捷键（如主页 Ctrl+Enter 翻译）由 QShortcut 注册，不归
         # HotkeyManager 管；配置一变就重建，用户不用重启程序。
         self.home.refresh_shortcuts()
-        if old_engine != new_engine:
+        if old_engine != new_engine or old_model_dir != new_model_dir:
             self._init_ocr_async()
         # 实时字幕运行中改了相关设置：引擎用的是启动时的配置快照，需停止后
         # 重新开启才生效，给出明确提示，避免用户以为改了没反应

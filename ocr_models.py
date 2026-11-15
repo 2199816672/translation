@@ -23,6 +23,16 @@ from app_paths import app_dir
 MODEL_ROOT = os.path.join(str(app_dir()), "models", "ocr")
 LEGACY_EASY_DIR = os.path.join(os.path.expanduser("~"), ".EasyOCR", "model")
 
+# 用户「直接指定模型目录」时写进 user_config.json 的键。用户数据目录里的
+# 配置在覆盖升级 / 一键升级后保留，所以自选目录也不会升级后失效。
+CUSTOM_MODEL_DIR_KEY = "ocr_model_dir"
+# 「本地模型」下拉里登记的用户模型目录（列表，升级后保留）。字幕那边把导入
+# 的模型登记进 asr_imported_models，OCR 同理：导入过的目录要能在下拉里看到、
+# 随时切回来，而不是一「恢复默认」就再也找不到。
+KNOWN_MODEL_DIRS_KEY = "ocr_model_dirs"
+AUTO_MODEL_KEY = "auto"          # 下拉「自动」项的 data（写配置时转为空串）
+_MAX_KNOWN_DIRS = 12
+
 _DETECTION_MODEL = "craft_mlt_25k.pth"
 _MODEL_SUFFIXES = (".pth", ".json", ".yaml", ".yml", ".txt", ".zip")
 
@@ -226,12 +236,58 @@ def models_complete(directory, languages=None):
                for lang in langs)
 
 
-def resolve_model_dir(languages=None, root=None, legacy=None):
+def custom_model_dir(cfg=None):
+    """用户在设置页「直接指定模型目录」选的路径；空串表示用默认目录。
+
+    只认真实存在、且至少含一个模型文件的目录。配置被手工改坏 / 目录被删时
+    自动回落默认目录，绝不让 OCR 因为指向空文件夹而整个挂掉。
+    """
+    try:
+        if cfg is None:
+            from config import load_user_config
+            cfg = load_user_config()
+        value = str((cfg or {}).get(CUSTOM_MODEL_DIR_KEY, "") or "").strip()
+    except Exception:
+        return ""
+    if not value or not os.path.isdir(value) or not _model_files(value):
+        return ""
+    return value
+
+
+def _effective_custom(custom, root=None, legacy=None):
+    """解析「自选目录」参数，且不让真实用户配置污染显式传目录的测试调用。"""
+    if custom is False:
+        return ""
+    if custom:
+        path = str(custom)
+        return path if os.path.isdir(path) and _model_files(path) else ""
+    if root is not None or legacy is not None:
+        return ""          # 测试 / 隔离调用：只认显式传进来的目录
+    return custom_model_dir()
+
+
+def active_model_dir(languages=None):
+    """「打开模型文件夹 / 导入文件 / 复制路径」应指向的目录。
+
+    必须和 ``detect_local_models()['resolved_dir']`` 同源：老用户的模型只
+    在旧版 ``~/.EasyOCR/model``、统一目录为空时，识别器读旧版目录，而
+    「打开文件夹」若指向空的统一目录，用户把 .pth 放进去会以为没生效；
+    导入目标目录也同理，放进来的文件要落在真正被读取的地方。
+    """
+    return resolve_model_dir(languages)
+
+
+def resolve_model_dir(languages=None, root=None, legacy=None, custom=None):
     """给 ``easyocr.Reader(model_storage_directory=...)`` 用的目录。
 
-    优先级：用户导入目录 → 老版本默认目录 → 统一管理目录（新下载落这里）。
-    ``root`` / ``legacy`` 主要供测试与检测函数传入自定义目录。
+    优先级：用户直接指定的模型目录（无需复制文件） → 统一管理目录 →
+    老版本默认目录 → 统一管理目录（新下载落这里）。
+    ``root`` / ``legacy`` 主要供测试与检测函数传入自定义目录；显式传入时
+    不读用户配置，保证测试隔离。
     """
+    chosen = _effective_custom(custom, root, legacy)
+    if chosen and has_required_models(chosen, languages):
+        return chosen
     root = str(root or MODEL_ROOT)
     legacy = str(legacy or LEGACY_EASY_DIR)
     if has_required_models(root, languages):
@@ -258,32 +314,210 @@ def available_languages(directory, languages=None):
             if found.get(_LANG_MODELS.get(lang, f"{lang}_g2.pth"))]
 
 
-def reader_languages(languages=None, root=None, legacy=None):
+def reader_languages(languages=None, root=None, legacy=None, custom=None):
     """应传给 ``easyocr.Reader`` 的语言列表：只保留本地已齐备的语言。
 
     返回空列表表示本地一门语言都没有，调用方应回落到完整语言列表并允许
     easyocr 自动下载（首次在线安装路径不能断）。
     """
     langs = list(languages or ['ch_sim', 'en'])
-    directory = resolve_model_dir(langs, root=root, legacy=legacy)
+    directory = resolve_model_dir(langs, root=root, legacy=legacy,
+                                  custom=custom)
     return available_languages(directory, langs)
 
 
-def detect_local_models(languages=None, root=None, legacy=None):
+# ── 「本地模型」下拉：与字幕页「导入后立刻出现在下拉里」保持同一交互 ──
+
+def _norm_dir(path):
+    """Windows 路径大小写不敏感：比较目录时统一 abspath + normcase。"""
+    return os.path.normcase(os.path.abspath(str(path or '')))
+
+
+def choice_key(value):
+    """把「自动 / 目录路径」归一化成下拉项可比较的 key。"""
+    if not value or str(value) == AUTO_MODEL_KEY:
+        return AUTO_MODEL_KEY
+    return _norm_dir(value)
+
+
+def custom_value_for_key(key):
+    """下拉项 → ``ocr_model_dir`` 配置值；自动项写空串清除自定义目录。"""
+    if not key or str(key) == AUTO_MODEL_KEY:
+        return ""
+    return os.path.abspath(str(key))
+
+
+def known_model_dirs(cfg=None):
+    """用户导入 / 指定过的模型目录（去重、保序、绝对路径）。
+
+    配置里可能是旧版留下的单个字符串，也可能是被手工改坏的任意类型；这里
+    一律安全收敛成列表，绝不让设置页构造失败。
+    """
+    try:
+        if cfg is None:
+            from config import load_user_config
+            cfg = load_user_config()
+        raw = (cfg or {}).get(KNOWN_MODEL_DIRS_KEY) or []
+    except Exception:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    result, seen = [], set()
+    for item in raw:
+        text = str(item or '').strip()
+        if not text:
+            continue
+        key = _norm_dir(text)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(os.path.abspath(text))
+    return result[:_MAX_KNOWN_DIRS]
+
+
+def register_model_dir(path, cfg=None, save=True):
+    """把导入 / 指定的目录登记进「本地模型」下拉，返回 ``(ok, dirs)``。
+
+    默认目录 / 旧版目录本来就是固定项，不重复登记；最近导入的排最前。
+    ``save=False`` 供测试与只读调用使用，不写用户配置。
+    """
+    raw = str(path or '').strip()
+    target = os.path.abspath(raw) if raw else ''
+    dirs = known_model_dirs(cfg)
+    if not raw or not os.path.isdir(target):
+        return False, dirs
+    if _norm_dir(target) in (_norm_dir(MODEL_ROOT), _norm_dir(LEGACY_EASY_DIR)):
+        return True, dirs
+    dirs = [d for d in dirs if _norm_dir(d) != _norm_dir(target)]
+    dirs.insert(0, target)
+    dirs = dirs[:_MAX_KNOWN_DIRS]
+    if save:
+        try:
+            from config import save_user_config
+            if not save_user_config({KNOWN_MODEL_DIRS_KEY: dirs}):
+                return False, dirs
+        except Exception:
+            return False, dirs
+    return True, dirs
+
+
+def current_choice_key(cfg=None):
+    """当前应选中哪个下拉项：有效自定义目录，或「自动」。"""
+    return custom_model_dir(cfg) or AUTO_MODEL_KEY
+
+
+def _model_choice(key, directory, title, source, languages):
+    """单个下拉项：标题、文件数、能识别的语言、是否就绪、动态路径提示。"""
+    directory = os.path.abspath(str(directory))
+    exists = os.path.isdir(directory)
+    files = _model_files(directory) if exists else {}
+    usable = available_languages(directory, languages) if exists else []
+    if not exists:
+        tail = "⚠ 目录已失效"
+    elif usable:
+        tail = (f"{len(files)} 个文件 · "
+                + "、".join(language_label(lang) for lang in usable) + " ✓")
+    elif files:
+        tail = f"{len(files)} 个文件 · ⚠ 不完整"
+    else:
+        tail = "暂无模型文件"
+    tip = (title + "\n读取目录（本机实际路径，请用按钮定位）：" + directory
+           + f"\n模型文件 {len(files)} 个 · "
+           + (("可离线识别：" + "、".join(language_label(lang) for lang in usable))
+              if usable else "尚不能离线识别（缺必需文件）"))
+    return {
+        'key': key, 'dir': directory, 'label': f"{title} · {tail}",
+        'tip': tip, 'source': source, 'ready': bool(usable),
+        'exists': exists, 'languages': usable, 'files': len(files),
+    }
+
+
+def model_choices(cfg=None, languages=None, root=None, legacy=None):
+    """「本地模型」下拉的数据源（纯函数，与字幕页 ``_reload_models`` 同理）。
+
+    固定项：自动（按优先级解析出的目录）、默认模型文件夹、旧版目录；
+    动态项：用户导入 / 直接指定过的目录。每项都能直接作为
+    ``ocr_model_dir`` 写入，选中即切换识别器读取的模型目录。
+    ``root`` / ``legacy`` 显式传入时不读用户配置，方便测试隔离。
+    """
+    if cfg is None:
+        if root is None and legacy is None:
+            try:
+                from config import load_user_config
+                cfg = load_user_config()
+            except Exception:
+                cfg = {}
+        else:
+            cfg = {}
+    cfg = cfg or {}
+    langs = list(languages or ['ch_sim', 'en'])
+    root = os.path.abspath(str(root or MODEL_ROOT))
+    legacy = os.path.abspath(str(legacy or LEGACY_EASY_DIR))
+    auto_dir = resolve_model_dir(langs, root=root, legacy=legacy,
+                                 custom=False)
+    # 默认目录为空、模型在旧版目录时，说明「自动」为什么会显示模型已就绪，
+    # 免得用户以为自动项和下面「默认模型文件夹」自相矛盾。
+    auto_title = ("自动（推荐）" if _norm_dir(auto_dir) == _norm_dir(root)
+                  else "自动（推荐 · 当前读到旧版目录）")
+    entries = [
+        _model_choice(AUTO_MODEL_KEY, auto_dir, auto_title, "auto", langs),
+        _model_choice(root, root, "默认模型文件夹", "default", langs),
+    ]
+    if _model_files(legacy):
+        entries.append(
+            _model_choice(legacy, legacy, "旧版目录（.EasyOCR）", "legacy",
+                          langs))
+    for directory in known_model_dirs(cfg):
+        norm = _norm_dir(directory)
+        if norm in (_norm_dir(root), _norm_dir(legacy)):
+            continue       # 固定项已覆盖，不重复登记
+        if any(choice_key(e['key']) == norm for e in entries):
+            continue
+        entries.append(_model_choice(
+            directory, directory, "📌 " + os.path.basename(directory),
+            "imported", langs))
+    # 配置里手写的目录、或上一版保存的自定义目录，即使没登记过也要出现，
+    # 否则下拉会把用户当前正在用的模型「藏起来」。
+    custom = custom_model_dir(cfg)
+    if custom and not any(choice_key(e['key']) == choice_key(custom)
+                          for e in entries):
+        entries.append(_model_choice(
+            custom, custom, "📌 " + os.path.basename(custom),
+            "current", langs))
+    current = choice_key(current_choice_key(cfg))
+    for entry in entries:
+        entry['current'] = choice_key(entry['key']) == current
+    return entries
+
+
+def detect_local_models(languages=None, root=None, legacy=None, custom=None):
     """只读检测：现在有哪些模型文件、必需还缺哪些、能识别哪些语言。
 
     ``missing`` 只列「阻止离线识别」的必需文件（检测模型 + 至少一门语言
     模型）；已经能识别中文时，缺的英文模型放进 ``optional_missing``，
     UI 不再误报「还缺 1 个模型文件」而让用户以为白下了。
+    用户「直接指定模型目录」后，统计、缺件判定与识别器读取目录必须同源于
+    那个目录，否则会出现「自选目录已能用，界面却按默认目录报缺文件」。
     """
+    configured = _effective_custom(custom, root, legacy)
     root = str(root or MODEL_ROOT)
     legacy = str(legacy or LEGACY_EASY_DIR)
-    own = _model_files(root)
+    resolved = resolve_model_dir(languages, root=root, legacy=legacy,
+                                 custom=configured if configured else False)
+    custom_active = bool(
+        configured and
+        os.path.normcase(os.path.abspath(resolved))
+        == os.path.normcase(os.path.abspath(configured)))
+    own = _model_files(resolved) if custom_active else _model_files(root)
     old = _model_files(legacy)
-    merged = dict(old)
-    merged.update(own)          # 统一管理目录优先
+    # 用户明确指定了目录时，统计只反映那个目录：把默认/旧版目录里的文件
+    # 一起算进来会出现「共 3 个文件，占用…」却和自选目录内容对不上。
+    merged = dict(own) if custom_active else dict(old)
+    if not custom_active:
+        merged.update(own)      # 统一管理目录优先
     needed = required_model_files(languages)
-    resolved = resolve_model_dir(languages, root=root, legacy=legacy)
     # 缺什么按「识别器真正会读的那个目录」算：模型分散在两处时不能报
     # 「一个都不缺」却又判定无法离线识别。
     resolved_files = _model_files(resolved)
@@ -304,7 +538,11 @@ def detect_local_models(languages=None, root=None, legacy=None):
     # 有效模型（典型：旧版 ~/.EasyOCR/model 里留了 en_g2.pth），它会被静默
     # 忽略，用户却以为自己下过了。这里显式标记，让设置页引导合并而不是
     # 显示「可选再补」把人支使去重下。
-    if (os.path.normcase(os.path.abspath(root))
+    if custom_active:
+        # 用户明确指定了目录：其它目录里的同类文件不该再提示「未合并」，
+        # 否则会误导他去把默认目录也塞满一份。
+        other_dir, other_files = '', {}
+    elif (os.path.normcase(os.path.abspath(root))
             == os.path.normcase(os.path.abspath(legacy))):
         other_dir, other_files = '', {}
     elif resolved == root:
@@ -324,10 +562,13 @@ def detect_local_models(languages=None, root=None, legacy=None):
         'ready': bool(usable),
         'can_use_offline': bool(usable),
         'resolved_dir': resolved,
+        'custom_dir': resolved if custom_active else '',
+        'custom_configured': configured,
         'other_dir': other_dir,
         'split_dirs': bool(split_files),
         'split_files': split_files,
-        'total_bytes': _total_bytes(root) + _total_bytes(legacy),
+        'total_bytes': (_total_bytes(resolved) if custom_active
+                        else _total_bytes(root) + _total_bytes(legacy)),
     }
 
 
@@ -411,7 +652,9 @@ def import_local_model(source, root=None):
     ``(模型目录现有文件数, 本次复制的文件名列表)``；目录里一个模型文件
     都没有时抛中文异常。
     """
-    root = str(root or MODEL_ROOT)
+    # 用户「直接指定模型目录」后，导入的新文件也要进那个目录，否则导入完
+    # 检测仍按自选目录算，会看起来像「导入了却没生效」。
+    root = str(root or active_model_dir())
     # Windows 路径大小写不敏感，但 abspath 不归一化大小写：用户选到
     # 「C:\Models」而 root 是「c:\models」时，字符串比较会误判成两个目录，
     # copy2 随后抛英文 SameFileError。统一 normcase 才能给出中文提示。
@@ -504,7 +747,17 @@ def manual_download_hint(languages=None):
         "放到哪里：点设置页「打开模型文件夹」直接定位，"
         "或点「复制路径」把目录粘进下载工具。\n"
         "每台电脑的目录都不一样，这里不写死路径，以按钮打开的为准。\n"
-        "当前状态：" + status + "\n"
+        "如何选择本地模型：设置页「本地模型」下拉会列出默认模型文件夹、"
+        "旧版目录和你导入过的每一个模型目录，并显示各自的文件数与可识别语言；"
+        "选中即切换识别器读取的目录，立即生效、无需重启。\n"
+        "点「导入本地模型…」选文件夹 / 多个 .pth 文件复制进当前读取目录"
+        "（复制完就生效，来源目录若本身是一套完整模型也会加进下拉供切换）；"
+        "也可「直接指定模型目录」使用已有文件夹（不复制、不额外占空间），"
+        "指定后该目录会立刻出现在下拉里并自动选中；"
+        "菜单里的「恢复默认模型目录」只切回默认，不会丢已导入的目录。\n"
+        + ("当前使用的是你指定的模型目录。\n" if detect.get('custom_dir')
+           else "当前使用默认模型目录。\n")
+        + "当前状态：" + status + "\n"
         "必需缺少：" + missing + "\n"
         "最少必需（只识别中文，2 个文件就够）：\n"
         f"  · {_DETECTION_MODEL}（文字检测）\n"
@@ -549,6 +802,7 @@ def engine_catalog_text():
 
 
 def ensure_model_root():
-    """打开模型目录前先创建，返回绝对路径。"""
-    Path(MODEL_ROOT).mkdir(parents=True, exist_ok=True)
-    return MODEL_ROOT
+    """打开模型目录前先创建，返回绝对路径；自选目录时直接打开它。"""
+    active = active_model_dir()
+    Path(active).mkdir(parents=True, exist_ok=True)
+    return active
