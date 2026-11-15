@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
 
 from config import SCREENSHOT_DIR
 from text_segment import (
-    blocks_to_text, flatten_text, group_blocks, normalize_groups,
+    blocks_to_text, flatten_text, group_blocks_fine, normalize_groups,
     wrap_by_width, wrap_sentences,
 )
 from theme import Palette
@@ -523,7 +523,7 @@ class LiveTranslateWindow(QWidget):
             if blocks:
                 img = QImage(path)
                 groups = normalize_groups(
-                    group_blocks(blocks), img.width(), img.height())
+                    group_blocks_fine(blocks), img.width(), img.height())
             if not groups:
                 # 无位置信息、或行块被分组全部过滤时，整段压平翻译。
                 # 否则 results 为空会给出空译文（旧代码靠回填原文掩盖了它）。
@@ -694,14 +694,14 @@ class LiveTranslateWindow(QWidget):
         painter.end()
 
     def _draw_blocks(self, painter):
-        """译文按【视觉段落】原位整块覆盖；原文对照时每块顶部附一行原文小字。
+        """译文按【视觉行】原位贴回；每块独立字号，原文对照时顶部附一行小字。
 
-        与截图覆盖层同口径：一个自然段一个底框，盖住整段原文 bbox，
-        字号从大到小自适应，译文按行距铺开。先铺全部底框再写字，
-        所有块都要画到，原文不会裸露。
+        与截图覆盖层同口径：分组已由 group_blocks_fine 拆到行级别，这里
+        每块按自己的 bbox 高度选字号，底框最多两行，不再出现盖住半个
+        窗口的大黑框，也不会被一个小标签把整屏字号压到最小。
         """
-        pad = 8
-        bleed = 3
+        pad = 6
+        bleed = 2
         W, H = self.width(), self.height()
 
         # 1) 原文 bbox → 浮层坐标
@@ -723,65 +723,59 @@ class LiveTranslateWindow(QWidget):
         src_fm = QFontMetrics(src_font)
         src_line_h = src_fm.lineSpacing()
 
-        # 2) 字号从大到小：挑第一个「所有段落都放得下」的字号
-        chosen = None
-        for size in (20, 19, 18, 17, 16, 15, 14, 13, 12, 11):
-            font.setPixelSize(size)
-            fm = QFontMetrics(font)
-            items = []
-            fits_all = True
-            for b, (left, top, w, h) in zip(self._blocks, rects):
+        # 2) 每块独立挑字号 + 原文对照首行
+        items = []
+        for b, (left, top, w, h) in zip(self._blocks, rects):
+            text = str(b.get("trans") or "").strip()
+            start = max(11, min(20, int(h * 0.8)))
+            sizes = list(range(start, 10, -1))
+            chosen = None
+            for size in sizes:
+                font.setPixelSize(size)
+                fm = QFontMetrics(font)
                 max_w = max(24, w - pad * 2)
                 lines = wrap_sentences(
-                    str(b.get("trans") or "").strip(),
-                    max_w, fm.horizontalAdvance) or [""]
-                src_lines = []
-                if self._show_source:
-                    all_src = [ln for ln in wrap_by_width(
-                        str(b.get("text") or "").strip(),
-                        max_w, src_fm.horizontalAdvance) if ln.strip()]
-                    if all_src:
-                        first = all_src[0].rstrip(" ,.")
-                        # 整段原文很长，只取首行做对照并明确标注省略
-                        src_lines = [first + ("…" if len(all_src) > 1 else "")]
-                src_h = (len(src_lines) * src_line_h
-                         + (4 if src_lines else 0))
-                need = src_h + len(lines) * fm.lineSpacing() + pad * 2
-                items.append((lines, src_lines, need, max_w))
-                if need > h:
-                    fits_all = False
-            chosen = (QFont(font), QFontMetrics(font), items)
-            if fits_all:
-                break
-        font, fm, items = chosen
-        line_h = fm.lineSpacing()
+                    text, max_w, fm.horizontalAdvance) or [""]
+                chosen = (QFont(font), QFontMetrics(font), lines, max_w)
+                if (len(lines) * fm.lineSpacing() + pad * 2
+                        <= max(h, 22) or size == sizes[-1]):
+                    break
+            src_lines = []
+            if self._show_source:
+                max_w = chosen[3]
+                all_src = [ln for ln in wrap_by_width(
+                    str(b.get("text") or "").strip(),
+                    max_w, src_fm.horizontalAdvance) if ln.strip()]
+                if all_src:
+                    first = all_src[0].rstrip(" ,.")
+                    src_lines = [first + ("…" if len(all_src) > 1 else "")]
+            items.append((chosen, src_lines))
 
-        # 3) 先铺全部底框：框高 = max(原文 bbox, 译文所需)，原文不会露出
-        heights = [min(max(h, need), max(8, H - top))
-                   for (_, top, _, h), (_, _, need, _) in zip(rects, items)]
+        # 3) 先铺全部底框：最多两行译文 + 一行原文，原文不会裸露
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(8, 8, 12, 238))
-        for (left, top, w, h), draw_h in zip(rects, heights):
-            painter.drawRoundedRect(QRectF(left, top, w, draw_h), 5, 5)
-
-        # 4) 逐块写文字：所有块都画，不 break
-        for (left, top, w, h), (lines, src_lines, need, max_w), draw_h in zip(
-                rects, items, heights):
-            src_h = (len(src_lines) * src_line_h
-                     + (4 if src_lines else 0))
-            room = draw_h - pad * 2 - src_h
-            keep = (len(lines) if need <= draw_h else
-                    max(1, int(room // line_h)))
-            draw = list(lines[:keep])
-            if len(lines) > keep and draw:
+        painter.setBrush(QColor(12, 14, 20, 226))
+        boxes = []
+        for (left, top, w, h), ((fnt, fm, lines, max_w), src_lines) in zip(
+                rects, items):
+            line_h = fm.lineSpacing()
+            draw = list(lines[:2])
+            if len(lines) > 2 and draw:
                 last = draw[-1]
                 while last and fm.horizontalAdvance(last + "…") > max_w:
                     last = last[:-1]
                 draw[-1] = (last.rstrip("，,、 ") + "…") if last else "…"
-            # 行距按可用高度铺开 + 整体居中，避免大框里空一大片
-            step = int(min(line_h * 2.0,
-                           max(line_h, room // max(1, len(draw)))))
-            used = len(draw) * step
+            src_h = len(src_lines) * src_line_h + (4 if src_lines else 0)
+            draw_h = min(max(h, len(draw) * line_h + src_h + pad * 2),
+                         max(8, H - top))
+            boxes.append((left, top, w, draw_h, fnt, fm, draw,
+                          line_h, src_h, src_lines, max_w))
+            painter.drawRoundedRect(QRectF(left, top, w, draw_h), 5, 5)
+
+        # 4) 逐块写文字：所有块都画，不 break
+        for (left, top, w, draw_h, fnt, fm, draw, line_h,
+             src_h, src_lines, max_w) in boxes:
+            room = draw_h - pad * 2 - src_h
+            used = len(draw) * line_h
             ty = float(top + pad + src_h
                        + max(0, (room - used) // 2))
             if src_lines:
@@ -790,7 +784,7 @@ class LiveTranslateWindow(QWidget):
                 painter.drawText(
                     QRectF(left + pad, top + pad, max_w, src_line_h),
                     Qt.AlignmentFlag.AlignLeft, src_lines[0])
-            painter.setFont(font)
+            painter.setFont(fnt)
             for line in draw:
                 line_rect = QRectF(left + pad, ty, max_w, line_h)
                 painter.setPen(QColor(0, 0, 0, 170))
@@ -798,7 +792,7 @@ class LiveTranslateWindow(QWidget):
                                  Qt.AlignmentFlag.AlignLeft, line)
                 painter.setPen(QColor(250, 250, 250))
                 painter.drawText(line_rect, Qt.AlignmentFlag.AlignLeft, line)
-                ty += step
+                ty += line_h
 
     def _draw_text(self, painter, rect, text, font, color, center=False,
                    sentences=True, max_height=None):

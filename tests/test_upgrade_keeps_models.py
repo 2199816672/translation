@@ -35,7 +35,7 @@ class InstallerKeepsUserDataTests(unittest.TestCase):
                  if line.startswith('Source:') and 'Excludes:' in line]
         self.assertEqual(len(lines), 1, '只能有一条程序文件安装规则')
         for pattern in ('models\\*', 'user_libs\\*', 'screenshots\\*',
-                        'user_config.json'):
+                        'cache\\*', 'user_config.json'):
             self.assertIn(pattern, lines[0], f'Excludes 漏了 {pattern}')
 
     def test_no_delete_sections(self):
@@ -50,7 +50,8 @@ class InstallerKeepsUserDataTests(unittest.TestCase):
     def test_runtime_data_lists_stay_in_sync(self):
         self.assertEqual(set(app_paths.RUNTIME_DATA),
                          set(build_installer.RUNTIME_DATA))
-        for name in ('models', 'user_libs', 'screenshots', 'user_config.json'):
+        for name in ('models', 'user_libs', 'screenshots', 'cache',
+                     'user_config.json'):
             self.assertIn(name, app_paths.RUNTIME_DATA)
 
     def test_model_root_lives_in_user_data_dir(self):

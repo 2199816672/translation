@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QSystemTrayIcon, QMenu, QApplication
 
 from config import (
     OCR_LANGUAGES, OCR_ENGINE, SUPPORTED_TARGET_LANGS, SUPPORTED_SOURCE_LANGS,
-    load_user_config, save_user_config, APP_VERSION,
+    load_user_config, save_user_config, APP_VERSION, DEFAULT_SNAP_WINDOWS,
 )
 from app_paths import resource_path
 from ocr_recognizer import get_ocr_instance, check_engine_available
@@ -102,6 +102,8 @@ def _get_autostart():
 class MainWindow(FluentWindow):
     _sig_ocr_done = Signal(str, str)
     _sig_ocr_blocks = Signal(object)   # OCR 句子块（归一化坐标）
+    _sig_ocr_words = Signal(object)    # OCR 词块（归一化坐标），提取按词点选用
+    _sig_overlay_extract_trans_done = Signal(str, str)  # (译文, 错误信息)
     _sig_trans_done = Signal(str)
     _sig_doc_trans_done = Signal(str)
     _sig_doc_sub_trans_done = Signal(list)
@@ -153,6 +155,7 @@ class MainWindow(FluentWindow):
         self._ocr_target = None
         self._overlay_ocr_text = ""
         self._overlay_blocks = []   # OCR 视觉段落块（归一化坐标），译文按原位置贴回用
+        self._overlay_words = []    # OCR 词块（归一化坐标），提取按词点选用
         self._restore_after_capture = False
         self._capture_pending = False   # 截图延迟内防重复触发
         self._capture_opacity = None    # 抓屏期间临时把窗口设为全透明
@@ -238,6 +241,9 @@ class MainWindow(FluentWindow):
         self.av.polishRequested.connect(self._on_av_polish)
         self._sig_ocr_done.connect(self._on_ocr_done)
         self._sig_ocr_blocks.connect(self._on_overlay_blocks)
+        self._sig_ocr_words.connect(self._on_overlay_words)
+        self._sig_overlay_extract_trans_done.connect(
+            self._on_overlay_extract_trans_done)
         self._sig_trans_done.connect(self._on_trans_done)
         self._sig_doc_trans_done.connect(self._on_doc_trans_done)
         self._sig_doc_sub_trans_done.connect(self._on_doc_sub_trans_done)
@@ -318,16 +324,20 @@ class MainWindow(FluentWindow):
     def _on_ocr_done(self, text, target):
         if target == "overlay_extract":
             if self._overlay:
-                self._overlay.show_ocr_result(text)
+                # 提取时把词位置一起给浮层：原图上按词显示可点选标签，
+                # 文字内容由可拖动的提取小窗口按用户选中项汇总。
+                self._overlay.show_ocr_result(
+                    text, self._overlay_blocks, self._overlay_words)
             self.home.set_ocr_text(text)
             self._on_status("识别完成", "#4ade80")
         elif target == "overlay_translate":
             self._overlay_ocr_text = text
             self.home.set_ocr_text(text)
             if not text.strip():
-                self._on_status("未识别到文字", "#71717a")
+                self._on_status("未识别到文字，可把选区框大一点再试", "#71717a")
                 if self._overlay and self._overlay.isVisible():
-                    self._overlay.show_error("未识别到文字")
+                    self._overlay.show_error(
+                        "未识别到文字：可把选区框大一点，或换个识别引擎")
                 return
             self._on_status("识别完成，正在翻译...", "#eab308")
             self._do_translate_overlay(text, self._overlay_blocks)
@@ -1028,8 +1038,12 @@ class MainWindow(FluentWindow):
         self._capture_pending = False
         try:
             auto_translate = self.cfg.get("auto_translate", False)
-            self._overlay = ScreenshotOverlay(auto_translate=auto_translate)
+            snap_windows = self.cfg.get("snap_windows", DEFAULT_SNAP_WINDOWS)
+            self._overlay = ScreenshotOverlay(
+                auto_translate=auto_translate, snap_enabled=snap_windows)
             self._overlay.extractRequested.connect(self._on_overlay_extract)
+            self._overlay.extractTranslateRequested.connect(
+                self._on_overlay_extract_translate)
             self._overlay.translateRequested.connect(self._on_overlay_translate)
             self._overlay.polishRequested.connect(self._on_overlay_polish)
             self._overlay.screenshotTaken.connect(self._on_overlay_screenshot)
@@ -1089,7 +1103,10 @@ class MainWindow(FluentWindow):
 
     def _do_live_select(self):
         try:
-            self._overlay = ScreenshotOverlay(live_select=True)
+            self._overlay = ScreenshotOverlay(
+                live_select=True,
+                snap_enabled=self.cfg.get("snap_windows",
+                                          DEFAULT_SNAP_WINDOWS))
             self._overlay.regionSelected.connect(self._on_live_region_selected)
             self._overlay.finished.connect(self._on_overlay_finished)
             self._overlay.start_capture()
@@ -1537,6 +1554,46 @@ class MainWindow(FluentWindow):
     def _on_overlay_blocks(self, blocks):
         self._overlay_blocks = blocks or []
 
+    @Slot(object)
+    def _on_overlay_words(self, words):
+        self._overlay_words = words or []
+
+    @Slot(str)
+    def _on_overlay_extract_translate(self, text):
+        """提取小窗口「翻译」：翻译用户点选 / 手动编辑后的文字。
+
+        走主翻译器（含免费引擎自动切换），失败留空并明确报错，
+        绝不用原文冒充译文。
+        """
+        text = (text or "").strip()
+        if not text:
+            self._sig_overlay_extract_trans_done.emit("", "没有可翻译的文字")
+            return
+        self._on_status("正在翻译提取的文字...", "#eab308")
+        self._sync_target_lang()
+
+        def run():
+            try:
+                translated = self.translator.translate_paragraph(text)
+                if not str(translated or "").strip():
+                    raise TranslationError(
+                        "翻译返回空结果，请检查网络或更换翻译 API")
+                self._sig_overlay_extract_trans_done.emit(translated, "")
+            except Exception as e:
+                self._sig_overlay_extract_trans_done.emit("", f"翻译失败：{e}")
+
+        threading.Thread(target=run, daemon=True).start()
+
+    @Slot(str, str)
+    def _on_overlay_extract_trans_done(self, translated, error):
+        if self._overlay and self._overlay.isVisible():
+            self._overlay.show_extract_translation(translated, error)
+        if error:
+            self._on_status(error, "#ef4444")
+        else:
+            self._on_status("提取文字翻译完成", "#4ade80")
+            self._auto_copy(translated, "trans")
+
     def _do_ocr_for_overlay(self, image_path, target):
         if self.ocr is None:
             self._on_status("OCR 未就绪，请稍候...", "#eab308")
@@ -1544,23 +1601,49 @@ class MainWindow(FluentWindow):
         self._on_status("正在识别文字...", "#eab308")
 
         def run():
-            # 翻译路径一次 OCR 同时拿到文本和行位置；其余路径仍用纯文本接口
+            # 翻译 / 提取路径一次 OCR 同时拿到文本和行位置；其余路径仍用
+            # 纯文本接口。提取还要词位置，才能在原图上按词点选。
             groups = []
+            words = []
             text = ""
             used_blocks = False
-            if (target == "overlay_translate"
+            if (target in ("overlay_translate", "overlay_extract")
                     and hasattr(self.ocr, "recognize_blocks")):
                 try:
                     blocks = self.ocr.recognize_blocks(image_path) or []
                     if blocks:
                         from PySide6.QtGui import QImage
                         from text_segment import (
-                            blocks_to_text, group_blocks, normalize_groups)
+                            blocks_to_text, blocks_to_words, group_blocks_fine,
+                            normalize_groups)
                         img = QImage(image_path)
+                        iw, ih = img.width(), img.height()
+                        # 逐视觉行贴回：旧 group_blocks 会把整栏合成一个大框，
+                        # 译文挤成一坨且盖住输入框（见 test_ux_round13）。
                         groups = normalize_groups(
-                            group_blocks(blocks), img.width(), img.height())
+                            group_blocks_fine(blocks), iw, ih)
                         text = blocks_to_text(blocks)
                         used_blocks = True
+                        if target == "overlay_extract":
+                            # 复用刚才这一次识别的 blocks：Windows OCR 的
+                            # 行块自带原生词坐标，EasyOCR 只有行块，统一交给
+                            # blocks_to_words 按显示宽度分摊，绝不重复跑 OCR。
+                            try:
+                                if hasattr(self.ocr, "recognize_words"):
+                                    try:
+                                        raw_words = self.ocr.recognize_words(
+                                            image_path, blocks=blocks)
+                                    except TypeError:
+                                        # 第三方 / 旧引擎不接受 blocks 参数
+                                        raw_words = blocks
+                                else:
+                                    raw_words = blocks
+                                words = normalize_groups(
+                                    blocks_to_words(raw_words or blocks),
+                                    iw, ih)
+                            except Exception:
+                                words = normalize_groups(
+                                    blocks_to_words(blocks), iw, ih)
                 except Exception:
                     groups = []
             if not used_blocks:
@@ -1568,9 +1651,11 @@ class MainWindow(FluentWindow):
                     text = self.ocr.recognize(image_path) or ""
                 except Exception as e:
                     self._sig_ocr_blocks.emit([])
+                    self._sig_ocr_words.emit([])
                     self._sig_error.emit(str(e))
                     return
             self._sig_ocr_blocks.emit(groups)
+            self._sig_ocr_words.emit(words)
             self._sig_ocr_done.emit(text, target)
 
         threading.Thread(target=run, daemon=True).start()
@@ -1605,7 +1690,8 @@ class MainWindow(FluentWindow):
                         results.append(tr)
                     except Exception:
                         failed += 1
-                        results.append(para)
+                        # 翻译失败必须留空，绝不能把原文塞进译文位置
+                        results.append("")
                 if texts and failed == len(texts):
                     raise TranslationError(
                         "全部段落翻译失败，请检查网络或更换翻译API")
@@ -1641,7 +1727,7 @@ class MainWindow(FluentWindow):
         if paragraphs and failed == 0:
             self._on_status("翻译完成", "#4ade80")
         elif paragraphs and failed:
-            self._on_status(f"翻译完成（{failed} 个段落失败，已保留原文）", "#eab308")
+            self._on_status(f"翻译完成（{failed} 个段落失败，已留空）", "#eab308")
         else:
             self._on_status("翻译结果为空，请检查网络或更换翻译API", "#eab308")
         self._auto_copy(full_text, "trans")

@@ -1,12 +1,40 @@
 """
 OCR文字识别模块 - 支持 Windows 系统自带 和 EasyOCR 双引擎
 """
+import copy
+import hashlib
 import os
 import subprocess
 import sys
 import threading
+import warnings
+
+from pathlib import Path
 
 from subprocess_util import pip_cmd, pip_process
+from result_cache import get_cache, make_key
+
+
+def _silence_third_party_warnings():
+    """只静默 EasyOCR / torch 在 CPU 上必定刷出的两条无害 UserWarning。
+
+    这两条来自 torch 自身（量化 API 弃用提示、无 GPU 时 pin_memory 无效），
+    既不是本程序报错，也不影响识别结果，但每次启动都会在控制台刷屏，
+    容易让用户误以为出错了。其它 warning / 错误一律原样保留；
+    设环境变量 TT_SHOW_LIB_NOTICES=1 可关闭过滤。
+    """
+    if os.environ.get("TT_SHOW_LIB_NOTICES") == "1":
+        return
+    warnings.filterwarnings(
+        "ignore", message=r"torch\.quantize_per_tensor.*deprecated",
+        category=UserWarning)
+    warnings.filterwarnings(
+        "ignore",
+        message=r"'pin_memory' argument is set as true but no accelerator is found",
+        category=UserWarning)
+
+
+_silence_third_party_warnings()
 
 
 def check_engine_available(engine):
@@ -40,6 +68,43 @@ def _imread_unicode(path):
         return cv2.imdecode(data, cv2.IMREAD_COLOR)
     except (OSError, ValueError):
         return None
+
+
+def _image_digest(image_path):
+    """按文件内容算指纹：同一张图（哪怕路径不同）只识别一次。
+
+    分块读避免把几十 MB 的截图整个读进内存；哈希耗时远小于一次 OCR 推理。
+    """
+    try:
+        digest = hashlib.sha256()
+        with Path(str(image_path)).open("rb") as fh:
+            for block in iter(lambda: fh.read(256 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+    except OSError:
+        return ""
+
+
+def _cached_scan(recognizer, image_path, compute, kind):
+    """引擎扫描结果缓存：recognize / recognize_blocks / recognize_words 共用。
+
+    截图翻译里同一张图常被依次问「文本 / 行坐标 / 词坐标」，实时翻译还会
+    反复抓到相同画面；缓存后这些重复调用都不再触发 winrt / EasyOCR 推理。
+    值只存纯 Python 结构，跨线程安全（winrt 的 COM 对象本身不能跨线程）。
+    """
+    digest = _image_digest(image_path)
+    cache = get_cache("ocr", max_entries=150)
+    key = (make_key("o1", type(recognizer).__name__, kind,
+                    tuple(getattr(recognizer, "languages", []) or []), digest)
+           if digest else None)
+    if key is not None:
+        hit = cache.get(key)
+        if hit is not None:
+            return copy.deepcopy(hit)
+    value = compute()
+    if key is not None and value is not None:
+        cache.put(key, value)
+    return copy.deepcopy(value)
 
 
 def install_engine(engine):
@@ -165,53 +230,12 @@ class WindowsOCRRecognizer:
         self._lang_code = chosen
         return engine
 
-    def recognize(self, image_path):
-        engine = self._ensure_engine()
-        try:
-            import winrt.windows.graphics.imaging as wimg
-            import winrt.windows.storage.streams as wss
-            import cv2
+    # 三个对外接口（纯文本 / 行块 / 词块）共用一次 winrt 识别结果。
+    # 归一化成纯 Python 结构后既能缓存，也避免 winrt COM 对象跨线程封送。
+    _WORD_KEYS = ("text", "x", "y", "w", "h")
 
-            img = _imread_unicode(image_path)
-            if img is None:
-                raise RuntimeError(f"无法读取图片: {image_path}")
-            h_img = img.shape[0]
-            ret, buf = cv2.imencode(".png", img)
-            data = buf.tobytes()
-            stream = wss.InMemoryRandomAccessStream()
-            stream.write_async(data).get()
-            stream.seek(0)
-            decoder = wimg.BitmapDecoder.create_async(stream).get()
-            bitmap = decoder.get_software_bitmap_async().get()
-            result = engine.recognize_async(bitmap).get()
-            lines_with_y = []
-            for line in result.lines:
-                text = line.text.strip()
-                if not text:
-                    continue
-                y = 0
-                if line.words:
-                    y = line.words[0].bounding_rect.y
-                lines_with_y.append((text, y))
-            if not lines_with_y:
-                return ""
-            lines_with_y.sort(key=lambda x: x[1])
-            avg_h = max(1, (lines_with_y[-1][1] - lines_with_y[0][1]) / max(1, len(lines_with_y) - 1))
-            parts = [lines_with_y[0][0]]
-            for i in range(1, len(lines_with_y)):
-                gap = lines_with_y[i][1] - lines_with_y[i-1][1]
-                if gap > avg_h * 1.6:
-                    parts.append("\n")
-                parts.append(lines_with_y[i][0])
-            return '\n'.join(parts)
-        except Exception as e:
-            raise RuntimeError(f"Windows OCR识别失败: {e}\n提示: 请在系统设置中安装对应语言包")
-
-    def recognize_blocks(self, image_path):
-        """返回带位置的行块 [{text,x,y,w,h}]，坐标为传入图片的原图像素。
-
-        与 recognize() 并存：后者保持纯字符串接口，供主页 / 文档解析使用。
-        """
+    def _scan_lines(self, image_path):
+        """真正跑一次 winrt OCR，返回 [{text, words:[{...,x2,y2}]}]。"""
         engine = self._ensure_engine()
         try:
             import winrt.windows.graphics.imaging as wimg
@@ -228,28 +252,101 @@ class WindowsOCRRecognizer:
             decoder = wimg.BitmapDecoder.create_async(stream).get()
             bitmap = decoder.get_software_bitmap_async().get()
             result = engine.recognize_async(bitmap).get()
-            blocks = []
+            lines = []
             for line in result.lines:
                 text = (line.text or "").strip()
                 if not text:
                     continue
-                words = list(line.words or [])
-                if words:
-                    rects = [w.bounding_rect for w in words]
-                    x = min(r.x for r in rects)
-                    y = min(r.y for r in rects)
-                    x2 = max(r.x + r.width for r in rects)
-                    y2 = max(r.y + r.height for r in rects)
-                else:
-                    x = y = 0.0
-                    x2 = y2 = 1.0
-                blocks.append({"text": text, "x": float(x), "y": float(y),
-                               "w": max(1.0, float(x2 - x)),
-                               "h": max(1.0, float(y2 - y))})
-            blocks.sort(key=lambda b: (b["y"], b["x"]))
-            return blocks
+                words = []
+                for word in (line.words or []):
+                    word_text = (word.text or "").strip()
+                    if not word_text:
+                        continue
+                    r = word.bounding_rect
+                    x, y = float(r.x), float(r.y)
+                    width, height = float(r.width), float(r.height)
+                    words.append({
+                        "text": word_text, "x": x, "y": y,
+                        "w": max(1.0, width), "h": max(1.0, height),
+                        "x2": x + width, "y2": y + height,
+                    })
+                lines.append({"text": text, "words": words})
+            return lines
         except Exception as e:
             raise RuntimeError(f"Windows OCR识别失败: {e}\n提示: 请在系统设置中安装对应语言包")
+
+    def _lines(self, image_path):
+        return _cached_scan(self, image_path,
+                            lambda: self._scan_lines(image_path), "lines")
+
+    @classmethod
+    def _word_blocks(cls, words):
+        return [{k: w[k] for k in cls._WORD_KEYS} for w in words]
+
+    def recognize(self, image_path):
+        """纯文本接口，供主页 / 文档解析使用。"""
+        lines_with_y = [
+            (line["text"], line["words"][0]["y"] if line["words"] else 0.0)
+            for line in self._lines(image_path)
+        ]
+        if not lines_with_y:
+            return ""
+        lines_with_y.sort(key=lambda x: x[1])
+        avg_h = max(1, (lines_with_y[-1][1] - lines_with_y[0][1])
+                    / max(1, len(lines_with_y) - 1))
+        parts = [lines_with_y[0][0]]
+        for i in range(1, len(lines_with_y)):
+            gap = lines_with_y[i][1] - lines_with_y[i-1][1]
+            if gap > avg_h * 1.6:
+                parts.append("\n")
+            parts.append(lines_with_y[i][0])
+        return '\n'.join(parts)
+
+    def recognize_blocks(self, image_path):
+        """返回带位置的行块 [{text,x,y,w,h,words}]，坐标为原图像素。"""
+        blocks = []
+        for line in self._lines(image_path):
+            words = line.get("words") or []
+            if words:
+                x = min(w["x"] for w in words)
+                y = min(w["y"] for w in words)
+                x2 = max(w["x2"] for w in words)
+                y2 = max(w["y2"] for w in words)
+            else:
+                x = y = 0.0
+                x2 = y2 = 1.0
+            blocks.append({
+                "text": line["text"], "x": float(x), "y": float(y),
+                "w": max(1.0, float(x2 - x)),
+                "h": max(1.0, float(y2 - y)),
+                # 原生词坐标随行块一起返回，提取按词点选时不必再跑一次 OCR
+                "words": self._word_blocks(words),
+            })
+        blocks.sort(key=lambda b: (b["y"], b["x"]))
+        return blocks
+
+    def recognize_words(self, image_path, blocks=None):
+        """返回【词级】块 [{text,x,y,w,h}]，坐标为传入图片的原图像素。
+
+        传入同一次识别的 blocks 时直接复用其中的 words 字段；没有词坐标的
+        行块原样返回，由 text_segment.blocks_to_words 统一再切词。
+        """
+        if blocks is not None:
+            out = []
+            for b in blocks:
+                inner = b.get("words") or []
+                if inner:
+                    out.extend(dict(w) for w in inner)
+                else:
+                    out.append(b)
+            return out
+        words = []
+        for line in self._lines(image_path):
+            words.extend(self._word_blocks(line.get("words") or []))
+        if not words:
+            return self.recognize_blocks(image_path)
+        words.sort(key=lambda b: (b["y"], b["x"]))
+        return words
 
 
 # ── EasyOCR 后端 ──────────────────────────────────────────────
@@ -312,34 +409,21 @@ class EasyOCRRecognizer:
                 self.model_exists = True
         return self.reader
 
-    def recognize(self, image_path):
+    def _scan_results(self, image_path):
+        """真正跑一次 EasyOCR，转成可缓存的纯 Python 结构。
+
+        recognize()（纯文本）与 recognize_blocks()（行坐标）共用这一次推理，
+        以前两个接口各跑一遍 readtext，是截图翻译里最贵的一处重复计算。
+        """
         try:
             reader = self._init_reader()
             img = _imread_unicode(image_path)
             if img is None:
                 raise RuntimeError(f"无法读取图片: {image_path}")
-            results = reader.readtext(img)
-            if not results:
-                return ""
-            items = []
-            for r in results:
-                text = r[1].strip()
-                if not text:
-                    continue
-                bbox = r[0]
-                y = (bbox[0][1] + bbox[2][1]) / 2
-                items.append((text, y))
-            if not items:
-                return ""
-            items.sort(key=lambda x: x[1])
-            avg_h = max(1, (items[-1][1] - items[0][1]) / max(1, len(items) - 1))
-            parts = [items[0][0]]
-            for i in range(1, len(items)):
-                gap = items[i][1] - items[i-1][1]
-                if gap > avg_h * 1.6:
-                    parts.append("\n")
-                parts.append(items[i][0])
-            return '\n'.join(parts)
+            results = reader.readtext(img) or []
+            return [{"text": r[1],
+                     "pts": [[float(p[0]), float(p[1])] for p in r[0]]}
+                    for r in results]
         except Exception as e:
             msg = str(e)
             if "CUDA" in msg or "gpu" in msg.lower():
@@ -348,30 +432,56 @@ class EasyOCRRecognizer:
                 raise RuntimeError(f"OCR模型加载失败: {msg}\n原因: 模型文件可能损坏，请删除 ~/.EasyOCR/model 后重试")
             raise RuntimeError(f"EasyOCR识别失败: {msg}")
 
+    def _results(self, image_path):
+        return _cached_scan(self, image_path,
+                            lambda: self._scan_results(image_path), "results")
+
+    def recognize(self, image_path):
+        items = []
+        for r in self._results(image_path):
+            text = (r["text"] or "").strip()
+            if not text:
+                continue
+            pts = r["pts"]
+            y = (pts[0][1] + pts[2][1]) / 2
+            items.append((text, y))
+        if not items:
+            return ""
+        items.sort(key=lambda x: x[1])
+        avg_h = max(1, (items[-1][1] - items[0][1]) / max(1, len(items) - 1))
+        parts = [items[0][0]]
+        for i in range(1, len(items)):
+            gap = items[i][1] - items[i-1][1]
+            if gap > avg_h * 1.6:
+                parts.append("\n")
+            parts.append(items[i][0])
+        return '\n'.join(parts)
+
     def recognize_blocks(self, image_path):
         """返回带位置的文本块 [{text,x,y,w,h}]，坐标为传入图片的原图像素。"""
-        try:
-            reader = self._init_reader()
-            img = _imread_unicode(image_path)
-            if img is None:
-                raise RuntimeError(f"无法读取图片: {image_path}")
-            results = reader.readtext(img) or []
-            blocks = []
-            for r in results:
-                text = (r[1] or "").strip()
-                if not text:
-                    continue
-                pts = r[0]
-                xs = [float(p[0]) for p in pts]
-                ys = [float(p[1]) for p in pts]
-                x, y = min(xs), min(ys)
-                blocks.append({"text": text, "x": x, "y": y,
-                               "w": max(1.0, max(xs) - x),
-                               "h": max(1.0, max(ys) - y)})
-            blocks.sort(key=lambda b: (b["y"], b["x"]))
-            return blocks
-        except Exception as e:
-            raise RuntimeError(f"EasyOCR识别失败: {e}")
+        blocks = []
+        for r in self._results(image_path):
+            text = (r["text"] or "").strip()
+            if not text:
+                continue
+            pts = r["pts"]
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            x, y = min(xs), min(ys)
+            blocks.append({"text": text, "x": x, "y": y,
+                           "w": max(1.0, max(xs) - x),
+                           "h": max(1.0, max(ys) - y)})
+        blocks.sort(key=lambda b: (b["y"], b["x"]))
+        return blocks
+
+    def recognize_words(self, image_path, blocks=None):
+        """EasyOCR 只给行级 bbox，词级坐标由 text_segment.blocks_to_words
+        按显示宽度分摊；这里保持接口与其它引擎一致，返回原始行块。
+        传入 blocks 时直接复用，不重复跑一次 readtext。
+        """
+        if blocks is not None:
+            return list(blocks)
+        return self.recognize_blocks(image_path)
 
 
 # ── 全局单例 ──────────────────────────────────────────────────

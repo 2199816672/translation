@@ -30,7 +30,7 @@ APP_DATA_NAME = "TranslationTool"
 # 名单用于排除，改动时记得同步。
 RUNTIME_DATA = (
     "user_config.json", "user_config.json.tmp", "user_config.json.broken",
-    "screenshots", "models", "converted", "user_libs",
+    "screenshots", "models", "converted", "user_libs", "cache",
 )
 
 

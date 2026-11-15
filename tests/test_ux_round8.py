@@ -132,8 +132,11 @@ class Round8SourceContracts(unittest.TestCase):
         self.assertIn('开箱即用，默认无需填密钥', s)
         self.assertIn('Ctrl+F 聚焦', s)
         self.assertIn('托盘右键菜单触发', s)
-        self.assertIn('松开后：提取 / 翻译 / 编辑标注',
-                      self._src('screenshot_overlay.py'))
+        overlay = self._src('screenshot_overlay.py')
+        self.assertIn('松开后：提取 / 翻译 / 编辑', overlay)
+        # 新增的窗口吸附也要在浮层提示里可发现
+        self.assertIn('单击可选中整个窗口', overlay)
+        self.assertIn('按住 Alt 自由框选', overlay)
 
     def test_caption_error_dedup(self):
         lc = self._src('live_caption.py')

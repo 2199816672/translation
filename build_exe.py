@@ -39,7 +39,8 @@ HIDDEN_IMPORTS = [
     "pages", "pages.home_page", "pages.doc_page",
     "pages.av_page", "pages.settings_page", "user_messages", "cancelable",
     "ocr_models", "diagnostics", "status_bus", "task_center", "ui_theme",
-    "ui_feedback", "onboarding", "command_palette",
+    "ui_feedback", "onboarding", "command_palette", "window_snapper",
+    "result_cache",
     # 第三方
     "keyboard", "winrt", "winrt.windows.media.ocr",
     "winrt.windows.globalization", "winrt.windows.graphics.imaging",

@@ -7,6 +7,8 @@
     python build_installer.py --skip-exe     # 复用最近一次构建的程序目录，只编译安装包
     python build_installer.py --portable     # 额外生成免安装 zip
     python build_installer.py --version 1.3.0 --skip-exe   # 仅用于本地覆盖升级测试
+    python build_installer.py --keep-old     # 保留旧版本产物（默认会自动清理）
+    python build_installer.py --purge-staging  # 连本次构建暂存目录一起删
 
 输出：
     dist/installer/TranslationTool-Setup-v<版本>.exe
@@ -16,6 +18,12 @@
 版本号唯一来源是 config.py 的 APP_VERSION，安装脚本通过 ISCC 的
 /dMyAppVersion 注入，避免多处硬编码不同步。发版改版本号请用
 `python bump_version.py <版本>`（会同步 README 标题与 iss 兜底值）。
+
+构建成功（安装包、校验文件、可选 zip 全部生成）后会自动清理本地旧版本
+产物，避免每个版本 170~250 MB 的安装包和数百 MB 的暂存目录一直累积。
+当前版本产物一律保留，本次暂存目录默认保留供冻结版冒烟，旧版本在
+GitHub Release 上仍有云端备份。需要保留本地旧包时加 --keep-old，或设
+环境变量 TT_KEEP_OLD_BUILDS=1。清理失败不会影响构建结果。
 """
 import argparse
 import hashlib
@@ -39,7 +47,7 @@ SETUP_PREFIX = "TranslationTool-Setup-v"
 # 包内默认配置覆盖用户设置（ignoreversion），卸载时还会被当作安装文件删掉。
 RUNTIME_DATA = (
     "user_config.json", "user_config.json.broken", "user_config.json.tmp",
-    "screenshots", "models", "converted", "user_libs",
+    "screenshots", "models", "converted", "user_libs", "cache",
 )
 
 
@@ -198,6 +206,172 @@ def build_portable(version: str, app_dir: Path) -> Path:
     return zip_path
 
 
+# ── 旧版本产物自动清理 ──────────────────────────────────────────────
+# 只在「能解析出版本号」或「明确是构建中间目录」时才动手，手工放进去的
+# 未知文件一律不碰。当前版本产物、installer 目录、dist 本身永远保留。
+_VERSIONED_NAMES = (
+    re.compile(r"^TranslationTool-Setup-v(.+)\.exe$"),
+    re.compile(r"^TranslationTool-Setup-v(.+)\.exe\.sha256$"),
+    re.compile(r"^TranslationTool-v(.+)-win64\.zip$"),
+    re.compile(r"^release_notes_v(.+)\.md$"),
+)
+_OLD_PORTABLE = re.compile(r"^ScreenshotTranslator_v")
+_STAGE_DIR = re.compile(r"^staging_\d{8}_\d{6}$")
+_VERIFY_DIRS = frozenset(("batch_verify", "health_check",
+                          "ui_check", "ui_verify"))
+_STALE_LOGS = frozenset(("_upgrade_verify.log",))
+
+
+def _version_of(name: str):
+    """能解析出版本号才返回，否则返回 None（不认识的名字不清理）。"""
+    for pattern in _VERSIONED_NAMES:
+        match = pattern.match(name)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _tree_size(path: Path) -> int:
+    if path.is_file():
+        return path.stat().st_size
+    total = 0
+    for base, _, names in os.walk(path):
+        for name in names:
+            try:
+                total += os.path.getsize(os.path.join(base, name))
+            except OSError:
+                pass
+    return total
+
+
+def _leftovers_may_have_user_data(stage: Path) -> bool:
+    """暂存目录被 sanitize_app_dir 挪出的数据里是否像有真实用户文件。
+
+    冒烟测试只会留下几十字节的默认配置；出现 >1 KB 的文件就保守跳过整个
+    暂存目录，交给用户自己确认，避免自动清理误删用户数据。
+    """
+    park = stage / "_runtime_leftovers"
+    if not park.is_dir():
+        return False
+    try:
+        return any(p.is_file() and p.stat().st_size > 1024
+                   for p in park.rglob("*"))
+    except OSError:
+        return True
+
+
+def _dir_has_runtime_data(app_dir: Path) -> bool:
+    """程序目录里是否残留运行时生成的用户数据（配置/模型/组件/缓存）。
+
+    dist/TranslationTool 可能被直接双击运行过，此时 exe 会在同目录写出
+    这些数据；自动清理不能把它当纯构建中间目录整棵 rmtree。
+    """
+    try:
+        return any((app_dir / name).exists() for name in RUNTIME_DATA)
+    except OSError:
+        return True
+
+
+def cleanup_old_builds(version: str, dist_root=None, keep_staging=None,
+                       purge_staging: bool = False,
+                       dry_run: bool = False) -> dict:
+    """构建成功后清理旧版本产物，返回 deleted / freed / errors / kept_staging。
+
+    - 只删版本 != version 的带版本产物，以及明确的构建中间目录；
+    - keep_staging 是本次构建的暂存目录，默认保留（冻结版冒烟要用）；
+    - 暂存目录含疑似用户数据时跳过并写进 errors；
+    - dry_run=True 只报告不删除，供测试与人工确认。
+    """
+    dist = Path(dist_root or ROOT / "dist").resolve()
+    result = {"deleted": [], "freed": 0, "errors": [], "kept_staging": None}
+    if not dist.is_dir():
+        return result
+    keep = Path(keep_staging).resolve() if keep_staging else None
+
+    def remove(path: Path, label: str) -> None:
+        try:
+            target = path.resolve()
+            if target == dist or dist not in target.parents:
+                result["errors"].append(f"拒绝越界删除: {path}")
+                return
+            if not path.exists():
+                return
+            size = _tree_size(path)
+            if not dry_run:
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+            result["deleted"].append((label, path.name, size))
+            result["freed"] += size
+        except Exception as exc:
+            result["errors"].append(f"{path.name}: {exc}")
+
+    installer = dist / "installer"
+    if installer.is_dir():
+        for entry in sorted(installer.iterdir()):
+            found = _version_of(entry.name)
+            if found is not None and found != version:
+                remove(entry, "旧版本安装包")
+
+    for entry in sorted(dist.iterdir()):
+        if entry.name == "installer":
+            continue
+        if entry.is_file():
+            found = _version_of(entry.name)
+            if found is not None and found != version:
+                remove(entry, "旧版本文件")
+            elif _OLD_PORTABLE.match(entry.name) or entry.name in _STALE_LOGS:
+                remove(entry, "旧便携包/验证日志")
+        elif entry.is_dir() and not entry.is_symlink():
+            if _OLD_PORTABLE.match(entry.name):
+                remove(entry, "旧便携版目录")
+                continue
+            is_legacy_app = (entry.name == APP_DIR_NAME
+                             and (entry / f"{APP_DIR_NAME}.exe").is_file())
+            is_stage = bool(_STAGE_DIR.match(entry.name))
+            is_verify = entry.name in _VERIFY_DIRS
+            if not (is_legacy_app or is_stage or is_verify):
+                continue
+            # --skip-exe 在没有任何 staging 时会直接复用 dist/TranslationTool，
+            # 此时 keep 就是 dist 本身，别把刚用作构建源的目录删掉。
+            if is_legacy_app and keep == dist:
+                continue
+            # 便携版目录被直接运行过就会带真实用户数据，宁可留着不删
+            if is_legacy_app and _dir_has_runtime_data(entry):
+                result["errors"].append(
+                    f"跳过 {entry.name}：目录内含运行时用户数据，请手动确认")
+                continue
+            if is_stage and not purge_staging and keep is not None \
+                    and entry.resolve() == keep:
+                result["kept_staging"] = entry.name
+                continue
+            if is_stage and _leftovers_may_have_user_data(entry):
+                result["errors"].append(
+                    f"跳过 {entry.name}：_runtime_leftovers 可能含用户数据")
+                continue
+            remove(entry, "构建暂存/验证目录")
+    return result
+
+
+def print_cleanup_summary(result: dict, purge_staging: bool = False) -> None:
+    deleted = result["deleted"]
+    if not deleted and not result["errors"]:
+        print("旧版本清理：没有需要清理的旧产物。", flush=True)
+        return
+    print(f"旧版本清理：删除 {len(deleted)} 项，释放 "
+          f"{result['freed'] / 1024 / 1024:.1f} MB", flush=True)
+    for _label, name, size in deleted[:15]:
+        print(f"  - {name} ({size / 1024 / 1024:.1f} MB)", flush=True)
+    if len(deleted) > 15:
+        print(f"  - ……另有 {len(deleted) - 15} 项", flush=True)
+    if result["kept_staging"] and not purge_staging:
+        print(f"  保留本次暂存目录 {result['kept_staging']}"
+              "（冻结版冒烟用；--purge-staging 可一并删除）", flush=True)
+    for err in result["errors"]:
+        print(f"  警告：{err}", file=sys.stderr, flush=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="构建翻译工具安装程序")
     parser.add_argument("--skip-exe", action="store_true",
@@ -206,6 +380,10 @@ def main() -> int:
                         help="额外生成免安装 zip")
     parser.add_argument("--version", default=None,
                         help="覆盖安装包版本号（仅供本地覆盖升级测试用）")
+    parser.add_argument("--keep-old", action="store_true",
+                        help="保留本地旧版本产物（默认构建成功后自动清理）")
+    parser.add_argument("--purge-staging", action="store_true",
+                        help="连本次构建的暂存目录一起删除（默认保留供冒烟）")
     args = parser.parse_args()
 
     source_version = read_version()
@@ -244,6 +422,27 @@ def main() -> int:
     if args.portable:
         zip_path = build_portable(version, app_dir)
         print(f"便携包: {zip_path} ({zip_path.stat().st_size / 1024 / 1024:.1f} MB)")
+
+    # 构建全部成功才清理：失败时旧版本仍可作为回滚。
+    # --version 与 APP_VERSION 不一致属于本地覆盖升级测试，产物版本是假的，
+    # 清理会误删真正当前版本的安装包，必须跳过。
+    should_cleanup = (
+        not args.keep_old
+        and os.environ.get("TT_KEEP_OLD_BUILDS") != "1"
+        and version == source_version
+    )
+    if should_cleanup:
+        try:
+            summary = cleanup_old_builds(
+                version, keep_staging=app_dir.parent,
+                purge_staging=args.purge_staging)
+            print_cleanup_summary(summary, args.purge_staging)
+        except Exception as exc:
+            # 清理只是省空间，绝不能把已经成功的构建判成失败
+            print(f"警告：旧版本清理未完成（不影响本次产物）：{exc}",
+                  file=sys.stderr, flush=True)
+    else:
+        print("已跳过旧版本清理（--keep-old / 本地测试构建）。", flush=True)
 
     print("构建完成。", flush=True)
     return 0

@@ -7,6 +7,7 @@ screenshots/
 converted/
 models/
 user_libs/
+cache/
 dist/
 build/
 *.spec

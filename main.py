@@ -9,9 +9,50 @@
 用户数据目录 user_libs。该分支不加载 Qt，也不会弹出第二个窗口。
 """
 import io
+import os
 import sys
 
 PIP_WORKER_FLAG = "--tt-pip-worker"
+
+
+def _install_third_party_notice_filter():
+    """精确静默 qfluentwidgets 在 import 时无条件打印的 Pro 广告。
+
+    这条 print 写在库自身的 config.py 模块顶层，没有开关；它既不是错误，
+    也与功能无关，每次启动都占一行控制台。只过滤这一行，其它输出
+    （含真正的报错、Warning、程序日志）全部原样转发。
+    设环境变量 TT_SHOW_LIB_NOTICES=1 可关闭过滤。
+    """
+    if os.environ.get("TT_SHOW_LIB_NOTICES") == "1":
+        return
+    inner = getattr(sys, "stdout", None)
+    if inner is None:
+        return
+
+    class _NoticeFilter:
+        def __init__(self, stream):
+            self._stream = stream
+            self._skip_blank = False
+
+        def write(self, data):
+            # print(ALERT) 会写两次：正文 + 单独的 "\n"。正文被吞掉后，
+            # 紧随其后的那次纯空白写入也要吞掉，否则控制台留一个空行。
+            if self._skip_blank:
+                self._skip_blank = False
+                if not data.strip():
+                    return len(data)
+            if "QFluentWidgets Pro is now released" in data:
+                self._skip_blank = True
+                return len(data)
+            return self._stream.write(data)
+
+        def flush(self):
+            return self._stream.flush()
+
+        def __getattr__(self, name):
+            return getattr(self._stream, name)
+
+    sys.stdout = _NoticeFilter(inner)
 
 
 def _prepare_worker_stdio():
@@ -58,5 +99,6 @@ def _run_pip_worker(argv):
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == PIP_WORKER_FLAG:
         sys.exit(_run_pip_worker(sys.argv[2:]))
+    _install_third_party_notice_filter()
     from app import run
     sys.exit(run())

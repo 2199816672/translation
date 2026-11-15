@@ -15,8 +15,21 @@ import requests
 import socket
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import user_config, TRANSLATION_APIS, DEFAULT_TRANSLATION_API, FREE_APIS, FREE_API_KEY_FIELDS
-from free_translator import get_free_translator
+from config import (
+    user_config, TRANSLATION_APIS, DEFAULT_TRANSLATION_API, FREE_APIS,
+    FREE_API_KEY_FIELDS, DEFAULT_FREE_API_FAILOVER,
+)
+from free_translator import get_free_translator, translate_with_failover
+from result_cache import get_cache, make_key
+
+# 影响译文的凭证：只要有一项变了，缓存键就变，绝不会把 A 密钥的结果
+# 复用到 B 密钥上。这些值只参与 make_key 的 sha256，不写进键、不落盘。
+_CACHE_CREDENTIAL_KEYS = (
+    'bing_azure_key', 'bing_azure_region', 'mymemory_api_key',
+    'google_cloud_key', 'deepl_api_key', 'deepl_use_free_api',
+    'baidu_appid', 'baidu_secret', 'tencent_secret_id', 'tencent_secret_key',
+    'volcengine_app_id', 'volcengine_token',
+)
 
 
 class TranslationError(Exception):
@@ -181,9 +194,11 @@ class VolcengineTranslator:
 
 class Translator:
     def __init__(self, source_lang='auto', target_lang='zh-CN', api_type=None,
-                 config_override=None):
+                 config_override=None, use_cache=True):
         self.source_lang = source_lang
         self.target_lang = target_lang
+        # 「测试连接」必须真的发一次请求，不能拿缓存里的旧成功结果糊弄用户
+        self.use_cache = bool(use_cache)
         # 设置页「测试连接」传入的是界面上还没保存的密钥快照。独立保存一份，
         # 绝不写进全局 user_config（会污染主窗口正在用的翻译器）。
         self._cfg = config_override
@@ -269,15 +284,39 @@ class Translator:
                 self.translator = "FREE_ENGINE"
         return self.translator
 
+    def _cache_key(self, text):
+        cfg = self._cfg if self._cfg is not None else user_config
+        creds = "\x1f".join(
+            f"{key}={cfg.get(key, '')}" for key in _CACHE_CREDENTIAL_KEYS)
+        return make_key("t1", self.api_type, self.source_lang,
+                        self.target_lang, self._free_engine or "",
+                        self._free_region or "", creds, text)
+
     def translate(self, text):
         if not text or not text.strip():
             return ""
         self._init_translator()
 
-        if self._free_engine:
-            return self._translate_free(text)
+        # 重复内容（同一句字幕、反复框选的同一段文字、来回切换的画面）
+        # 直接复用上次译文，省掉一次 1~15 秒的网络往返。
+        cache = get_cache("translation") if self.use_cache else None
+        key = self._cache_key(text) if cache is not None else None
+        if key is not None:
+            cached = cache.get(key)
+            if cached is not None:
+                return cached
 
-        return self._translate_paid(text)
+        if self._free_engine:
+            result = self._translate_free(text)
+        else:
+            result = self._translate_paid(text)
+
+        # 只缓存成功、非空、且没被原样回显的结果：绝不能把「失败」或
+        # 「原文冒充译文」固化下来，让后面几天都拿到假译文。
+        if (key is not None and isinstance(result, str) and result.strip()
+                and result.strip() != text.strip()):
+            cache.put(key, result)
+        return result
 
     def translate_paragraph(self, paragraph):
         """整段翻译：段内的硬换行先合并，过长时按句末标点分块再拼接。
@@ -313,27 +352,31 @@ class Translator:
         return separator.join(self.translate_paragraph(p) for p in paragraphs)
 
     def _translate_free(self, text):
-        free_t = get_free_translator(
-            self._free_engine, api_key=self._free_api_key,
-            region=self._free_region)
-        if not free_t:
-            raise TranslationError("翻译引擎初始化失败，请检查网络或 API 设置")
-        paragraphs = text.split('\n')
+        """免费引擎：首选挂掉时自动切换其它免费引擎（可在设置页关闭）。"""
+        cfg = self._cfg if self._cfg is not None else user_config
+        failover = bool(cfg.get('free_api_failover',
+                                DEFAULT_FREE_API_FAILOVER))
         results = []
-        for p in paragraphs:
-            if p.strip():
-                try:
-                    results.append(free_t.translate(p, self.source_lang, self.target_lang))
-                except TranslationError:
-                    raise
-                except Exception as e:
-                    hint = _diagnose_network_error(e)
-                    msg = f"翻译失败: {e}"
-                    if hint:
-                        msg += f"\n原因: {hint}"
-                    raise TranslationError(msg, reason=hint or str(e))
-            else:
+        for p in text.split('\n'):
+            if not p.strip():
                 results.append("")
+                continue
+            try:
+                translated, _engine = translate_with_failover(
+                    p, self.source_lang, self.target_lang,
+                    preferred=self._free_engine,
+                    api_key=self._free_api_key,
+                    region=self._free_region,
+                    enabled=failover)
+                results.append(translated)
+            except TranslationError:
+                raise
+            except Exception as e:
+                hint = _diagnose_network_error(e)
+                msg = f"翻译失败: {e}"
+                if hint:
+                    msg += f"\n原因: {hint}"
+                raise TranslationError(msg, reason=hint or str(e))
         return '\n'.join(results)
 
     def _translate_paid(self, text):
@@ -423,7 +466,7 @@ def test_translation(api_type=None, keys=None, target_lang='zh-CN',
 
     def probe():
         engine = Translator('auto', target_lang, api_type,
-                            config_override=keys)
+                            config_override=keys, use_cache=False)
         return engine.translate(text)
 
     try:

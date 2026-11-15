@@ -4,7 +4,6 @@
 import os
 import time
 import uuid
-import textwrap
 
 from PySide6.QtCore import Qt, QRect, QRectF, QPoint, Signal, QTimer
 from PySide6.QtGui import (
@@ -47,20 +46,69 @@ def _new_capture_path():
     return os.path.join(d, name)
 
 
+class _DragHandle(QFrame):
+    """提取 / 译文小窗口的标题栏：按住即可拖动整个弹窗。
+
+    弹窗是覆盖层的子控件，没有系统标题栏；只让标题栏响应拖动，
+    文本区里仍能正常选中 / 编辑文字，不会一按就把窗口拖走。
+    """
+
+    def __init__(self, popup, parent=None):
+        super().__init__(parent)
+        self._popup = popup
+        self._press_global = None
+        self._popup_pos = None
+        self.setCursor(QCursor(Qt.CursorShape.SizeAllCursor))
+        self.setToolTip("按住这里可以拖动窗口")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            # 必须用全局坐标做基准：弹窗会跟着鼠标一起移动，event.pos()
+            # 的参考系每次都在变，拿它算位移会半速拖动、抖动甚至回跳。
+            self._press_global = event.globalPosition().toPoint()
+            self._popup_pos = QPoint(self._popup.pos())
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (self._press_global is not None
+                and event.buttons() & Qt.MouseButton.LeftButton):
+            delta = event.globalPosition().toPoint() - self._press_global
+            nx = self._popup_pos.x() + delta.x()
+            ny = self._popup_pos.y() + delta.y()
+            parent = self._popup.parentWidget()
+            if parent is not None:
+                nx = max(0, min(nx, parent.width() - self._popup.width()))
+                ny = max(0, min(ny, parent.height() - self._popup.height()))
+            self._popup.move(nx, ny)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._press_global = None
+        self._popup_pos = None
+        super().mouseReleaseEvent(event)
+
+
 class ScreenshotOverlay(QWidget):
-    """全屏覆盖层：选区 → 菜单 → 提取(浮动文字框) / 翻译(叠加译文，可切换)。"""
+    """全屏覆盖层：选区 → 菜单 → 提取(按词点选 + 浮动窗口) / 翻译(叠加译文)。"""
 
     screenshotTaken = Signal(str)
     imageCopied = Signal(str)       # 复制图片成功，参数是图片尺寸说明
     extractRequested = Signal(str)
+    extractTranslateRequested = Signal(str)  # 提取窗口里选中的文字
     translateRequested = Signal(str)
     polishRequested = Signal(str, str)  # (kind, text)
     regionSelected = Signal(QRect)      # 实时翻译：选区（全局坐标）
     finished = Signal()
 
-    def __init__(self, auto_translate=False, live_select=False, parent=None):
+    def __init__(self, auto_translate=False, live_select=False, parent=None,
+                 snap_enabled=True):
         super().__init__(parent)
         self._live_select = live_select
+        # 窗口自动吸附：默认开，设置页可关；按住 Alt 可临时自由框选
+        self._snap_enabled = bool(snap_enabled)
+        self._snap_windows = []      # 浮层局部坐标的候选窗口 (l,t,r,b)
+        self._hover_window = None
+        self._snap_click_window = None
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
         )
@@ -91,11 +139,25 @@ class ScreenshotOverlay(QWidget):
         self._trans_paragraphs = []
         # [{text, trans, x, y, w, h}]，x/y/w/h 是相对裁剪图的 0~1 比例
         self._trans_blocks = []
+        # 「提取」识别到的视觉行位置，引擎不给词坐标时退化成淡蓝细框
+        self._extract_blocks = []
+        # 提取模式：原图上按词显示可点标签，选中后才进小窗口
+        self._word_blocks = []          # [{text,x,y,w,h,row}]，0~1 归一化
+        self._word_selected = set()
+        self._word_hover = -1           # 当前悬停的词，用于轻量高亮
+        self._word_drag_active = False
+        self._word_drag_select = True
+        self._word_user_edited = False
+        self._setting_extract_text = False
         self._showing_trans = False
         self._popup_rect = QRect()
         self._popup_close = QRect()
         self._extract_popup = None
         self._extract_text_edit = None
+        self._extract_hint = None
+        self._extract_badge = None
+        self._extract_trans_popup = None
+        self._extract_trans_edit = None
         self._edit_overlay = None
         self._edit_tool = "pen"
         self._edit_pen = False
@@ -159,10 +221,14 @@ class ScreenshotOverlay(QWidget):
         self._show_menu = False
         self._ocr_text = ""
         self._trans_blocks = []
+        self._extract_blocks = []
         self._showing_trans = False
         self._edit_overlay = None
         self._popup_close = QRect()
         self._selecting = False
+        self._clear_word_selection()
+        self._hide_extract_popup()
+        self._hide_trans_popup()
 
         geo = screen.geometry()
         # grabWindow(0) 抓取的是该屏幕本身；不要传全局坐标（多显示器会错位）
@@ -179,6 +245,115 @@ class ScreenshotOverlay(QWidget):
         self.raise_()
 
         self._calc_scale()
+        self._load_snap_windows()
+
+    # ── 窗口自动吸附 ──────────────────────────────────────────
+
+    def _load_snap_windows(self):
+        """枚举「当前屏幕上真实可见」的顶层窗口，换算成浮层局部坐标。"""
+        self._snap_windows = []
+        self._hover_window = None
+        self._snap_click_window = None
+        if not self._snap_enabled:
+            return
+        origin = self.geometry().topLeft()
+        sx = self._scale or 1.0
+        sy = self._scale_y or sx
+        try:
+            import window_snapper
+            # GetWindowRect 是物理像素、浮层 geometry 是逻辑像素：把当前
+            # 截图屏幕换算成物理矩形传下去。另一个显示器上的窗口、以及被
+            # 上层窗口完全遮住的后台窗口都不会成为吸附目标。
+            geo = self.geometry()
+            screen_rect = (
+                int(geo.left() * sx), int(geo.top() * sy),
+                int((geo.left() + geo.width()) * sx),
+                int((geo.top() + geo.height()) * sy))
+            raw = window_snapper.enum_visible_windows(
+                screen_rect=screen_rect)
+        except Exception:
+            raw = []
+        if not raw:
+            return
+        bounds = self.rect()
+        out = []
+        for left, top, right, bottom, _title in raw:
+            try:
+                ql = int(round(left / sx)) - origin.x()
+                qt = int(round(top / sy)) - origin.y()
+                qr = int(round(right / sx)) - origin.x()
+                qb = int(round(bottom / sy)) - origin.y()
+                rect = QRect(ql, qt, qr - ql, qb - qt).intersected(bounds)
+                if rect.width() >= 40 and rect.height() >= 30:
+                    out.append(window_snapper.rect_tuple(rect)
+                               + (_title,))
+            except Exception:
+                continue
+        self._snap_windows = out
+
+    @staticmethod
+    def _alt_pressed():
+        return bool(QApplication.queryKeyboardModifiers()
+                    & Qt.KeyboardModifier.AltModifier)
+
+    def _update_hover(self, pos):
+        """未框选时高亮鼠标下的最内层窗口（Alt 临时关闭吸附）。"""
+        active = (self._snap_enabled and self._crop_rect is None
+                  and not self._selecting and not self._show_menu
+                  and self._mode is None and not self._alt_pressed())
+        hit = None
+        if active and self._snap_windows:
+            try:
+                import window_snapper
+                hit = window_snapper.window_at(
+                    (pos.x(), pos.y()), self._snap_windows)
+            except Exception:
+                hit = None
+        if hit != self._hover_window:
+            self._hover_window = hit
+            self.update()
+
+    def _set_snap(self, enabled):
+        self._snap_enabled = bool(enabled)
+        if self._snap_enabled:
+            self._load_snap_windows()
+        else:
+            self._snap_windows = []
+            self._hover_window = None
+        self._status_text = ("窗口吸附已开启：单击选中窗口，拖框自动贴边"
+                             if self._snap_enabled else
+                             "窗口吸附已关闭：自由框选")
+        self._status_timer.start()
+        self.update()
+
+    def _draw_hover_window(self, p):
+        """微信式悬停高亮：蓝色描边 + 单击选中提示。"""
+        left, top, right, bottom, title = self._hover_window
+        rect = QRect(left, top, right - left, bottom - top)
+        p.setBrush(QColor(96, 165, 250, 26))
+        p.setPen(QPen(QColor("#60a5fa"), 2))
+        p.drawRect(rect)
+        # 四角短标记，明确这是「整窗边界」而不是选区
+        p.setPen(QPen(QColor("#93c5fd"), 3))
+        length = 16
+        for x, dx in ((rect.left(), 1), (rect.right(), -1)):
+            for y, dy in ((rect.top(), 1), (rect.bottom(), -1)):
+                p.drawLine(x, y, x + dx * length, y)
+                p.drawLine(x, y, x, y + dy * length)
+        hint = (f"{title} · {rect.width()}×{rect.height()}"
+                if title else f"{rect.width()}×{rect.height()}")
+        hint += "  |  单击选中整个窗口 · 按住 Alt 自由框选"
+        font = QFont("Microsoft YaHei")
+        font.setPixelSize(13)
+        p.setFont(font)
+        tw = p.fontMetrics().horizontalAdvance(hint)
+        hx = max(4, min(self.width() - tw - 20, rect.left()))
+        hy = rect.top() - 10 if rect.top() > 34 else rect.bottom() + 24
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(12, 14, 20, 210))
+        p.drawRoundedRect(QRect(hx - 8, hy - 18, tw + 16, 26), 5, 5)
+        p.setPen(QColor(Palette.TEXT))
+        p.drawText(hx, hy, hint)
 
     def _calc_scale(self):
         """根据实际 pixmap 和 widget 尺寸计算缩放比（x/y 分别计算）。"""
@@ -272,16 +447,54 @@ class ScreenshotOverlay(QWidget):
 
     # ── 外部调用 ──────────────────────────────────────────────
 
-    def show_ocr_result(self, text):
+    def show_ocr_result(self, text, blocks=None, words=None):
+        """提取完成：原图【按词】显示可点标签，选中的词才进小窗口。
+
+        words 是归一化 (0~1) 的词坐标。默认一个都不选：用户点击或按住拖过
+        原图上的词，把需要的文字挑进窗口；漏识别 / 错识别的地方可直接在
+        窗口里手动补字。引擎不给词坐标时退回全文显示，仍可编辑。
+        """
         self._status_text = ""
+        # 上一轮可能还开着译文窗口，新一轮提取必须先收起，避免旧译文混进来
+        self._hide_trans_popup()
         self._ocr_text = text
         self._ocr_paragraphs = self._split_paragraphs(text)
+        self._extract_blocks = [dict(b) for b in (blocks or [])]
+        # Windows OCR 原生词坐标没有 row；统一补齐，让「原图上的视觉行」
+        # 与「小窗口里汇总出来的文字行」始终一致，也好按行画高亮带。
+        from text_segment import assign_word_rows
+        self._word_blocks = assign_word_rows(
+            [dict(w) for w in (words or [])])
+        self._word_selected = set()
+        self._word_hover = -1
+        self._word_user_edited = False
+        self._word_drag_active = False
         self._trans_text = ""
         self._trans_paragraphs = []
         self._showing_trans = False
         self._mode = "extract"
         self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
-        self._show_extract_popup(text)
+        # 有词块就等用户点选；没有词坐标的旧引擎直接给全文，仍可编辑
+        self._show_extract_popup(
+            "" if self._word_blocks else text)
+        self.update()
+
+    def show_extract_translation(self, text, error=""):
+        """提取小窗口「翻译」的结果：显示在另一个可拖动窗口里。
+
+        失败时只显示错误，绝不把原文塞进译文位置。
+        """
+        if self._mode != "extract":
+            return
+        if self._extract_trans_popup is None:
+            self._create_trans_popup()
+        self._setting_extract_text = True
+        self._extract_trans_edit.setPlainText(
+            (error or "翻译失败，未返回译文") if error else str(text or ""))
+        self._setting_extract_text = False
+        self._place_popup(self._extract_trans_popup, 380, 232,
+                          prefer_below=True)
+        self._extract_trans_popup.raise_()
 
     def show_trans_result(self, text):
         self._trans_blocks = []
@@ -327,10 +540,11 @@ class ScreenshotOverlay(QWidget):
         self.update()
 
     def show_error(self, msg):
-        """后台识别/翻译失败：清除等待提示并恢复菜单（错误详情在主窗口状态栏）。"""
-        self._status_text = ""
+        """后台识别/翻译失败：浮层上给可见提示，别让用户以为「点了没反应」。"""
+        self._status_text = msg or "识别或翻译失败，可把选区框大一点再试"
         self._show_menu = True
         self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+        self._status_timer.start()
         self.update()
 
     @staticmethod
@@ -353,15 +567,25 @@ class ScreenshotOverlay(QWidget):
         target = QRect(0, 0, self.width(), self.height())
         p.drawPixmap(target, self._raw_pixmap)
 
+        if (not self._crop_rect and not self._selecting
+                and self._hover_window is not None):
+            self._draw_hover_window(p)
         if not self._crop_rect and (self._selecting or self._live_select):
             self._draw_selecting(p)
         elif self._crop_rect:
             self._draw_crop(p)
-            # 翻译模式下无论显示「译文」还是「原文」都绘制叠加层；
-            # _draw_trans_blocks / _draw_trans_stacked 内部已按 _showing_trans
-            # 决定画译文还是原文，否则切回原文会什么都不显示。
-            if self._mode == "translate":
+            # 只有「译文」状态才叠加覆盖层。切到「原文」直接去掉翻译、
+            # 露出原始截图，不再把 OCR 提取文字画成一排小黑框；想看提取了
+            # 什么文字，请用「提取」的识别文字小窗口（并附位置高亮）。
+            if self._mode == "translate" and self._showing_trans:
                 self._draw_trans_overlay(p)
+            elif self._mode == "extract" and (
+                    self._word_blocks or self._extract_blocks):
+                # 提取：优先按词画可点标签；拿不到词坐标的引擎退回整行细框
+                if self._word_blocks:
+                    self._draw_word_chips(p)
+                else:
+                    self._draw_extract_highlights(p)
 
         if self._status_text:
             self._draw_status(p)
@@ -394,8 +618,9 @@ class ScreenshotOverlay(QWidget):
             hint = "拖动框选要实时翻译的区域 | 回车开始 | ESC/右键 取消"
         else:
             # 选完区才有工具栏，11 个功能此前在主界面一字未提
-            hint = ("拖动鼠标选择区域 | 松开后：提取 / 翻译 / 编辑标注 / "
-                    "复制或保存图片 | ESC/右键 取消")
+            hint = ("拖动框选 | 单击可选中整个窗口 · 拖框自动贴边 · "
+                    "按住 Alt 自由框选 | 松开后：提取 / 翻译 / 编辑 / "
+                    "复制 / 保存 | ESC/右键 取消")
         tw = p.fontMetrics().horizontalAdvance(hint)
         hx = self.width() // 2 - tw // 2
         hy = self.height() - 50
@@ -471,7 +696,11 @@ class ScreenshotOverlay(QWidget):
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRect(box)
 
-        p.setPen(QPen(QColor("#ef4444"), 1))
+        # 提取模式用与词高亮同色系的柔和蓝框：红框 + 一堆标记混在一起
+        # 会显得很乱；其它模式保留原来的红色选区框。
+        frame = (QColor(96, 165, 250, 165) if self._mode == "extract"
+                 else QColor(239, 68, 68, 190))
+        p.setPen(QPen(frame, 1))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRect(r)
 
@@ -651,17 +880,25 @@ class ScreenshotOverlay(QWidget):
                 actions = ["复制文字", "复制图片", "保存", "提取", "翻译"]
             else:
                 actions = ["复制", "保存", "提取", "翻译"]
-            if self._mode == "translate" and self._ocr_text:
-                actions[-1] = "原文" if self._showing_trans else "翻译"
+            if self._mode == "translate":
+                # 文案说清「切到什么」，不写成会被误认为重新翻译的「翻译」。
+                # 只要已有译文结果就能切换，不依赖是否附带 OCR 原文。
+                actions[-1] = "原文" if self._showing_trans else "译文"
             if self._trans_text.strip():
                 actions.append("润色")
             actions.extend(["编辑", "取消"])
             for name in actions:
                 btn = self._menu_button(
                     name, lambda n=name: self._do_action(n))
-                if name in ("复制", "复制图片", "复制文字", "翻译", "保存"):
+                if name in ("复制", "复制图片", "复制文字",
+                            "翻译", "译文", "保存"):
                     btn.setProperty("kind", "primary")
+                if name in ("原文", "译文"):
+                    btn.setToolTip(
+                        "在译文 / 原文之间切换；也可以直接点击选区内的译文区域")
                 self._row1_layout.addWidget(btn)
+            # 工具栏保持精简的一行：窗口吸附开关统一放在设置页，
+            # 不再往小菜单里塞第二行（用户反馈那样太丑）。
             self._menu_row2.setVisible(False)
 
         self._menu.adjustSize()
@@ -722,7 +959,199 @@ class ScreenshotOverlay(QWidget):
         self._menu.show()
         self._menu.raise_()
 
-    # ── 翻译叠加 ─────────────────────────────────────────────
+    # ── 翻译叠加 / 提取位置高亮 ───────────────────────────────
+
+    def _draw_extract_highlights(self, p):
+        """提取模式：淡蓝细框标出「哪里识别到了文字」，不遮挡原图内容。
+
+        只描边、不铺底色、不写字——文字内容由已有的识别文字小窗口展示。
+        原文模式不再负责展示提取文字，这条路径把它接管过来。
+        """
+        cr = self._crop_rect
+        if not cr or not self._extract_blocks:
+            return
+        p.save()
+        p.setClipRect(cr)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(96, 165, 250, 140), 1))
+        for b in self._extract_blocks:
+            x = cr.left() + float(b.get("x", 0)) * cr.width()
+            y = cr.top() + float(b.get("y", 0)) * cr.height()
+            w = float(b.get("w", 0)) * cr.width()
+            h = float(b.get("h", 0)) * cr.height()
+            rect = QRect(int(x) - 1, int(y) - 1,
+                         max(4, int(w) + 2), max(4, int(h) + 2))
+            rect = rect.intersected(cr)
+            if not rect.isEmpty():
+                p.drawRoundedRect(rect, 3, 3)
+        p.restore()
+
+    # ── 提取：按词点选 ────────────────────────────────────────
+
+    def _word_rect(self, word):
+        """词块（0~1 归一化）→ 屏幕矩形；保证最小可点面积，方便小字点选。"""
+        cr = self._crop_rect
+        if not cr:
+            return QRect()
+        x = cr.left() + float(word.get("x", 0)) * cr.width()
+        y = cr.top() + float(word.get("y", 0)) * cr.height()
+        w = float(word.get("w", 0)) * cr.width()
+        h = float(word.get("h", 0)) * cr.height()
+        pad = 2
+        rect = QRect(int(x) - pad, int(y) - pad,
+                     max(14, int(w) + pad * 2),
+                     max(14, int(h) + pad * 2))
+        return rect.intersected(self.rect())
+
+    def _word_at(self, pos):
+        """命中测试：外扩后的词框可能轻微重叠，取包含该点的最小框。"""
+        best, best_area = -1, None
+        for i, word in enumerate(self._word_blocks):
+            rect = self._word_rect(word)
+            if rect.contains(pos):
+                area = rect.width() * rect.height()
+                if best_area is None or area < best_area:
+                    best, best_area = i, area
+        return best
+
+    def _word_rows(self):
+        """按视觉行整理 [(词索引, 词矩形)]，组内按 x 排序。
+
+        行号由 text_segment.assign_word_rows 统一补齐，绘制端不再自己猜，
+        保证「原图上的行」与「小窗口里汇总出来的行」是同一套。
+        """
+        rows = {}
+        for i, word in enumerate(self._word_blocks):
+            rect = self._word_rect(word)
+            if rect.isEmpty():
+                continue
+            rows.setdefault(int(word.get("row", 0)), []).append((i, rect))
+        out = []
+        for row in sorted(rows):
+            items = sorted(rows[row], key=lambda it: it[1].left())
+            if items:
+                out.append(items)
+        return out
+
+    @staticmethod
+    def _united(rects):
+        rect = QRect()
+        for r in rects:
+            rect = rect.united(r)
+        return rect
+
+    def _draw_word_chips(self, p):
+        """提取模式：标出「哪些词可以点」，但不再用实心块盖住原图。
+
+        旧实现每个词一个白底黑字标签：控制台这类密集文本动辄 80+ 个白块，
+        互相重叠、词被截成 "Pyth…"，原图反而看不清。现在改成不写一个字
+        的三层轻量提示：
+          1. 每个视觉行一条极淡的圆角底带（N 行而不是 N 个方块）；
+          2. 每个词底部一条细下划线，暗示可点的词边界；
+          3. 连续选中的词合并成一段蓝色高亮，悬停词单独描边。
+        命中仍按单个词的原始矩形，逐词点选 / 按住拖选完全不变；绘制
+        clip 在选区内，OCR 坐标偶尔越界也不会把标记画到框外。
+        """
+        if not self._crop_rect or not self._word_blocks:
+            return
+        rows = self._word_rows()
+        if not rows:
+            return
+        p.save()
+        p.setClipRect(self._crop_rect)
+        p.setPen(Qt.PenStyle.NoPen)
+        # 词特别多时把下划线压淡一点，密密麻麻的短线也会显得吵；
+        # 但至少要看得见，否则用户不知道哪里能点。
+        line_alpha = 70 if len(self._word_blocks) > 60 else 115
+
+        # 1) 行带：只铺一层极淡底色，不描边。行带把零散的词组织成行，
+        #    又不会和词下划线叠成「上下两条平行线」显得像网格。
+        for row in rows:
+            band = self._united([r for _, r in row]).adjusted(-2, -2, 2, 2)
+            p.setBrush(QColor(15, 23, 42, 42))
+            p.drawRoundedRect(band, 4, 4)
+
+        # 2) 未选中词的下划线；同时收集同行连续选中的词
+        runs = []
+        for row in rows:
+            run = []
+            for idx, r in row:
+                if idx in self._word_selected:
+                    run.append(r)
+                    continue
+                if run:
+                    runs.append(run)
+                    run = []
+                p.setBrush(QColor(96, 165, 250, line_alpha))
+                p.drawRect(QRect(r.left() + 1, r.bottom() - 1,
+                                 max(2, r.width() - 2), 2))
+            if run:
+                runs.append(run)
+
+        # 3) 连续选中的词合成一段高亮，不再散成一堆碎蓝块
+        for run in runs:
+            hi = self._united(run).adjusted(-1, -1, 1, 1)
+            p.setBrush(QColor(59, 130, 246, 110))
+            p.setPen(QPen(QColor(147, 197, 253, 215), 1))
+            p.drawRoundedRect(hi, 3, 3)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(147, 197, 253, 235))
+            p.drawRect(QRect(hi.left() + 1, hi.bottom() - 2,
+                             max(2, hi.width() - 2), 2))
+
+        # 4) 悬停词：淡填充 + 亮描边，明确「这里可以点」
+        if (0 <= self._word_hover < len(self._word_blocks)
+                and self._word_hover not in self._word_selected):
+            hr = self._word_rect(self._word_blocks[self._word_hover])
+            if not hr.isEmpty():
+                p.setBrush(QColor(96, 165, 250, 58))
+                p.setPen(QPen(QColor(147, 197, 253, 190), 1))
+                p.drawRoundedRect(hr.adjusted(-1, -1, 1, 1), 3, 3)
+        p.restore()
+
+    def _clear_word_selection(self):
+        self._word_blocks = []
+        self._word_selected = set()
+        self._word_hover = -1
+        self._word_drag_active = False
+        self._word_drag_select = True
+        self._word_user_edited = False
+
+    def _selected_words_text(self):
+        from text_segment import words_to_text
+        return words_to_text(self._word_blocks, self._word_selected)
+
+    def _apply_word_selection(self, index, select):
+        """点击 / 按住滑动经过一个词：按起手时决定的「加」或「减」批量处理。"""
+        if index < 0 or index >= len(self._word_blocks):
+            return
+        if (index in self._word_selected) == bool(select):
+            return
+        if select:
+            self._word_selected.add(index)
+        else:
+            self._word_selected.discard(index)
+        self._sync_extract_text()
+        self.update()
+
+    def _sync_extract_text(self):
+        """把当前选中的词按原图行序汇总进小窗口。
+
+        用户手动改过文字后不再覆盖，避免把补的字抹掉；点「全选 / 清空」
+        会重置这一状态重新按词汇总。
+        """
+        if self._word_user_edited or self._extract_text_edit is None:
+            return
+        self._set_extract_text(self._selected_words_text())
+        self._update_extract_hint()
+
+    def _popup_contains(self, pos):
+        """点在小窗口里时交给子控件处理（拖动 / 编辑 / 按钮）。"""
+        for popup in (self._extract_popup, self._extract_trans_popup):
+            if (popup is not None and popup.isVisible()
+                    and popup.geometry().contains(pos)):
+                return True
+        return False
 
     @staticmethod
     def _wrap_to_width(fm, text, max_w):
@@ -749,21 +1178,28 @@ class ScreenshotOverlay(QWidget):
         self._popup_close = cr2
 
     def _draw_trans_blocks(self, p):
-        """译文按【视觉段落】原位整块覆盖。
+        """译文按【视觉行】原位贴回：每行一个小底框，字号各自自适应。
 
-        一个自然段 = 一个大底框，完整盖住整段原文 bbox；字号从大到小
-        自适应，挑能放下整段译文的最大值，再把译文按行距均匀铺开，
-        避免「一条小横幅 + 小字」或大框里空一大片。先铺全部底框再写字，
-        保证原文不裸露，也不会让后画的框盖掉先写的译文。
+        分组已由 text_segment.group_blocks_fine 拆到「行」级别。旧实现挑
+        一个「所有段落都放得下」的统一字号，一个小标签就把整屏压成 11px，
+        还会把整段 bbox 撑成一个盖住半个窗口的大黑框。这里改为每块独立
+        挑字号、底框最多两行，位置与原文字一一对应。
         """
         cr = self._crop_rect
-        key = "trans" if self._showing_trans else "text"
-        pad = 10
-        bleed = 3          # OCR bbox 常略小于字形，向外扩一点确保盖住
+        # 切到「原文」时 paintEvent 直接跳过整个覆盖层，这里只负责画译文，
+        # 不再把 OCR 提取文字贴回原位置。
+        key = "trans"
+        pad = 6
+        bleed = 2          # OCR bbox 常略小于字形，向外扩一点确保盖住
         right = min(self.width(), cr.right() + 1)
         bottom = min(self.height(), cr.bottom() + 1)
+        # 只框住 "Portrait" 这类词时，原文行只有几十像素宽，译文硬塞进去
+        # 会被截成「人像…」，看起来像「翻译不显示」。窄行允许译文框向右
+        # 扩到可读宽度；设上限避免又变成盖住半个窗口的大黑框。
+        min_readable_w = 150
+        max_box_w = 300
 
-        # 1) 原文段落 bbox（相对裁剪图的 0~1 比例）→ 屏幕矩形
+        # 1) 原文行 bbox（相对裁剪图的 0~1 比例）→ 屏幕矩形
         rects = []
         for b in self._trans_blocks:
             ox = cr.left() + float(b.get("x", 0)) * cr.width()
@@ -776,69 +1212,67 @@ class ScreenshotOverlay(QWidget):
             h = max(8, min(int(oh + bleed * 2), bottom - top))
             rects.append((left, top, w, h))
 
-        # 2) 字号从大到小：挑第一个「所有段落都放得下」的字号。
-        #    整段 bbox 有 200px+ 高，通常能用 18~22px，不再被压成小字。
+        # 2) 每块独立挑字号：字号跟随原文行高（保持原界面的视觉层级），
+        #    译文放不下才逐级减小，互不拖累。
         font = QFont("Microsoft YaHei")
-        chosen = None
-        for size in (22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11):
-            font.setPixelSize(size)
-            fm = QFontMetrics(font)
-            items = []
-            fits_all = True
-            for b, (left, top, w, h) in zip(self._trans_blocks, rects):
-                max_w = max(24, w - pad * 2)
-                lines = self._wrap_to_width(
-                    fm, str(b.get(key) or "").strip(), max_w) or [""]
-                need = len(lines) * fm.height() + pad * 2
-                items.append((lines, need, max_w))
-                if need > h:
-                    fits_all = False
-            chosen = (QFont(font), QFontMetrics(font), items)
-            if fits_all:
-                break
-        font, fm, items = chosen
-        line_h = fm.height()
+        font.setPixelSize(13)
+        probe = QFontMetrics(font)
+        items = []
+        for b, (left, top, w, h) in zip(self._trans_blocks, rects):
+            text = str(b.get(key) or "").strip()
+            box_w = w
+            if w < min_readable_w and text:
+                natural = probe.horizontalAdvance(text) + pad * 2
+                box_w = max(w, min(natural, max_box_w,
+                                   max(24, self.width() - left)))
+            start = max(11, min(20, int(h * 0.8)))
+            sizes = list(range(start, 10, -1))
+            chosen = None
+            for size in sizes:
+                font.setPixelSize(size)
+                fm = QFontMetrics(font)
+                max_w = max(24, box_w - pad * 2)
+                lines = self._wrap_to_width(fm, text, max_w) or [""]
+                need_h = len(lines) * fm.height() + pad * 2
+                chosen = (QFont(font), QFontMetrics(font), lines, max_w, box_w)
+                if need_h <= max(h, 22) or size == sizes[-1]:
+                    break
+            items.append(chosen)
 
-        # 3) 先铺全部底框：框高 = max(原文 bbox, 译文所需)，所有块都画。
-        #    绝不能比原文矮，否则段内的英文行会裸露。
-        heights = [min(max(h, need), max(8, bottom - top))
-                   for (_, top, _, h), (_, need, _) in zip(rects, items)]
+        # 3) 先铺全部底框：高度取 max(原文行, 译文所需)，但最多两行，
+        #    且允许越过选区底部（小选区也能完整显示译文），不会盖住下方控件。
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(0, 0, 0, 238))
-        for (left, top, w, h), draw_h in zip(rects, heights):
-            p.drawRoundedRect(QRect(left, top, w, draw_h), 6, 6)
-
-        # 4) 逐块写译文：行距按可用高度铺开 + 整体居中，大框不显空旷
-        for (left, top, w, h), (lines, need, max_w), draw_h in zip(
-                rects, items, heights):
-            keep = (len(lines) if need <= draw_h else
-                    max(1, int((draw_h - pad * 2) // line_h)))
-            draw = list(lines[:keep])
-            if len(lines) > keep and draw:
+        p.setBrush(QColor(12, 14, 20, 226))
+        boxes = []
+        for (left, top, w, h), (fnt, fm, lines, max_w, box_w) in zip(rects, items):
+            line_h = fm.height()
+            draw = list(lines[:2])
+            if len(lines) > 2 and draw:
                 last = draw[-1]
                 while last and fm.horizontalAdvance(last + "…") > max_w:
                     last = last[:-1]
                 draw[-1] = (last.rstrip("，,、 ") + "…") if last else "…"
-            step = int(min(line_h * 2.0,
-                           max(line_h, (draw_h - pad * 2)
-                               // max(1, len(draw)))))
-            used = len(draw) * step
+            draw_h = min(max(h, len(draw) * line_h + pad * 2),
+                         max(8, self.height() - top))
+            boxes.append((left, top, draw_h, fnt, fm, draw, line_h))
+            p.drawRoundedRect(QRect(left, top, box_w, draw_h), 5, 5)
+
+        # 4) 逐块写译文，在各自的小框里垂直居中
+        for left, top, draw_h, fnt, fm, draw, line_h in boxes:
+            used = len(draw) * line_h
             ty = int(top + pad + fm.ascent()
                      + max(0, (draw_h - pad * 2 - used) // 2))
+            p.setFont(fnt)
             p.setPen(QColor(Palette.TEXT))
-            p.setFont(font)
             for line in draw:
                 p.drawText(left + pad, ty, line)
-                ty += step
+                ty += line_h
 
     def _draw_trans_stacked(self, p):
         """没有位置信息时的回退：整段按段落顺序从选区左上角往下堆。"""
         cr = self._crop_rect
-        if self._showing_trans:
-            paragraphs = self._trans_paragraphs
-        else:
-            paragraphs = self._ocr_paragraphs if self._ocr_paragraphs else (
-                [self._ocr_text] if self._ocr_text else [])
+        # 原文状态不绘制叠加层；这里只负责译文的整段回退显示
+        paragraphs = self._trans_paragraphs
         if not paragraphs:
             return
 
@@ -934,79 +1368,184 @@ class ScreenshotOverlay(QWidget):
         p.setFont(font)
         p.drawText(QRect(bx, by, bw, bh), Qt.AlignmentFlag.AlignCenter, text)
 
-    # ── 提取弹窗（真实 Widget）──────────────────────────────
+    # ── 提取 / 译文小窗口（可拖动的真实 Widget）──────────────
 
-    def _create_extract_popup(self):
-        self._extract_popup = QFrame(self)
-        self._extract_popup.setObjectName("extractPopup")
-        self._extract_popup.setStyleSheet(f"""
-            QFrame#extractPopup {{
+    def _popup_style(self, name):
+        return f"""
+            QFrame#{name} {{
                 background: {Palette.SURFACE};
                 border: 1px solid {Palette.BORDER};
-                border-radius: 10px;
+                border-radius: 12px;
             }}
             QTextEdit {{
                 background: {Palette.BG_INPUT};
                 color: {Palette.TEXT};
-                border: 1px solid {Palette.BORDER};
-                border-radius: 6px;
-                padding: 6px;
+                border: 1px solid {Palette.BORDER_SOFT};
+                border-radius: 8px;
+                padding: 8px 10px;
                 font-size: 13px;
                 font-family: 'Microsoft YaHei';
             }}
             QTextEdit:focus {{ border: 1px solid {Palette.FOCUS}; }}
             QPushButton {{
-                background: transparent;
-                color: {Palette.TEXT_MUTED};
-                border: none;
-                font-size: 14px;
+                background: {Palette.SURFACE_HOVER};
+                color: {Palette.TEXT};
+                border: 1px solid {Palette.BORDER_SOFT};
+                border-radius: 6px;
+                padding: 4px 11px;
+                font-size: 12px;
                 font-family: 'Microsoft YaHei';
             }}
-            QPushButton:hover {{ color: {Palette.TEXT_STRONG}; }}
-            QLabel {{
-                background: transparent;
-                border: none;
-                color: {Palette.TEXT_STRONG};
-                font-size: 13px;
+            QPushButton:hover {{
+                border-color: {Palette.FOCUS}; color: {Palette.TEXT_STRONG};
+            }}
+            QPushButton#popupPrimary {{
+                background: {Palette.PRIMARY};
+                color: {Palette.PRIMARY_TEXT};
+                border: 1px solid {Palette.PRIMARY};
                 font-weight: 600;
+            }}
+            QPushButton#popupPrimary:hover {{
+                background: {Palette.PRIMARY_HOVER};
+                color: {Palette.PRIMARY_TEXT};
+            }}
+            QPushButton#popupClose {{
+                background: transparent; border: none; padding: 0;
+                color: {Palette.TEXT_MUTED}; font-size: 15px;
+            }}
+            QPushButton#popupClose:hover {{ color: {Palette.TEXT_STRONG}; }}
+            QLabel {{
+                background: transparent; border: none;
+                color: {Palette.TEXT_STRONG};
+                font-size: 13px; font-weight: 600;
                 font-family: 'Microsoft YaHei';
             }}
-        """)
-        layout = QVBoxLayout(self._extract_popup)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(6)
+            QLabel#popupHint {{
+                color: {Palette.TEXT_MUTED}; font-size: 11px;
+                font-weight: 400; padding: 1px 0 3px 0;
+            }}
+            QLabel#popupBadge {{
+                color: {Palette.TEXT_MUTED};
+                background: {Palette.SURFACE_HOVER};
+                border: 1px solid {Palette.BORDER_SOFT};
+                border-radius: 8px; padding: 1px 7px;
+                font-size: 11px; font-weight: 400;
+            }}
+        """
 
-        header = QHBoxLayout()
-        title = QLabel("识别文字")
-        header.addWidget(title)
-        header.addStretch(1)
-        close_btn = QPushButton("×")
+    def _make_popup_header(self, popup, title, on_close, badge=None):
+        handle = _DragHandle(popup)
+        row = QHBoxLayout(handle)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        label = QLabel(title, handle)
+        # 标题不吞鼠标事件，整个标题栏都能抓住拖动
+        label.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        row.addWidget(label)
+        if badge is not None:
+            row.addWidget(badge)
+        row.addStretch(1)
+        close_btn = QPushButton("×", handle)
+        close_btn.setObjectName("popupClose")
         close_btn.setFixedSize(22, 22)
         close_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        close_btn.clicked.connect(self._on_extract_popup_close)
-        header.addWidget(close_btn)
-        layout.addLayout(header)
+        close_btn.clicked.connect(on_close)
+        row.addWidget(close_btn)
+        return handle
 
-        self._extract_text_edit = QTextEdit()
-        self._extract_text_edit.setReadOnly(True)
-        self._extract_text_edit.setMinimumSize(300, 120)
-        self._extract_text_edit.setMaximumSize(420, 500)
-        self._extract_text_edit.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
-        layout.addWidget(self._extract_text_edit)
+    @staticmethod
+    def _popup_button(label, slot):
+        btn = QPushButton(label)
+        btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn.clicked.connect(slot)
+        return btn
 
-        # 底部操作：一键复制 / 保存识别文字，避免弹窗里还得手动 Ctrl+C
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-        self._extract_copy_btn = QPushButton("复制")
-        self._extract_copy_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self._extract_copy_btn.clicked.connect(self._on_extract_copy)
-        self._extract_save_btn = QPushButton("保存")
-        self._extract_save_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self._extract_save_btn.clicked.connect(self._on_extract_save)
-        btn_row.addStretch(1)
-        btn_row.addWidget(self._extract_copy_btn)
-        btn_row.addWidget(self._extract_save_btn)
-        layout.addLayout(btn_row)
+    def _create_extract_popup(self):
+        self._extract_popup = QFrame(self)
+        self._extract_popup.setObjectName("extractPopup")
+        self._extract_popup.setStyleSheet(self._popup_style("extractPopup"))
+        layout = QVBoxLayout(self._extract_popup)
+        layout.setContentsMargins(14, 11, 14, 12)
+        layout.setSpacing(8)
+
+        # 标题栏右侧的「已选 / 总数」徽标，选词进度一眼可见
+        self._extract_badge = QLabel("", self._extract_popup)
+        self._extract_badge.setObjectName("popupBadge")
+        layout.addWidget(self._make_popup_header(
+            self._extract_popup, "识别文字", self._on_extract_popup_close,
+            badge=self._extract_badge))
+
+        self._extract_hint = QLabel("", self._extract_popup)
+        self._extract_hint.setObjectName("popupHint")
+        self._extract_hint.setWordWrap(True)
+        layout.addWidget(self._extract_hint)
+
+        self._extract_text_edit = QTextEdit(self._extract_popup)
+        # 可编辑：OCR 漏识别 / 认错字时用户能直接补上，不必重新框选
+        self._extract_text_edit.setReadOnly(False)
+        self._extract_text_edit.setMinimumSize(300, 100)
+        self._extract_text_edit.setMaximumSize(460, 500)
+        self._extract_text_edit.setWordWrapMode(
+            QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        self._extract_text_edit.setPlaceholderText(
+            "点击或拖过原图上带下划线的词，选中的文字会出现在这里；\n"
+            "也可以直接输入，补上没识别到的内容")
+        self._extract_text_edit.textChanged.connect(
+            self._on_extract_text_changed)
+        layout.addWidget(self._extract_text_edit, 1)
+
+        # 按钮收成整齐一行：选择类在左，输出类与主操作在右
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self._extract_all_btn = self._popup_button(
+            "全选", self._on_extract_select_all)
+        self._extract_clear_btn = self._popup_button(
+            "清空", self._on_extract_clear)
+        self._extract_copy_btn = self._popup_button(
+            "复制", self._on_extract_copy)
+        self._extract_save_btn = self._popup_button(
+            "保存", self._on_extract_save)
+        self._extract_translate_btn = self._popup_button(
+            "翻译", self._on_extract_translate)
+        self._extract_translate_btn.setObjectName("popupPrimary")
+        row.addWidget(self._extract_all_btn)
+        row.addWidget(self._extract_clear_btn)
+        row.addStretch(1)
+        row.addWidget(self._extract_copy_btn)
+        row.addWidget(self._extract_save_btn)
+        row.addWidget(self._extract_translate_btn)
+        layout.addLayout(row)
+
+    def _create_trans_popup(self):
+        self._extract_trans_popup = QFrame(self)
+        self._extract_trans_popup.setObjectName("extractTransPopup")
+        self._extract_trans_popup.setStyleSheet(
+            self._popup_style("extractTransPopup"))
+        layout = QVBoxLayout(self._extract_trans_popup)
+        layout.setContentsMargins(14, 11, 14, 12)
+        layout.setSpacing(8)
+        layout.addWidget(self._make_popup_header(
+            self._extract_trans_popup, "译文", self._hide_trans_popup))
+        self._extract_trans_edit = QTextEdit(self._extract_trans_popup)
+        self._extract_trans_edit.setReadOnly(False)
+        self._extract_trans_edit.setMinimumSize(300, 100)
+        self._extract_trans_edit.setMaximumSize(460, 500)
+        self._extract_trans_edit.setWordWrapMode(
+            QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        self._extract_trans_edit.setPlaceholderText("译文会显示在这里，可直接修改后复制")
+        layout.addWidget(self._extract_trans_edit, 1)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self._extract_trans_copy_btn = self._popup_button(
+            "复制", self._on_extract_trans_copy)
+        self._extract_trans_save_btn = self._popup_button(
+            "保存", self._on_extract_trans_save)
+        self._extract_trans_copy_btn.setObjectName("popupPrimary")
+        row.addStretch(1)
+        row.addWidget(self._extract_trans_copy_btn)
+        row.addWidget(self._extract_trans_save_btn)
+        layout.addLayout(row)
 
     def _flash_extract_btn(self, btn, text):
         """在弹窗按钮上就地显示短反馈并自动恢复。
@@ -1027,29 +1566,101 @@ class ScreenshotOverlay(QWidget):
                 pass  # 弹窗已被销毁
         QTimer.singleShot(1200, _restore)
 
+    def _set_extract_text(self, text):
+        """程序写入小窗口：加标志，别被 textChanged 误判成用户手动编辑。"""
+        if self._extract_text_edit is None:
+            return
+        self._setting_extract_text = True
+        self._extract_text_edit.setPlainText(text or "")
+        self._setting_extract_text = False
+
+    def _on_extract_text_changed(self):
+        if self._setting_extract_text:
+            return
+        self._word_user_edited = True
+        self._update_extract_hint()
+
+    def _update_extract_hint(self):
+        """提示与标题栏徽标随选择状态刷新；文案保持简短，别撑高窗口。"""
+        if self._extract_hint is None:
+            return
+        total = len(self._word_blocks)
+        picked = len(self._word_selected)
+        if self._extract_badge is not None:
+            self._extract_badge.setText(
+                f"{picked} / {total} 词" if total else "全文")
+        if not total:
+            self._extract_hint.setText(
+                "当前引擎不支持按词点选，可直接编辑下方文字")
+        elif self._word_user_edited:
+            self._extract_hint.setText(
+                "已手动编辑 · 点「全选 / 清空」可恢复按词汇总")
+        elif not picked:
+            self._extract_hint.setText(
+                f"点选或拖过原图上带下划线的词 · 共 {total} 个 · Esc / × 退出")
+        else:
+            self._extract_hint.setText(
+                f"已选 {picked} 个词 · 文字可直接修改 · Esc / × 退出")
+
     def _show_extract_popup(self, text):
         if self._extract_popup is None:
             self._create_extract_popup()
-        self._extract_text_edit.setPlainText(text)
-        cr = self._crop_rect
-        popup_w = min(400, max(300, self.width() // 4))
-        lines = textwrap.wrap(text, width=45) or [""]
-        popup_h = min(400, max(150, len(lines) * 22 + 60))
-        px = cr.right() + 14
-        py = cr.top()
-        if px + popup_w > self.width():
-            px = max(0, cr.left() - popup_w - 14)
-        if py + popup_h > self.height():
-            py = max(0, self.height() - popup_h - 10)
-        if py < 0:
-            py = 0
-        self._extract_popup.setGeometry(px, py, popup_w, popup_h)
-        self._extract_popup.show()
-        self._extract_popup.raise_()
+        self._set_extract_text(text)
+        self._update_extract_hint()
+        self._place_popup(self._extract_popup, 380, 278)
+
+    def _place_popup(self, popup, w, h, prefer_below=False):
+        """把小窗口摆在选区旁边；译文窗口默认排在提取窗口下方，可再拖动。"""
+        cr = self._crop_rect or self.rect()
+        px, py = cr.right() + 14, cr.top()
+        if prefer_below and self._extract_popup is not None:
+            base = self._extract_popup.geometry()
+            px, py = base.left(), base.bottom() + 10
+        if px + w > self.width():
+            px = max(0, cr.left() - w - 14)
+        if py + h > self.height():
+            py = max(0, self.height() - h - 10)
+        popup.setGeometry(max(0, px), max(0, py),
+                          min(w, self.width()), min(h, self.height()))
+        popup.show()
+        popup.raise_()
 
     def _hide_extract_popup(self):
         if self._extract_popup:
             self._extract_popup.hide()
+        self._hide_trans_popup()
+
+    def _hide_trans_popup(self):
+        if self._extract_trans_popup:
+            self._extract_trans_popup.hide()
+
+    def _on_extract_select_all(self):
+        """一键拿全部：也是从「手动编辑」回到按词汇总的入口。"""
+        self._word_user_edited = False
+        if self._word_blocks:
+            self._word_selected = set(range(len(self._word_blocks)))
+            self._set_extract_text(self._selected_words_text())
+        else:
+            self._set_extract_text(self._ocr_text)
+        self._update_extract_hint()
+        self.update()
+
+    def _on_extract_clear(self):
+        self._word_user_edited = False
+        self._word_selected.clear()
+        self._set_extract_text("")
+        self._update_extract_hint()
+        self.update()
+
+    def _on_extract_translate(self):
+        text = (self._extract_text_edit.toPlainText().strip()
+                if self._extract_text_edit is not None else "")
+        if not text:
+            self._flash_extract_btn(self._extract_translate_btn, "无内容")
+            return
+        # 先把译文窗口摆出来显示「正在翻译…」，主窗口异步回传结果
+        self.show_extract_translation("正在翻译…")
+        self.extractTranslateRequested.emit(text)
 
     def _on_extract_copy(self):
         """提取弹窗：一键复制识别文字到剪贴板。"""
@@ -1083,11 +1694,44 @@ class ScreenshotOverlay(QWidget):
             self._flash_extract_btn(self._extract_save_btn, "保存失败")
             print(f"保存识别文字失败：{e}")
 
+    def _on_extract_trans_copy(self):
+        text = (self._extract_trans_edit.toPlainText()
+                if self._extract_trans_edit is not None else "")
+        if not text.strip():
+            self._flash_extract_btn(self._extract_trans_copy_btn, "无内容")
+            return
+        QApplication.clipboard().setText(text)
+        self._flash_extract_btn(self._extract_trans_copy_btn, "已复制")
+
+    def _on_extract_trans_save(self):
+        text = (self._extract_trans_edit.toPlainText()
+                if self._extract_trans_edit is not None else "")
+        if not text.strip():
+            self._flash_extract_btn(self._extract_trans_save_btn, "无内容")
+            return
+        path, chosen = QFileDialog.getSaveFileName(
+            self, "保存译文", "译文.txt",
+            "文本文件 (*.txt);;Markdown (*.md)")
+        if not path:
+            return
+        if not os.path.splitext(path)[1]:
+            path += '.md' if '*.md' in (chosen or '') else '.txt'
+        try:
+            with open(path, "w", encoding="utf-8-sig" if
+                      path.lower().endswith(".txt") else "utf-8") as f:
+                f.write(text)
+            self._flash_extract_btn(self._extract_trans_save_btn, "已保存")
+        except Exception as e:
+            self._flash_extract_btn(self._extract_trans_save_btn, "保存失败")
+            print(f"保存译文失败：{e}")
+
     def _on_extract_popup_close(self):
         self._hide_extract_popup()
         # 关闭弹窗必须退出 extract 模式：否则 _crop_hit 一直返回空（手柄消失）、
         # mousePressEvent 末尾被 `if self._mode: return` 吞掉，选区再也调不动。
         self._mode = None
+        self._extract_blocks = []
+        self._clear_word_selection()
         self._show_menu = True
         self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
         self.update()
@@ -1192,14 +1836,15 @@ class ScreenshotOverlay(QWidget):
                     self._edit_last = lp
                 return
 
-        # 提取弹窗：点击弹窗外关闭并回到菜单
-        if (self._mode == "extract" and self._extract_popup
-                and self._extract_popup.isVisible()):
-            if not self._extract_popup.geometry().contains(pos):
-                self._on_extract_popup_close()
+        # 提取 / 译文小窗口里的点击交给子控件自己处理（拖动 / 编辑 / 按钮）。
+        # 旧实现「点弹窗外就关闭」会和新的按词点选冲突：用户要反复回到
+        # 原图点词，因此退出只走 × / Esc / 右键。
+        if self._mode == "extract" and self._popup_contains(pos):
             return
 
-        if self._mode and hasattr(self, "_popup_close") and self._popup_close.contains(pos):
+        # 原文状态没有画关闭 ×，别让上一次译文留下的热区误触发退出
+        if (self._mode == "translate" and self._showing_trans
+                and self._popup_close.contains(pos)):
             self._reset_mode()
             return
 
@@ -1212,17 +1857,37 @@ class ScreenshotOverlay(QWidget):
             self.setCursor(QCursor(self._cursor_for_edge(hit)))
             return
 
+        # 提取模式：点击原图上的词切换选中，按住拖过可一次多选 / 多选取消。
+        # 起手那个词决定本次是「加」还是「减」，拖过的词都执行同一操作。
+        if self._mode == "extract":
+            if self._word_blocks and self._crop_rect:
+                idx = self._word_at(pos)
+                if idx >= 0:
+                    self._word_drag_active = True
+                    self._word_drag_select = idx not in self._word_selected
+                    self._apply_word_selection(idx, self._word_drag_select)
+                    return
+            # 点偏一点 / 点选区外都不退出：用户要反复回原图点词，
+            # 一点就重新框选会丢掉已选内容。退出统一走 × / Esc / 右键。
+            return
+
         if self._show_menu:
             # 菜单按钮为子控件，点击由按钮自身处理；到达这里说明点在菜单外
-            # 选区内部保持菜单；选区外部则重新框选
+            # 选区内部：翻译完成后点击即在「译文 → 原文 → 译文」间切换；
+            # 选区外部：保持原有的重新框选。
             if self._edit_overlay is not None:
                 return
             if self._crop_rect and self._crop_rect.contains(pos):
+                # 旧实现在这里直接 return，导致 _toggle_trans 永远走不到，
+                # 「点击切换原文」实际上点了没反应。
+                if self._mode == "translate":
+                    self._toggle_trans()
                 return
             self._hide_extract_popup()
             self._reset_mode()
             self._show_menu = False
             self._crop_rect = None
+            self._snap_click_window = self._hover_window
             self._selecting = True
             self._start = pos
             self._end = pos
@@ -1237,6 +1902,7 @@ class ScreenshotOverlay(QWidget):
         if self._mode:
             return
 
+        self._snap_click_window = self._hover_window
         self._selecting = True
         self._start = pos
         self._end = pos
@@ -1245,13 +1911,16 @@ class ScreenshotOverlay(QWidget):
         self.update()
 
     def _toggle_trans(self):
-        """翻译模式下点击选区，在译文 / 原文之间切换。
+        """翻译模式下点击选区：译文 ↔ 原文。
 
-        （调用方已确保处于 translate 模式）需已识别到文字才允许切换。
+        原文状态不绘制任何叠加层，直接露出原始截图；提取到的文字由
+        「提取」的识别文字小窗口 + 位置高亮负责展示。
         """
-        if self._ocr_text:
-            self._showing_trans = not self._showing_trans
-            self.update()
+        self._showing_trans = not self._showing_trans
+        if not self._showing_trans:
+            # 译文的关闭 × 已不再绘制，清掉热区避免点在原位置误退出
+            self._popup_close = QRect()
+        self.update()
 
     def _set_edit_cursor(self):
         """Set custom cursor showing brush circle when over crop area in edit mode."""
@@ -1280,8 +1949,31 @@ class ScreenshotOverlay(QWidget):
 
     def mouseMoveEvent(self, event):
         pos = event.pos()
+        self._update_hover(pos)
         if self._crop_drag_mode:
             self._apply_crop_drag(pos - self._crop_drag_start_pos)
+            return
+        # 按住拖过词块：批量选中 / 批量取消，起手决定方向
+        if self._word_drag_active:
+            if self._word_hover != -1:
+                self._word_hover = -1
+                self.update()
+            idx = self._word_at(pos)
+            if idx >= 0:
+                self._apply_word_selection(idx, self._word_drag_select)
+            return
+        if self._mode == "extract" and self._word_blocks:
+            # 悬停在词上：手型光标 + 轻量描边，提示「这里可以点」
+            over_popup = self._popup_contains(pos)
+            in_crop = bool(self._crop_rect and self._crop_rect.contains(pos))
+            idx = self._word_at(pos) if (in_crop and not over_popup) else -1
+            if idx != self._word_hover:
+                self._word_hover = idx
+                self.update()
+            if idx >= 0:
+                self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            elif not over_popup:
+                self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
             return
         if self._text_box_active:
             cr = self._crop_rect
@@ -1407,6 +2099,10 @@ class ScreenshotOverlay(QWidget):
             self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
             self.update()
             return
+        if self._word_drag_active:
+            self._word_drag_active = False
+            self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+            return
         if self._text_box_active:
             self._text_box_active = False
             cr = self._crop_rect
@@ -1438,11 +2134,32 @@ class ScreenshotOverlay(QWidget):
             self._end = event.pos()
             rect = QRect(self._start, self._end).normalized()
             rect = rect.intersected(self.rect())  # 拖出屏幕边界时自动裁剪
+            snap_active = (self._snap_enabled and not self._alt_pressed())
             if rect.width() < 5 or rect.height() < 5:
-                self._status_text = "选区太小，请重新框选"
-                self.update()
-                self._status_timer.start()
-                return
+                # 微信式：单击直接选中鼠标所在窗口，而不是报「选区太小」
+                hit = self._snap_click_window if snap_active else None
+                if hit:
+                    left, top, right, bottom = hit[:4]
+                    rect = QRect(left, top, right - left,
+                                 bottom - top).intersected(self.rect())
+                else:
+                    self._status_text = "选区太小，请重新框选"
+                    self.update()
+                    self._status_timer.start()
+                    return
+            elif snap_active and self._snap_windows:
+                # 手动拖框：四条边磁吸到最近的窗口边界
+                try:
+                    import window_snapper
+                    snapped = window_snapper.snap_rect(
+                        window_snapper.rect_tuple(rect), self._snap_windows)
+                    rect = QRect(snapped[0], snapped[1],
+                                 snapped[2] - snapped[0],
+                                 snapped[3] - snapped[1]
+                                 ).intersected(self.rect())
+                except Exception:
+                    pass
+            self._snap_click_window = None
             self._crop_rect = rect
             self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
 
@@ -1459,7 +2176,7 @@ class ScreenshotOverlay(QWidget):
                 # 自动翻译：跳过菜单，直接翻译
                 self._status_text = "正在翻译..."
                 self.update()
-                path = self._save_to_temp()
+                path = self._save_ocr_image()
                 if path:
                     self.translateRequested.emit(path)
             else:
@@ -1539,7 +2256,10 @@ class ScreenshotOverlay(QWidget):
         self._ocr_paragraphs = []
         self._trans_paragraphs = []
         self._trans_blocks = []
+        self._extract_blocks = []
+        self._clear_word_selection()
         self._showing_trans = False
+        self._popup_close = QRect()
         self._status_text = ""
         self._show_menu = True
         self._menu_sig = None
@@ -1565,6 +2285,7 @@ class ScreenshotOverlay(QWidget):
 
     def _cancel(self):
         self._hide_extract_popup()
+        self._clear_word_selection()
         # 框选完又点「取消」/ 右键 / ESC 时，别把这张图直接丢掉：存一份到
         # 主页「截图预览」，用户仍能用「复制截图」或「保存」继续处理。
         if (not self._live_select and self._crop_rect
@@ -1836,7 +2557,7 @@ class ScreenshotOverlay(QWidget):
                 self.update()
         elif name == "提取":
             self._show_menu = False
-            path = self._save_to_temp()
+            path = self._save_ocr_image()
             if path:
                 self.extractRequested.emit(path)
             else:
@@ -1847,16 +2568,15 @@ class ScreenshotOverlay(QWidget):
                 self._show_menu = True
                 self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
                 self.update()
-        elif name in ("翻译", "原文"):
-            if self._mode == "translate" and self._ocr_text:
-                self._showing_trans = not self._showing_trans
+        elif name in ("翻译", "原文", "译文"):
+            if self._mode == "translate":
+                self._toggle_trans()
                 self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
-                self.update()
             else:
                 self._show_menu = False
                 self._status_text = "正在翻译..."
                 self.update()
-                path = self._save_to_temp()
+                path = self._save_ocr_image()
                 if path:
                     self.translateRequested.emit(path)
                 else:
@@ -1974,6 +2694,33 @@ class ScreenshotOverlay(QWidget):
         if not image.save(path):
             return None
         return path
+
+    # 小于这个尺寸的截图，Windows OCR / EasyOCR 常常一行都识别不出来
+    # （只框 "Portrait" 这种词时用户以为「翻译不显示」，其实是没识别到）。
+    _OCR_MIN_W = 240
+    _OCR_MIN_H = 80
+
+    def _save_ocr_image(self):
+        """OCR 专用图：小选区先高质量放大，保存 / 复制 / 预览仍用原图。
+
+        放大后 recognize_blocks 返回的坐标按放大图宽高归一化，贴回选区时
+        仍是同一套 0~1 比例，译文位置不受影响。
+        """
+        image = self._crop_image()
+        if image is None or image.isNull():
+            return None
+        w, h = image.width(), image.height()
+        factor = 1.0
+        if w < self._OCR_MIN_W or h < self._OCR_MIN_H:
+            factor = min(6.0, max(
+                self._OCR_MIN_W / max(1, w),
+                self._OCR_MIN_H / max(1, h), 2.0))
+        if factor > 1.0:
+            image = image.scaled(
+                int(w * factor), int(h * factor),
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+        return self._save_to_temp(image)
 
 
 class FullscreenCapture:

@@ -13,13 +13,16 @@ from PySide6.QtWidgets import (
 )
 
 from config import (
-    AI_POLISH_PROVIDERS, CONFIG_FILE, DEFAULT_AI_POLISH_SETTINGS,
+    AI_POLISH_PROVIDERS, AI_POLISH_FREE_SERVICES, FREE_POLISH_SERVICES,
+    CONFIG_FILE, DEFAULT_AI_POLISH_SETTINGS, DEFAULT_AI_POLISH_FAILOVER,
     DEFAULT_ASR_SETTINGS, DEFAULT_LIVE_SETTINGS, DEFAULT_TRANSLATION_API,
-    DEFAULT_SUBTITLE_SETTINGS, SUBTITLE_AUDIO_SOURCES, SUBTITLE_ENGINES,
-    SUBTITLE_DISPLAY_MODES,
+    DEFAULT_CACHE_SETTINGS, DEFAULT_SUBTITLE_SETTINGS,
+    SUBTITLE_AUDIO_SOURCES, SUBTITLE_ENGINES, SUBTITLE_DISPLAY_MODES,
     TRANSLATION_APIS, FREE_APIS, FREE_API_KEY_FIELDS, OCR_ENGINE,
-    SUPPORTED_OCR_ENGINES, get_asr_settings, get_live_settings,
+    SUPPORTED_OCR_ENGINES, get_asr_settings, get_cache_settings,
+    get_live_settings,
     get_subtitle_settings, load_user_config, save_user_config, APP_VERSION,
+    DEFAULT_FREE_API_FAILOVER, DEFAULT_SNAP_WINDOWS,
 )
 from widgets import HotKeyInput, FlatCheckBox
 from theme import Palette
@@ -29,6 +32,7 @@ from hotkeys import (DEFAULT_HOTKEYS, HOTKEY_ACTIONS,
                      get_hotkeys, normalize, reserved_conflicts)
 from user_messages import friendly_install_error, friendly_model_error
 from task_center import TASK_CENTER
+import result_cache
 import ui_feedback
 
 
@@ -401,6 +405,7 @@ class SettingsPage(QWidget):
                 self._build_subtitle_section,
                 self._build_hotkey_section,
                 self._build_general_section,
+                self._build_cache_section,
                 self._build_auto_section,
                 self._build_checklist_section,
                 self._build_diagnostics_section):
@@ -674,6 +679,20 @@ class SettingsPage(QWidget):
                         "切换后会显示对应的密钥输入框。")
         self.api_combo.currentTextChanged.connect(self._on_api_changed)
 
+        self.free_api_failover_check = FlatCheckBox(
+            "免费接口失败时自动切换其它免费引擎")
+        self.free_api_failover_check.setChecked(
+            self._cfg.get("free_api_failover", DEFAULT_FREE_API_FAILOVER))
+        section.add("故障切换:", self.free_api_failover_check,
+                    tip="选中的免费接口超时 / 报错 / 返回空时，自动尝试其它免费引擎；\n"
+                        "优先切到稳定可用的引擎，刚失败的接口 5 分钟内不再重复尝试；\n"
+                        "切换记录会写进「诊断与帮助」。\n"
+                        "关闭后只使用所选引擎，失败会明确报错，绝不用原文冒充译文。")
+        section.add_caption(
+            "免费引擎共 6 个：Bing、MyMemory（稳定）；Google、Google GTX"
+            "（部分网络不可用）；LibreTranslate、有道（公共接口，可能被风控）。"
+            "失败的接口会自动跳过；付费 / 需密钥引擎不参与自动切换。")
+
         # 各引擎密钥输入
         self.bing_azure_key = self._mk_edit(
             "Azure Cognitive Services 订阅密钥（可选）")
@@ -811,8 +830,9 @@ class SettingsPage(QWidget):
         self.polish_provider_combo.setMinimumWidth(260)
         section.add(
             "润色通道:", self.polish_provider_combo,
-            tip="「免费公共通道」开箱可用；\n"
-                "DeepSeek / 豆包网页版免费，但需要浏览器登录后的 Token / Cookie；\n"
+            tip="两个「免费公共通道」无需密钥、开箱可用（备用端点共享限流）；\n"
+                "「免费额度 API」可选 Groq / OpenRouter / 智谱 / 硅基流动，\n"
+                "注册即得免费 Key；DeepSeek / 豆包网页版需浏览器登录凭证；\n"
                 "也可以填自己的 OpenAI 兼容接口。")
 
         self.polish_deepseek_token = self._mk_edit("DeepSeek userToken")
@@ -830,6 +850,35 @@ class SettingsPage(QWidget):
             "模型名，如 deepseek-chat / gpt-4o-mini")
         self.polish_model.setText(self._cfg.get("ai_polish_model", ""))
 
+        # 免费额度 API：每个官方服务各自保存 Key，切换服务时自动存取
+        self.polish_free_service_combo = QComboBox()
+        for name, value in AI_POLISH_FREE_SERVICES.items():
+            self.polish_free_service_combo.addItem(name, value)
+        svc = str(self._cfg.get("ai_polish_free_service", "groq"))
+        svc_idx = self.polish_free_service_combo.findData(svc)
+        self.polish_free_service_combo.setCurrentIndex(max(0, svc_idx))
+        self.polish_free_service_combo.setMinimumWidth(220)
+        self._polish_free_keys = {
+            name: str(self._cfg.get(f"ai_polish_{name}_key", ""))
+            for name in FREE_POLISH_SERVICES
+        }
+        self._polish_free_current = (
+            self.polish_free_service_combo.currentData() or "groq")
+        self.polish_free_key = self._mk_edit("免费额度 API Key")
+        self.polish_free_key.setText(
+            self._polish_free_keys.get(self._polish_free_current, ""))
+        self.polish_free_model = self._mk_edit(
+            "留空用服务默认免费模型")
+        self.polish_free_model.setText(
+            self._cfg.get("ai_polish_free_model", ""))
+        self.polish_free_service_combo.currentIndexChanged.connect(
+            self._on_polish_free_service_changed)
+
+        self.polish_failover_check = FlatCheckBox(
+            "免费润色通道失败时自动切换其它免费通道")
+        self.polish_failover_check.setChecked(
+            self._cfg.get("ai_polish_failover", DEFAULT_AI_POLISH_FAILOVER))
+
         self._polish_stack = QStackedWidget()
         pollinations_page = QWidget()
         pollinations_layout = QVBoxLayout(pollinations_page)
@@ -839,6 +888,28 @@ class SettingsPage(QWidget):
             "稿件量大或要求更高质量时，建议使用下面自己的 API。"))
         pollinations_layout.addStretch(1)
         self._polish_stack.addWidget(pollinations_page)
+
+        # 页面顺序必须与 AI_POLISH_PROVIDERS 的 item 顺序严格一致：
+        # _on_polish_provider_changed 直接用 currentIndex() 切页
+        text_page = QWidget()
+        text_layout = QVBoxLayout(text_page)
+        text_layout.setContentsMargins(0, 8, 0, 3)
+        text_layout.addWidget(self._polish_caption(
+            "同一公共免费服务的 GET 文本端点，无需配置。"
+            "主通道限流或解析异常时作为备用路径；"
+            "两个端点共享 IP 级限流，不是独立配额。"))
+        text_layout.addStretch(1)
+        self._polish_stack.addWidget(text_page)
+
+        free_page = self._build_key_page(
+            "注册对应平台即可拿到免费 Key；每个服务分别保存，绝不互相转发。",
+            [("服务:", self.polish_free_service_combo,
+              "切换服务会自动保存 / 恢复各自的 Key"),
+             ("API Key:", self.polish_free_key,
+              "免费额度密钥，只发给所选服务"),
+             ("模型:", self.polish_free_model,
+              "留空则使用该服务的默认免费模型")])
+        self._polish_stack.addWidget(free_page)
 
         deepseek_page = self._build_key_page(
             "获取 Token：浏览器登录 chat.deepseek.com → F12 → "
@@ -865,6 +936,13 @@ class SettingsPage(QWidget):
         self._polish_stack.addWidget(custom_page)
 
         section.add_row(self._polish_stack)
+        section.add(
+            "故障切换:", self.polish_failover_check,
+            tip="所选免费通道限流 / 超时 / 报错时，自动改用其它免费通道；\n"
+                "优先切到已配置凭证的官方免费额度 / 网页通道，公共通道兜底。\n"
+                "刚失败的通道 90 秒内不再重复尝试，切换记录写入「诊断与帮助」。\n"
+                "每个通道只使用自己的凭证，绝不转发给其它服务；\n"
+                "「自定义 API」不参与自动切换。")
         self.polish_provider_combo.currentIndexChanged.connect(
             self._on_polish_provider_changed)
         self._on_polish_provider_changed()
@@ -885,6 +963,9 @@ class SettingsPage(QWidget):
         section.add_row(test_row)
 
         section.add_caption(
+            "免费通道共 8 条：公共通道 2 个端点（无需密钥）+ Groq / OpenRouter / "
+            "智谱 / 硅基流动 4 个官方免费额度服务 + DeepSeek / 豆包网页版。\n"
+            "公共通道会发送文本到第三方公共服务；免费额度服务需注册领取免费 Key。\n"
             "润色只修正错别字、语病、标点和不顺的表达，不改变原意、不增删内容；\n"
             "程序会清洗模型返回的说明文字，字幕批量润色还会校验条数，"
             "条数不一致自动逐条重试。\n"
@@ -902,8 +983,22 @@ class SettingsPage(QWidget):
             self._polish_stack.setCurrentIndex(
                 self.polish_provider_combo.currentIndex())
 
+    def _store_current_free_key(self):
+        """把 Key 输入框的值存回它所属服务的槽位，防止切服务时丢失。"""
+        if getattr(self, "_polish_free_current", None):
+            self._polish_free_keys[self._polish_free_current] = (
+                self.polish_free_key.text().strip())
+
+    def _on_polish_free_service_changed(self, _index=None):
+        self._store_current_free_key()
+        service = str(self.polish_free_service_combo.currentData() or "groq")
+        self._polish_free_current = service
+        self.polish_free_key.setText(
+            self._polish_free_keys.get(service, ""))
+
     def _collect_polish_settings(self):
-        return {
+        self._store_current_free_key()
+        result = {
             "ai_polish_provider": str(
                 self.polish_provider_combo.currentData() or "pollinations"),
             "ai_polish_deepseek_token": self.polish_deepseek_token.text().strip(),
@@ -911,7 +1006,15 @@ class SettingsPage(QWidget):
             "ai_polish_api_url": self.polish_api_url.text().strip(),
             "ai_polish_api_key": self.polish_api_key.text().strip(),
             "ai_polish_model": self.polish_model.text().strip(),
+            "ai_polish_failover": self.polish_failover_check.isChecked(),
+            "ai_polish_free_service": str(
+                self.polish_free_service_combo.currentData() or "groq"),
+            "ai_polish_free_model": self.polish_free_model.text().strip(),
         }
+        for service in FREE_POLISH_SERVICES:
+            result[f"ai_polish_{service}_key"] = (
+                self._polish_free_keys.get(service, ""))
+        return result
 
     def _test_polish(self):
         settings = self._collect_polish_settings()
@@ -924,9 +1027,10 @@ class SettingsPage(QWidget):
 
         def run():
             try:
-                from ai_polish import test_polish
-                out = test_polish(settings)
-                self._sig_polish_test.emit(True, out)
+                from ai_polish import test_polish_with_provider
+                out, used = test_polish_with_provider(settings)
+                # 自动切换后把真正生效的通道告诉用户，别让他以为选的通道可用
+                self._sig_polish_test.emit(True, f"{out} · 实际通道：{used}")
             except Exception as e:
                 self._sig_polish_test.emit(False, str(e))
 
@@ -2290,6 +2394,106 @@ class SettingsPage(QWidget):
                     tip="安装新版后这里的版本号会随之变化")
         return section
 
+    # ── 性能与结果缓存 ──────────────────────────────────────
+
+    def _build_cache_section(self) -> _Section:
+        section = _Section(
+            "性能与结果缓存", "重复内容不再重复走网络 / OCR · 可随时关闭或清空")
+        cfg = get_cache_settings()
+
+        self.cache_enabled_check = FlatCheckBox("启用结果缓存（推荐）")
+        self.cache_enabled_check.setChecked(
+            bool(cfg["result_cache_enabled"]))
+        section.add("总开关:", self.cache_enabled_check,
+                    tip="翻译 / AI 润色 / OCR 的成功结果按内容复用；\n"
+                        "失败或空译文绝不缓存，也不会用原文冒充译文。\n"
+                        "「测试连接 / 测试润色」始终真实发请求，不读缓存。\n"
+                        "关闭后立即停止读写缓存，不改变任何翻译行为。")
+
+        self.cache_entries_combo = QComboBox()
+        for label, value in (("200 条（省内存）", 200), ("500 条（推荐）", 500),
+                             ("1000 条", 1000), ("2000 条", 2000)):
+            self.cache_entries_combo.addItem(label, value)
+        idx = self.cache_entries_combo.findData(
+            int(cfg["result_cache_max_entries"]))
+        self.cache_entries_combo.setCurrentIndex(max(0, idx))
+        section.add("缓存容量:", self.cache_entries_combo,
+                    tip="每类结果最多保留多少条，超出按最近最少使用淘汰。\n"
+                        "OCR 结果较大，内部另有更紧的上限。")
+
+        self.cache_ttl_combo = QComboBox()
+        for label, value in (("1 天", 1), ("7 天（推荐）", 7), ("30 天", 30)):
+            self.cache_ttl_combo.addItem(label, value)
+        idx = self.cache_ttl_combo.findData(
+            int(cfg["result_cache_ttl_days"]))
+        self.cache_ttl_combo.setCurrentIndex(max(0, idx))
+        section.add("保留时长:", self.cache_ttl_combo,
+                    tip="超过时长的结果自动作废并重算，避免译文过时。")
+
+        self.cache_persist_check = FlatCheckBox("重启后仍然生效（保存到本机）")
+        self.cache_persist_check.setChecked(
+            bool(cfg["result_cache_persist"]))
+        section.add("跨会话:", self.cache_persist_check,
+                    tip="开启后结果保存在本机数据目录，升级安装不会删除；\n"
+                        "关闭则只用本次运行的内存缓存，且会清掉已保存的文件。")
+
+        self.cache_stats_label = QLabel()
+        self.cache_stats_label.setObjectName("caption")
+        self.cache_stats_label.setWordWrap(True)
+        section.add("命中统计:", self.cache_stats_label,
+                    tip="本次运行的缓存命中情况，点「刷新统计」更新")
+        self._refresh_cache_stats()
+
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        for text, handler in (("刷新统计", self._refresh_cache_stats),
+                              ("清空缓存", self._clear_result_cache),
+                              ("打开缓存目录", self._open_cache_dir)):
+            btn = QPushButton(text, row)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(handler)
+            lay.addWidget(btn)
+        lay.addStretch(1)
+        section.add_row(row)
+        section.add_caption(
+            "缓存只保存成功的译文 / 润色正文 / 识别结果与内容摘要，"
+            "不保存密钥、Token、Cookie 明文；清空不会删除模型、配置或截图。")
+        return section
+
+    def _refresh_cache_stats(self):
+        if not hasattr(self, "cache_stats_label"):
+            return
+        stats = result_cache.total_stats()
+        if not stats["enabled"]:
+            self.cache_stats_label.setText("缓存已关闭（保存设置后生效）")
+            return
+        if not stats["requests"]:
+            self.cache_stats_label.setText(
+                "本次会话还没有缓存请求，翻译 / 润色 / 截图识别后会显示命中率")
+            return
+        self.cache_stats_label.setText(
+            f"本次会话命中 {stats['hits']} 次 / 共 {stats['requests']} 次请求"
+            f" · 命中率 {stats['hit_rate'] * 100:.0f}%"
+            f" · 已缓存 {stats['size']} 条")
+
+    def _clear_result_cache(self):
+        removed = result_cache.clear_all()
+        self._refresh_cache_stats()
+        try:
+            from qfluentwidgets import InfoBar, InfoBarPosition
+            InfoBar.success(
+                "缓存已清空", f"已清除 {removed} 条结果，后续内容会重新计算",
+                duration=3000, position=InfoBarPosition.TOP, parent=self)
+        except Exception:
+            pass
+
+    def _open_cache_dir(self):
+        """用「打开文件夹」按钮指代位置，说明文案里不写死本机绝对路径。"""
+        QDesktopServices.openUrl(
+            QUrl.fromLocalFile(str(result_cache.cache_dir())))
+
     # ── 自动操作 ────────────────────────────────────────────
 
     def _build_auto_section(self) -> _Section:
@@ -2300,6 +2504,16 @@ class SettingsPage(QWidget):
             self._cfg.get("auto_translate", False))
         section.add("自动翻译:", self.auto_translate_check,
                     tip="选区完成后直接翻译，点击译文可切换回原文")
+
+        self.snap_windows_check = FlatCheckBox("截图时自动吸附窗口边界")
+        self.snap_windows_check.setChecked(
+            self._cfg.get("snap_windows", DEFAULT_SNAP_WINDOWS))
+        section.add("窗口吸附:", self.snap_windows_check,
+                    tip="类似微信截图：鼠标悬停高亮窗口，单击可选中整个窗口；\n"
+                        "手动拖框时四条边会自动贴到最近的窗口边界。\n"
+                        "只吸附当前屏幕上真实可见的窗口，被其它窗口挡住的\n"
+                        "后台窗口不参与；按住 Alt 可临时自由框选。\n"
+                        "开关只在本页设置，截图工具栏保持精简。")
 
         self.auto_copy_check = FlatCheckBox("截图识别后自动复制到剪贴板")
         self.auto_copy_check.setChecked(self._cfg.get("auto_copy", False))
@@ -2455,9 +2669,11 @@ class SettingsPage(QWidget):
 
     def _save(self):
         api_name = self.api_combo.currentText()
+        api_changed = False
         if api_name in TRANSLATION_APIS:
             new_api = TRANSLATION_APIS[api_name]
-            if self._cfg.get("translation_api") != new_api:
+            api_changed = self._cfg.get("translation_api") != new_api
+            if api_changed:
                 self._cfg["translation_api"] = new_api
 
         self._cfg["bing_azure_key"] = self.bing_azure_key.text().strip()
@@ -2473,7 +2689,21 @@ class SettingsPage(QWidget):
         self._cfg["volcengine_token"] = self.volcengine_token.text().strip()
 
         # AI 润色通道与凭证
-        self._cfg.update(self._collect_polish_settings())
+        old_polish = (self._cfg.get("ai_polish_provider"),
+                      self._cfg.get("ai_polish_free_service"),
+                      self._cfg.get("ai_polish_failover"))
+        polish_cfg = self._collect_polish_settings()
+        self._cfg.update(polish_cfg)
+        new_polish = (polish_cfg.get("ai_polish_provider"),
+                      polish_cfg.get("ai_polish_free_service"),
+                      polish_cfg.get("ai_polish_failover"))
+        if old_polish != new_polish or not polish_cfg.get("ai_polish_failover"):
+            # 换了通道 / 关掉切换：清掉「上次可用的备用通道」粘性缓存
+            try:
+                from ai_polish import reset_polish_failover
+                reset_polish_failover()
+            except Exception:
+                pass
         # 快捷键：空字符串 = 不占用按键，必须允许保存「清空」
         for action, entry in self._hotkey_inputs.items():
             self._cfg[config_key(action)] = normalize(entry.value())
@@ -2501,12 +2731,34 @@ class SettingsPage(QWidget):
                 "\n\n".join(parts)
                 + "\n\n建议改成不同组合（设置仍会保存，改好后自动重新注册）。")
         self._cfg["auto_translate"] = self.auto_translate_check.isChecked()
+        self._cfg["snap_windows"] = self.snap_windows_check.isChecked()
+        failover = self.free_api_failover_check.isChecked()
+        self._cfg["free_api_failover"] = failover
+        if api_changed or not failover:
+            # 换了首选引擎 / 关掉自动切换：清掉「上次可用的备用引擎」粘性缓存
+            try:
+                from free_translator import reset_failover
+                reset_failover()
+            except Exception:
+                pass
         self._cfg["auto_copy"] = self.auto_copy_check.isChecked()
         self._cfg["auto_copy_target"] = (
             "source" if self.auto_copy_combo.currentText() == "原文"
             else "translation")
         self._cfg["minimize_to_tray"] = self.minimize_to_tray_check.isChecked()
         self._cfg["auto_check_update"] = self.auto_check_update_check.isChecked()
+
+        # 结果缓存：保存后立即对运行中的缓存生效，无需重启程序
+        self._cfg["result_cache_enabled"] = (
+            self.cache_enabled_check.isChecked())
+        self._cfg["result_cache_max_entries"] = int(
+            self.cache_entries_combo.currentData()
+            or DEFAULT_CACHE_SETTINGS["result_cache_max_entries"])
+        self._cfg["result_cache_ttl_days"] = int(
+            self.cache_ttl_combo.currentData()
+            or DEFAULT_CACHE_SETTINGS["result_cache_ttl_days"])
+        self._cfg["result_cache_persist"] = (
+            self.cache_persist_check.isChecked())
 
         # 语音识别选项
         self._cfg["asr_vad_enabled"] = self.asr_vad_check.isChecked()
@@ -2587,6 +2839,9 @@ class SettingsPage(QWidget):
         if save_user_config(patch):
             self._cfg = load_user_config()
             self._saved_cfg = dict(self._cfg)
+            # 缓存开关 / 容量 / 保留时长改了就立刻生效，别让用户以为要重启
+            result_cache.apply_settings()
+            self._refresh_cache_stats()
             from qfluentwidgets import InfoBar, InfoBarPosition
             if not autostart_ok:
                 InfoBar.warning(
@@ -2617,7 +2872,8 @@ class SettingsPage(QWidget):
             "将把本页所有设置恢复为默认值，包括：\n"
             "  · 清空已填写的 API 密钥 / Token / Cookie\n"
             "  · 清空全部全局快捷键；窗口内快捷键恢复为默认组合\n"
-            "  · 重置实时字幕、OCR、翻译引擎等选项\n\n"
+            "  · 重置实时字幕、OCR、性能与缓存、翻译引擎等选项\n\n"
+            "（恢复默认不会清空已有缓存，需要清空请用「性能与结果缓存」里的按钮）\n\n"
             "需要再点一次「保存设置」才会写入配置文件。确定吗？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
@@ -2642,8 +2898,19 @@ class SettingsPage(QWidget):
         self.polish_provider_combo.setCurrentIndex(max(0, polish_idx))
         for edit in (self.polish_deepseek_token, self.polish_doubao_cookie,
                      self.polish_api_url, self.polish_api_key,
-                     self.polish_model):
+                     self.polish_model, self.polish_free_key,
+                     self.polish_free_model):
             edit.clear()
+        self._polish_free_keys = {name: "" for name in FREE_POLISH_SERVICES}
+        self.polish_free_service_combo.blockSignals(True)
+        self.polish_free_service_combo.setCurrentIndex(max(
+            0, self.polish_free_service_combo.findData(
+                DEFAULT_AI_POLISH_SETTINGS.get(
+                    "ai_polish_free_service", "groq"))))
+        self.polish_free_service_combo.blockSignals(False)
+        self._polish_free_current = (
+            self.polish_free_service_combo.currentData() or "groq")
+        self.polish_failover_check.setChecked(DEFAULT_AI_POLISH_FAILOVER)
         self.polish_test_label.clear()
         self.translation_test_label.clear()
         self.translation_test_label.setStyleSheet("")
@@ -2662,6 +2929,18 @@ class SettingsPage(QWidget):
         self.autostart_check.setChecked(False)
         self.auto_check_update_check.setChecked(True)
         self.auto_translate_check.setChecked(False)
+        self.snap_windows_check.setChecked(DEFAULT_SNAP_WINDOWS)
+        self.free_api_failover_check.setChecked(DEFAULT_FREE_API_FAILOVER)
+        self.cache_enabled_check.setChecked(
+            bool(DEFAULT_CACHE_SETTINGS["result_cache_enabled"]))
+        cache_idx = self.cache_entries_combo.findData(
+            int(DEFAULT_CACHE_SETTINGS["result_cache_max_entries"]))
+        self.cache_entries_combo.setCurrentIndex(max(0, cache_idx))
+        ttl_idx = self.cache_ttl_combo.findData(
+            int(DEFAULT_CACHE_SETTINGS["result_cache_ttl_days"]))
+        self.cache_ttl_combo.setCurrentIndex(max(0, ttl_idx))
+        self.cache_persist_check.setChecked(
+            bool(DEFAULT_CACHE_SETTINGS["result_cache_persist"]))
         self.auto_copy_check.setChecked(False)
         self.auto_copy_combo.setCurrentText("原文")
 
