@@ -15,9 +15,9 @@ def friendly_install_error(msg):
     # 这里要说明「已经换过源」而不是笼统地让用户检查网络。
     if ('403' in low or 'forbidden' in low
             or 'http error 403' in low):
-        return ("下载源返回 403（镜像限流或同步异常），已自动换用其它源重试；"
-                "若仍失败，请点「重试安装」，或按状态文字悬停提示里的命令"
-                "改用 PyPI 官方源手动安装。")
+        return ("下载源返回 403（镜像限流或同步异常），已自动换用其它源重试"
+                "（首选腾讯云镜像）；若仍失败，请点「重试安装」，或按状态文字"
+                "悬停提示里的命令改用腾讯云镜像 / PyPI 官方源手动安装。")
     if 'timed out' in low or 'timeout' in low or 'read timed out' in low:
         return "安装超时，通常是网络不稳定。请检查网络后点「重试安装」。"
     if 'no space left' in low or 'not enough space' in low or 'disk full' in low:

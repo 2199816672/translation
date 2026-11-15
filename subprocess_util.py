@@ -138,11 +138,12 @@ def pip_cmd(packages, extra_args=()):
     return [sys.executable, "-m", "pip", "install"] + list(extra_args) + args, ""
 
 
-# 显式 ``-i`` 能覆盖用户 pip.ini 里配置的默认源。国内镜像（尤其清华）偶发
-# 403 / 同步延迟，只走单源会让「点一次安装」变成必然失败；按可用性依次
-# 尝试，最后才回落到用户自己的配置，尊重自定义但可用的源。
+# 显式 ``-i`` 能覆盖用户 pip.ini 里配置的默认源。国内镜像偶发 403 /
+# 同步延迟，只走单源会让「点一次安装」变成必然失败。腾讯云 PyPI 镜像同步
+# 快、国内访问稳定（实测 /simple/easyocr/ 200），作为首选；PyPI 官方兜底，
+# 最后回落到用户自己的配置。阿里云镜像频繁 403，已从全部安装链路移除。
 PIP_INDEXES = (
-    ("阿里云镜像", ("-i", "https://mirrors.aliyun.com/pypi/simple/")),
+    ("腾讯云镜像", ("-i", "https://mirrors.cloud.tencent.com/pypi/simple/")),
     ("PyPI 官方", ("-i", "https://pypi.org/simple")),
     ("系统默认源", ()),
 )
@@ -212,6 +213,8 @@ def pip_install_with_mirrors(packages, on_progress=None, cancel=None,
     return False, (
         f"安装失败（已依次尝试：{tried}）。\n"
         "可点「重试安装」再试一次；也可在命令行手动执行：\n"
+        f"  pip install {manual} "
+        "-i https://mirrors.cloud.tencent.com/pypi/simple/\n"
         f"  pip install {manual} -i https://pypi.org/simple\n\n"
         f"最后一次错误输出：\n{last}")
 

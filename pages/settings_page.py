@@ -1271,6 +1271,23 @@ class SettingsPage(QWidget):
             has_hotkey = any(bool(v) for v in get_hotkeys().values())
         except Exception:
             has_hotkey = False
+        # 模型下好了、引擎组件却没装成功（镜像 403）是最容易让人困惑的
+        # 状态：以前只要「模型齐」就打 ✅，用户会以为可以直接识别。这里
+        # 直接点破「还差组件」，并指向设置页的「安装」按钮。
+        if easy_ocr and ocr_models_ready:
+            ocr_high_ok = True
+            ocr_high_desc = "EasyOCR 已装好，本地模型可离线识别"
+        elif easy_ocr:
+            ocr_high_ok = True
+            ocr_high_desc = ("EasyOCR 引擎已装好；首次识别会自动下载模型，"
+                             "网络不好可手动导入")
+        elif ocr_models_ready:
+            ocr_high_ok = False
+            ocr_high_desc = ("本地模型已就位，但 EasyOCR 引擎组件还没装好；"
+                             "请到「OCR 设置」点「安装」，否则识别会失败")
+        else:
+            ocr_high_ok = False
+            ocr_high_desc = "可选：安装 EasyOCR，或手动下载模型导入"
         rows = [
             (win_ocr, "截图文字识别",
              "开箱可用（Windows 自带 OCR）" if win_ocr
@@ -1279,11 +1296,7 @@ class SettingsPage(QWidget):
             (model_ready, "实时字幕 / 音视频识别",
              "本地模型已就绪，完全离线可用" if model_ready
              else "需先下载或导入语音模型（几十 MB ~ 数 GB）"),
-            (easy_ocr or ocr_models_ready, "高精度 OCR",
-             "EasyOCR 已可用" if easy_ocr
-             else ("本地 EasyOCR 模型已齐全，装引擎后即可离线识别"
-                   if ocr_models_ready else
-                   "可选：安装 EasyOCR，或手动下载模型导入")),
+            (ocr_high_ok, "高精度 OCR", ocr_high_desc),
             (has_hotkey, "全局快捷键",
              "已设置" if has_hotkey
              else "未设置（不影响使用）；可在「快捷键」分区或首次引导里启用"),
@@ -1430,23 +1443,31 @@ class SettingsPage(QWidget):
         import ui_theme
         detect = ocr_models.detect_local_models()
         cache = ocr_models.model_cache_info()
-        if cache['models']:
-            summary = ocr_models.model_cache_summary(cache)
-        elif detect['legacy_files']:
-            # 老版本把模型下在 ~/.EasyOCR/model；统一目录还是空的，别一边
-            # 说「还缺 1 个文件」一边又说「尚无本地模型」，自相矛盾。
-            summary = (f"旧版目录 ~/.EasyOCR/model 已有 "
-                       f"{len(detect['legacy_files'])} 个模型文件"
-                       f"（{ocr_models.human_size(detect['total_bytes'])}）")
+        if detect['files']:
+            # 统计与检测必须同源：识别器实际读的是 resolved_dir，而统计只看
+            # 统一管理目录。模型在旧目录、统一目录只剩残留时，旧实现会同时
+            # 显示「✅ 已可离线识别」和「还缺 N 个文件」。detect 里的 files
+            # 是两个目录的合并结果，数量与占用也因此不会漏掉旧目录。
+            summary = ocr_models.model_cache_summary(cache, detect=detect)
         else:
             summary = "尚无本地 OCR 模型（可点「检测本地模型」或手动导入）"
         # 单一前缀 + 单一后缀，避免「尚未检测到… · 尚无本地模型…」重复，
         # 也别出现「没有模型 · 旧版目录已有 N 个」这种自相矛盾。
+        # 只要本地有一门语言齐备就算可用：缺的其它语言模型只是「可选增强」，
+        # 不能再说「还缺 1 个文件」，否则用户会以为手动下的模型白下了。
+        split_files = detect.get('split_files') or []
         if detect['ready']:
-            prefix, color = "✅ 本地模型齐全，识别时完全不联网 · ", ui_theme.COLOR_OK
-        elif detect['can_use_offline']:
-            prefix = (f"⚠ 可用但还缺 {len(detect['missing'])} 个文件 · ")
-            color = ui_theme.COLOR_WARN
+            names = "、".join(ocr_models.language_label(lang)
+                             for lang in detect['available_languages'])
+            prefix = f"✅ 已可离线识别（{names}）· "
+            color = ui_theme.COLOR_OK
+            optional = [n for n in (detect.get('optional_missing') or [])
+                        if n not in split_files]
+            if optional:
+                prefix += f"可选再补 {len(optional)} 个文件支持其它语言 · "
+            if split_files:
+                prefix += (f"⚠ 另一目录还有 {len(split_files)} 个模型未合并 · ")
+                color = ui_theme.COLOR_WARN
         elif detect['legacy_files']:
             prefix, color = "⚠ 旧版目录有模型但不完整 · ", ui_theme.COLOR_WARN
         else:
@@ -1454,26 +1475,58 @@ class SettingsPage(QWidget):
         text = prefix + summary
         self.ocr_model_label.setText(text)
         self.ocr_model_label.setStyleSheet(f"color: {color};")
+        split_tip = ""
+        if split_files:
+            split_tip = (
+                "\n另一个目录还有未合并的模型（" + detect.get('other_dir', '')
+                + "）：" + "、".join(split_files[:6])
+                + "\n识别器一次只能读一个目录，点「导入本地模型」把这些文件"
+                  "放进统一目录后即可一并启用，不用重新下载\n")
         self.ocr_model_label.setToolTip(
+            "当前程序实际读取的模型目录（每台电脑不同，请用按钮定位）：\n"
+            + detect['resolved_dir'] + "\n"
             "目录：点「打开模型文件夹」查看，或点「复制路径」取得本机实际目录"
             "（每台电脑不同，说明里不写死路径）\n"
-            "缺少：" + ("、".join(detect['missing']) or "无") + "\n"
+            "必需缺少：" + ("、".join(detect['missing']) or "无（已可离线识别）") + "\n"
+            "可选补充："
+            + ("、".join(detect.get('optional_missing') or []) or "无") + "\n"
+            + split_tip
             + ocr_models.manual_download_hint())
         return detect
 
     def _detect_ocr_models(self):
+        import ocr_models
         import ui_feedback
         from qfluentwidgets import InfoBar, InfoBarPosition
         detect = self._refresh_ocr_models()
+        split_files = detect.get('split_files') or []
         if detect['ready']:
+            names = "、".join(ocr_models.language_label(lang)
+                             for lang in detect['available_languages'])
+            optional = [n for n in (detect.get('optional_missing') or [])
+                        if n not in split_files]
+            extra = (f"可选再补 {'、'.join(optional)} 支持英文等其它语言"
+                     if optional else "模型齐全")
+            if split_files:
+                extra += ("；另一目录还有 " + "、".join(split_files[:3])
+                          + " 未被读到，点「导入本地模型」合并后即可启用")
             InfoBar.success("模型已就绪",
-                            "本地 OCR 模型齐全，EasyOCR 将直接使用，不再联网下载",
-                            duration=4000, position=InfoBarPosition.TOP,
+                            f"本地已有{names}模型，EasyOCR 将直接离线识别、"
+                            f"不再联网下载；{extra}",
+                            duration=6000, position=InfoBarPosition.TOP,
                             parent=self)
         else:
-            hint = (f"还缺 {len(detect['missing'])} 个模型文件"
-                    if detect['missing'] else
-                    "模型分散在两个目录，建议导入到统一目录")
+            # 「模型分散在两个目录」以前挂在 missing 为空的分支上，而只要
+            # 不能离线识别 missing 就必然非空 —— 那句提示永远不会出现。
+            if split_files:
+                hint = ("模型分散在两个目录，另一目录还有 "
+                        + "、".join(split_files[:3])
+                        + "；点「导入本地模型」合并到统一目录，别重复下载")
+            elif detect['missing']:
+                hint = (f"还缺 {len(detect['missing'])} 个必需文件："
+                        + "、".join(detect['missing']))
+            else:
+                hint = "本地模型文件不完整，暂时无法离线识别"
             ui_feedback.show_info_bar(
                 self, "检测结果",
                 hint + "，可点「手动下载说明」查看文件名与放置目录",
@@ -1535,8 +1588,13 @@ class SettingsPage(QWidget):
         import ocr_models
         box = QMessageBox(self)
         box.setWindowTitle("手动下载 OCR 模型（网络不好时的保底）")
-        box.setText("把模型文件放进模型文件夹后点「检测本地模型」，"
+        box.setText("只识别中文：检测模型 craft_mlt_25k.pth + "
+                    "zh_sim_g2.pth 两个文件就够，程序只启用本地已有的语言，"
+                    "不会为没下的英文模型联网。\n"
+                    "把文件放进模型文件夹后点「检测本地模型」，"
                     "识别会优先用本地文件，不再联网。\n"
+                    "若识别时提示缺少组件，还要先在上方点「安装」把 "
+                    "EasyOCR 引擎装好。\n"
                     "目录请用「打开模型文件夹」按钮定位："
                     "每台电脑都不一样，说明里不写死路径。")
         box.setDetailedText(ocr_models.manual_download_hint())
@@ -1610,8 +1668,10 @@ class SettingsPage(QWidget):
             "模型会自动下载；装完无需重启。\n"
             "   安装中按钮会变成「取消安装」，可随时中断，"
             "已下载的文件下次自动续传。\n"
-            "   网络不好时可点「手动下载说明」自己下模型，"
-            "再点「导入本地模型」即可离线识别。\n"
+            "   网络不好时可点「手动下载说明」自己下模型：只识别中文只需"
+            "「检测模型 + 简体中文」两个 .pth 文件，缺的英文模型不会联网拖累。\n"
+            "   放进模型文件夹后点「检测本地模型」即可离线识别；"
+            "若提示缺少组件，请先点「安装」装好 EasyOCR 引擎。\n"
             "   模型与已装组件都放在用户数据目录，覆盖升级 / 一键升级后"
             "原样保留，不用重新下载或重装。")
 

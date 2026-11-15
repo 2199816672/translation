@@ -310,10 +310,11 @@ def check_dependencies():
     return True, ""
 
 
-# 依次尝试的 pip 源。显式可用的镜像放前面：用户 pip.ini 里配了失效的
-# 清华源时，第一项「默认配置」必然 403，白白等一轮才轮到好源。
+# 依次尝试的 pip 源，与 subprocess_util.PIP_INDEXES 保持同一顺序：腾讯云
+# 镜像首选（国内同步快、稳定），PyPI 官方兜底，最后才用用户 pip.ini 的
+# 默认配置和清华镜像。阿里云镜像频繁返回 403，已从所有安装链路移除。
 _PIP_INDEXES = (
-    ("阿里云镜像", ("-i", "https://mirrors.aliyun.com/pypi/simple/")),
+    ("腾讯云镜像", ("-i", "https://mirrors.cloud.tencent.com/pypi/simple/")),
     ("PyPI 官方", ("-i", "https://pypi.org/simple")),
     ("默认配置", ()),
     ("清华镜像", ("-i", "https://pypi.tuna.tsinghua.edu.cn/simple/")),
@@ -352,7 +353,7 @@ def _run_pip(extra_args, progress_cb=None):
 def install_dependencies(progress_cb=None):
     """安装 faster-whisper：多镜像自动重试，全部失败时给出手动命令。
 
-    国内镜像偶发 403（限流/同步问题）时，会自动切换阿里云 / PyPI 官方。
+    国内镜像偶发 403（限流/同步问题）时，会按腾讯云 / PyPI 官方自动换源。
     """
     cmd, hint = pip_cmd(_PIP_PACKAGES)
     if cmd is None:  # 防御：pip 不可用时不做四个镜像的无谓重试
@@ -366,10 +367,11 @@ def install_dependencies(progress_cb=None):
         if ok:
             return True, f"语音识别组件安装成功（{label}）"
     manual = (
-        "安装失败（已依次尝试阿里云 / PyPI 官方 / 本机默认 / 清华镜像）。\n\n"
-        "可在命令行手动安装：\n"
-        "  pip install faster-whisper\n"
-        "若镜像报 403，换官方源：\n"
+        "安装失败（已依次尝试腾讯云 / PyPI 官方 / 本机默认 / 清华镜像）。\n\n"
+        "可在命令行手动安装（推荐腾讯云镜像）：\n"
+        "  pip install faster-whisper "
+        "-i https://mirrors.cloud.tencent.com/pypi/simple/\n"
+        "若仍报 403，换官方源：\n"
         "  pip install faster-whisper -i https://pypi.org/simple\n\n"
         f"最后一次错误输出：\n{last_tail}"
     )

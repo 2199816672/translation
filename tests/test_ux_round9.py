@@ -65,11 +65,11 @@ class PipMirrorTests(unittest.TestCase):
     def test_explicit_index_overrides_bad_default(self):
         (ok, msg), calls = self._run([0])
         self.assertTrue(ok)
-        self.assertIn('阿里云镜像', msg)
+        self.assertIn('腾讯云镜像', msg)
         # 第一次是 pip 可用性探测，第二次才是真正带 -i 的安装命令
         install = calls[1][1]
         self.assertIn('-i', install)
-        self.assertIn('https://mirrors.aliyun.com/pypi/simple/', install)
+        self.assertIn('https://mirrors.cloud.tencent.com/pypi/simple/', install)
         self.assertIn('--retries', install)
 
     def test_falls_back_to_next_mirror(self):
@@ -314,7 +314,10 @@ class SourceContracts(unittest.TestCase):
         o = self._src('ocr_recognizer.py')
         self.assertIn('pip_install_with_mirrors', o)
         self.assertIn('ocr_models.resolve_model_dir', o)
-        self.assertIn('download_enabled=not offline_ready', o)
+        # 第 20 轮起按「本地已有语言」判定离线，不再硬性要求三个模型文件
+        self.assertIn('ocr_models.available_languages(', o)
+        self.assertIn('download_enabled = not bool(usable)', o)
+        self.assertNotIn('download_enabled=not offline_ready', o)
         self.assertNotIn("安装失败 (code {proc.returncode})", o)
 
     def test_settings_ocr_model_management(self):

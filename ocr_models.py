@@ -44,6 +44,25 @@ _LANG_MODELS = {
     'vi': 'vi_g2.pth',
 }
 
+LANGUAGE_NAMES = {
+    'ch_sim': '简体中文', 'ch_tra': '繁体中文', 'en': '英文',
+    'ja': '日文', 'ko': '韩文', 'fr': '法文', 'de': '德文',
+    'es': '西班牙文', 'ru': '俄文', 'pt': '葡萄牙文',
+    'it': '意大利文', 'ar': '阿拉伯文', 'th': '泰文', 'vi': '越南文',
+}
+
+
+def language_label(code):
+    """把语言代码变成给用户看的中文名。"""
+    return LANGUAGE_NAMES.get(code, code)
+
+
+def primary_language_model(languages=None):
+    """「至少能识别一门语言」时推荐的那个语言模型文件名。"""
+    langs = list(languages or ['ch_sim', 'en'])
+    first = langs[0] if langs else 'ch_sim'
+    return _LANG_MODELS.get(first, f"{first}_g2.pth")
+
 # 方案对比：把「有哪些 OCR 模型/引擎」列全，也说清优势和代价。
 #
 # 安装包**只内置 Windows 系统自带 OCR**（占用 0 MB、零模型文件）——把
@@ -67,8 +86,8 @@ ENGINE_CATALOG = (
         'cost': '首次需安装数百 MB 依赖并下载约 100 MB 模型；CPU 上较慢',
         'best': '截图文字较杂、需要更高识别率；网络不好可手动导入模型',
         'size': '约 100 MB 模型', 'offline': True,
-        'how': '设置页点「安装」装引擎；模型会自动下载，也可手动下载后'
-               '点「导入本地模型」离线使用',
+        'how': '设置页点「安装」装引擎；模型会自动下载，也可手动只下'
+               '检测模型 + 简体中文两个 .pth 后放进模型文件夹离线识别中文',
         'url': 'https://www.jaided.ai/easyocr/modelhub/',
     },
     {
@@ -222,8 +241,41 @@ def resolve_model_dir(languages=None, root=None, legacy=None):
     return root
 
 
+def available_languages(directory, languages=None):
+    """目录里真正能离线识别的语言列表（检测模型 + 该语言模型都存在且非空）。
+
+    旧逻辑把 ``['ch_sim', 'en']`` 当成硬性要求：用户按说明手动下了
+    ``craft_mlt_25k.pth`` + ``zh_sim_g2.pth`` 两个文件，检测仍报「还缺
+    1 个模型文件」，识别器还会为没下的 ``en_g2.pth`` 打开联网下载，国内
+    网络一卡就整个 Reader 初始化失败。EasyOCR 只认 model_storage_directory
+    里实际存在的文件，所以这里按目录里齐备的语言返回，识别器只启用它们。
+    """
+    found = _model_files(directory)
+    if not found.get(_DETECTION_MODEL):
+        return []
+    langs = list(languages or ['ch_sim', 'en'])
+    return [lang for lang in langs
+            if found.get(_LANG_MODELS.get(lang, f"{lang}_g2.pth"))]
+
+
+def reader_languages(languages=None, root=None, legacy=None):
+    """应传给 ``easyocr.Reader`` 的语言列表：只保留本地已齐备的语言。
+
+    返回空列表表示本地一门语言都没有，调用方应回落到完整语言列表并允许
+    easyocr 自动下载（首次在线安装路径不能断）。
+    """
+    langs = list(languages or ['ch_sim', 'en'])
+    directory = resolve_model_dir(langs, root=root, legacy=legacy)
+    return available_languages(directory, langs)
+
+
 def detect_local_models(languages=None, root=None, legacy=None):
-    """只读检测：现在有哪些模型文件、缺哪些、能不能离线跑。"""
+    """只读检测：现在有哪些模型文件、必需还缺哪些、能识别哪些语言。
+
+    ``missing`` 只列「阻止离线识别」的必需文件（检测模型 + 至少一门语言
+    模型）；已经能识别中文时，缺的英文模型放进 ``optional_missing``，
+    UI 不再误报「还缺 1 个模型文件」而让用户以为白下了。
+    """
     root = str(root or MODEL_ROOT)
     legacy = str(legacy or LEGACY_EASY_DIR)
     own = _model_files(root)
@@ -235,18 +287,46 @@ def detect_local_models(languages=None, root=None, legacy=None):
     # 缺什么按「识别器真正会读的那个目录」算：模型分散在两处时不能报
     # 「一个都不缺」却又判定无法离线识别。
     resolved_files = _model_files(resolved)
-    missing = [name for name in needed if not resolved_files.get(name)]
+    usable = available_languages(resolved, languages)
+    all_missing = [name for name in needed if not resolved_files.get(name)]
+    if usable:
+        missing = []
+        optional_missing = all_missing
+    else:
+        # 一个语言模型都没有时，只要求用户补「检测模型 + 一门语言」这两个，
+        # 不把可选的英文模型也算成必需，说明与实际要求必须一致。
+        minimal = [_DETECTION_MODEL, primary_language_model(languages)]
+        missing = [name for name in minimal
+                   if not resolved_files.get(name)]
+        optional_missing = [name for name in all_missing
+                            if name not in missing]
+    # easyocr.Reader 只读一个 model_storage_directory。另一个目录里若还有
+    # 有效模型（典型：旧版 ~/.EasyOCR/model 里留了 en_g2.pth），它会被静默
+    # 忽略，用户却以为自己下过了。这里显式标记，让设置页引导合并而不是
+    # 显示「可选再补」把人支使去重下。
+    if (os.path.normcase(os.path.abspath(root))
+            == os.path.normcase(os.path.abspath(legacy))):
+        other_dir, other_files = '', {}
+    elif resolved == root:
+        other_dir, other_files = legacy, old
+    else:
+        other_dir, other_files = root, own
+    split_files = [name for name, size in sorted(other_files.items())
+                   if size and not resolved_files.get(name)]
     return {
         'root': root, 'legacy_root': legacy,
         'files': {k: v for k, v in sorted(merged.items())},
         'own_files': own, 'legacy_files': old,
         'needed': needed, 'missing': missing,
+        'optional_missing': optional_missing,
+        'available_languages': usable,
         'has_detection': bool(merged.get(_DETECTION_MODEL)),
-        'ready': (models_complete(root, languages)
-                  or models_complete(legacy, languages)),
-        'can_use_offline': (has_required_models(root, languages)
-                            or has_required_models(legacy, languages)),
+        'ready': bool(usable),
+        'can_use_offline': bool(usable),
         'resolved_dir': resolved,
+        'other_dir': other_dir,
+        'split_dirs': bool(split_files),
+        'split_files': split_files,
         'total_bytes': _total_bytes(root) + _total_bytes(legacy),
     }
 
@@ -265,20 +345,63 @@ def model_cache_info(root=None):
     return info
 
 
-def model_cache_summary(info=None, languages=None):
+def model_status_suffix(detect):
+    """状态后缀：设置页与统计文案共用同一份 detect 结论，避免自相矛盾。
+
+    以前统计只看统一管理目录、检测却按识别器真正读取的目录算，会出现
+    「✅ 已可离线识别 · 还缺 2 个文件」这种同框打架的提示。
+    """
+    usable = detect.get('available_languages') or []
+    if usable:
+        names = "、".join(language_label(lang) for lang in usable)
+        optional = detect.get('optional_missing') or []
+        return (f"，已可离线识别（{names}）"
+                + (f"，可选再补 {len(optional)} 个文件支持其它语言"
+                   if optional else "，模型齐全"))
+    missing = detect.get('missing') or []
+    return (f"，还缺 {len(missing)} 个必需文件" if missing
+            else "，模型文件不完整，暂不能离线识别")
+
+
+def model_cache_summary(info=None, languages=None, detect=None):
+    """模型统计文案；传入 detect 时以识别器真实读取目录的结论为准。
+
+    ``detect`` 为空时按 info 里的 ``ready``（文件非空）自行判定，0 字节的
+    半成品模型不会再被当成「模型齐全可离线识别」。
+    """
     info = info or model_cache_info()
     root = str(info.get('root') or '')
     files = info.get('models') or []
-    if not files:
+    if not files and not (detect and detect.get('files')):
         return ("尚无本地 OCR 模型（可点「检测本地模型」或手动导入）"
                 " · 目录 " + root)
-    present = {m.get('name') for m in files}
-    needed = required_model_files(languages)
-    missing = [name for name in needed if name not in present]
-    tail = ("，模型齐全可离线识别" if not missing
-            else f"，还缺 {len(missing)} 个文件")
-    return (f"共 {len(files)} 个模型文件，占用 "
-            f"{human_size(info.get('total_bytes'))}{tail}")
+    if detect is not None:
+        count = len(detect.get('files') or {})
+        total = detect.get('total_bytes', info.get('total_bytes'))
+        tail = model_status_suffix(detect)
+    else:
+        count = len(files)
+        total = info.get('total_bytes')
+        # 只用非空文件判定；文件名存在但 0 字节（下载中断）等于没有。
+        valid = {m.get('name') for m in files if m.get('ready')}
+        needed = required_model_files(languages)
+        langs = list(languages or ['ch_sim', 'en'])
+        usable = ([lang for lang in langs
+                   if _LANG_MODELS.get(lang, f"{lang}_g2.pth") in valid]
+                  if _DETECTION_MODEL in valid else [])
+        minimal = [_DETECTION_MODEL, primary_language_model(languages)]
+        fake_detect = {
+            'available_languages': usable,
+            'optional_missing': ([n for n in needed if n not in valid]
+                                 if usable else
+                                 [n for n in needed
+                                  if n not in valid and n not in minimal]),
+            'missing': ([] if usable else
+                        [n for n in minimal if n not in valid]),
+        }
+        tail = model_status_suffix(fake_detect)
+    return (f"共 {count} 个模型文件，占用 "
+            f"{human_size(total)}{tail}")
 
 
 def import_local_model(source, root=None):
@@ -349,16 +472,50 @@ def manual_download_hint(languages=None):
     复制路径」两个按钮，用户按自己电脑上的实际位置操作。
     """
     detect = detect_local_models(languages)
-    names = "、".join(detect['missing']) if detect['missing'] else "（无）"
+    langs = list(languages or ['ch_sim', 'en'])
+    first = langs[0] if langs else 'ch_sim'
+    primary = primary_language_model(languages)
+    extra = [name for name in required_model_files(languages)[1:]
+             if name != primary]
+    split_files = detect.get('split_files') or []
+    if detect['ready']:
+        names = "、".join(language_label(lang)
+                         for lang in detect['available_languages'])
+        if split_files:
+            # 另一个目录里有现成模型却没被读到：千万别让用户再去重下一遍。
+            status = (f"已可离线识别（{names}）；但另一目录还有 "
+                      + "、".join(split_files[:4])
+                      + " 没被读到。请点「导入本地模型」合并到统一目录，"
+                        "合并后这些语言会一并启用，不用重新下载。")
+        else:
+            status = (f"已可离线识别（{names}），下面「可选」的文件不影响"
+                      "中文识别，程序不会为没下的语言联网。")
+    else:
+        status = ("当前还不能离线识别，请补齐下面「最少必需」的文件"
+                  + ("；另一目录还有 " + "、".join(split_files[:4])
+                     + "，可点「导入本地模型」合并，别重复下载"
+                     if split_files else "") + "。")
+    missing = "、".join(detect['missing']) or "（无）"
+    optional = ("另一目录已有：" + "、".join(split_files[:4]) + "（合并后启用）"
+                if split_files else
+                "、".join(detect['optional_missing']) or "（无）")
     return (
         "模型文件可从 EasyOCR 官方模型页 / GitHub Release 手动下载。\n"
         "放到哪里：点设置页「打开模型文件夹」直接定位，"
         "或点「复制路径」把目录粘进下载工具。\n"
         "每台电脑的目录都不一样，这里不写死路径，以按钮打开的为准。\n"
-        "当前缺少：" + names + "\n"
-        "必需：检测模型 craft_mlt_25k.pth + 至少一门语言模型"
-        "（简体中文 zh_sim_g2.pth / 英文 en_g2.pth）。\n"
-        "放好后点「检测本地模型」，识别时会自动优先用本地文件，不再联网下载。\n"
+        "当前状态：" + status + "\n"
+        "必需缺少：" + missing + "\n"
+        "最少必需（只识别中文，2 个文件就够）：\n"
+        f"  · {_DETECTION_MODEL}（文字检测）\n"
+        f"  · {primary}（{language_label(first)}识别）\n"
+        "可选（要识别中英混排 / 纯英文再下）：\n"
+        "  · " + ("、".join(extra) or "（无）") + "\n"
+        "可选补充：" + optional + "\n"
+        "放好后点「检测本地模型」，识别时只启用本地已有的语言并完全离线，"
+        "不再联网下载。\n"
+        "若点「识别」提示缺少组件：请先在上方点「安装」把 EasyOCR 引擎"
+        "（pip 组件）装好，模型文件不等于引擎，两者都要有。\n"
         "模型放在用户数据目录里，不在安装清单中：以后覆盖升级或应用内一键"
         "升级都不会删除，无需重新下载；卸载程序也不会清理它。"
     )

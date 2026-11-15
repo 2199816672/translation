@@ -76,9 +76,11 @@ def install_loopback_support(progress_cb=None, cancel=None, packages=None):
     """
     pkgs = tuple(packages or ('soundcard',))
     label = '内录组件' if pkgs == ('soundcard',) else '音频采集组件'
+    # 与 subprocess_util.PIP_INDEXES 一致：腾讯云镜像首选，阿里云频繁 403
+    # 已移除；PyPI 官方兜底，清华镜像最后。
     mirrors = (
+        'https://mirrors.cloud.tencent.com/pypi/simple/',
         'https://pypi.org/simple',
-        'https://mirrors.aliyun.com/pypi/simple/',
         'https://pypi.tuna.tsinghua.edu.cn/simple',
     )
     last = ''

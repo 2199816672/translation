@@ -143,8 +143,8 @@ def install_engine_with_progress(engine, on_progress=None, cancel=None):
                 pass
 
     label = 'winrt OCR 组件' if engine == 'windows' else 'EasyOCR 引擎'
-    # 以前不指定 -i，完全听用户 pip.ini 的；清华 / 其它失效镜像返回 403
-    # 时安装必然失败。这里显式换源重试，失败也给出可照做的手动命令。
+    # 以前不指定 -i，完全听用户 pip.ini 的；失效镜像返回 403 时安装必然
+    # 失败。这里显式从腾讯云镜像开始换源重试，失败也给出可照做的手动命令。
     return pip_install_with_mirrors(
         pkg.split(), on_progress=on_progress, cancel=cancel,
         on_attempt=on_attempt, label=label)
@@ -355,10 +355,9 @@ EASY_MODEL_DIR = os.path.join(os.path.expanduser("~"), '.EasyOCR', 'model')
 
 
 def _check_easy_model_exists(languages):
-    """EasyOCR 模型是否已存在（含用户手动导入与老版本默认目录）。"""
+    """本地是否已有「至少一门语言」可离线识别（含手动导入与旧版目录）。"""
     import ocr_models
-    directory = ocr_models.resolve_model_dir(languages)
-    return ocr_models.has_required_models(directory, languages)
+    return bool(ocr_models.reader_languages(languages))
 
 
 class EasyOCRRecognizer:
@@ -390,20 +389,26 @@ class EasyOCRRecognizer:
                 use_gpu = False
             import ocr_models
             model_dir = ocr_models.resolve_model_dir(self.languages)
-            # 手动下载 / 导入的模型齐全时彻底关掉联网下载，国内网络不会再
-            # 卡在 easyocr 自动拉模型上；缺文件时仍保留自动下载兜底。
-            offline_ready = ocr_models.models_complete(
+            # 只启用本地已齐备的语言：用户按「手动下载说明」放了检测模型 +
+            # zh_sim_g2.pth 两个文件时，绝不能再为没下的 en_g2.pth 联网，
+            # 否则 Reader 直接初始化失败，看起来就像「模型没识别到」。
+            usable = ocr_models.available_languages(
                 model_dir, self.languages)
+            reader_langs = usable or self.languages
+            download_enabled = not bool(usable)
+            if usable:
+                print("EasyOCR: 使用本地模型离线识别，启用语言 "
+                      + ",".join(usable))
             if not self.model_exists:
                 print("EasyOCR: 开始下载模型文件...")
             try:
                 self.reader = easyocr.Reader(
-                    self.languages, gpu=use_gpu,
+                    reader_langs, gpu=use_gpu,
                     model_storage_directory=model_dir,
-                    download_enabled=not offline_ready)
+                    download_enabled=download_enabled)
             except TypeError:
                 # 极旧版 easyocr 不接受这两个参数，退回原行为
-                self.reader = easyocr.Reader(self.languages, gpu=use_gpu)
+                self.reader = easyocr.Reader(reader_langs, gpu=use_gpu)
             if not self.model_exists:
                 print("EasyOCR: 模型下载完成！")
                 self.model_exists = True
@@ -429,7 +434,11 @@ class EasyOCRRecognizer:
             if "CUDA" in msg or "gpu" in msg.lower():
                 raise RuntimeError(f"GPU加速不可用: {msg}\n原因: 显卡驱动可能需要更新，或显存不足")
             if "model" in msg.lower() or "download" in msg.lower():
-                raise RuntimeError(f"OCR模型加载失败: {msg}\n原因: 模型文件可能损坏，请删除 ~/.EasyOCR/model 后重试")
+                raise RuntimeError(
+                    f"OCR模型加载失败: {msg}\n"
+                    "原因: 模型文件缺失或损坏。请点设置页「检测本地模型」"
+                    "查看缺哪些文件，或点「手动下载说明」重新下载后放进模型"
+                    "文件夹（不要删除已经下好的模型）")
             raise RuntimeError(f"EasyOCR识别失败: {msg}")
 
     def _results(self, image_path):
