@@ -213,6 +213,15 @@ class MainWindow(FluentWindow):
         self._setup_hotkey()
         self._auto_check_update()
 
+        # 开机自启时（--minimized）Windows 会话 / 输入桌面可能还没稳定，
+        # keyboard 的低级键盘钩子此时注册会「看起来成功但收不到按键」。
+        # 事件循环跑起来后延迟无条件重建一次（不是靠 active 判断——那种
+        # 静默失效 active 也是满的），避免用户必须手动关掉重开。
+        self._hotkey_retries = 0
+        if start_minimized:
+            QTimer.singleShot(1500, lambda: self._verify_hotkeys(force=True))
+            QTimer.singleShot(6000, lambda: self._verify_hotkeys(force=True))
+
         if start_minimized or self.cfg.get("start_minimized", False):
             QTimer.singleShot(0, self._minimize_to_tray)
         # Ctrl+K 命令面板：托盘 / 浮层专属动作汇总到一个可搜索入口
@@ -426,9 +435,71 @@ class MainWindow(FluentWindow):
         from hotkeys import HotkeyManager, get_hotkeys
         self._hotkeys = HotkeyManager(
             self._sig_hotkey.emit,
-            on_error=self.settings.show_hotkey_error,
+            on_error=self._on_hotkey_register_error,
             on_warning=self.settings.show_hotkey_warning)
-        self._hotkeys.reload(get_hotkeys(self.cfg))
+        keys = get_hotkeys(self.cfg)
+        # 期望注册的去重组合数（冲突组合只注册第一个），用于事后校验
+        self._hotkey_expected = len({
+            str(v).strip().lower() for v in keys.values()
+            if str(v or '').strip().lower()})
+        self._hotkeys.reload(keys)
+
+    def _on_hotkey_register_error(self, msg):
+        """注册失败：窗口隐藏在托盘时 InfoBar 看不见，用托盘气泡兜底。"""
+        import diagnostics
+        diagnostics.record('hotkey', str(msg), source='快捷键注册')
+        try:
+            if not self.isVisible() and QSystemTrayIcon.isSystemTrayAvailable():
+                self._tray.showMessage(
+                    APP_DISPLAY_NAME, f"快捷键注册失败：{msg}",
+                    QSystemTrayIcon.MessageIcon.Warning, 5000)
+        except Exception:
+            pass
+        # 仍走原有的界面提示（窗口可见时用户能看到）
+        try:
+            self.settings.show_hotkey_error(msg)
+        except Exception:
+            pass
+
+    def _verify_hotkeys(self, force=False):
+        """开机自启后复查 / 重建热键，确保会话稳定后钩子一定有效。
+
+        Windows 登录早期 SetWindowsHookEx 可能装到一个随后失效的状态：
+        reload() 当场返回成功、_active 也是满的，但用户按键收不到。因此
+        自启场景用 ``force=True`` 在事件循环稳定后无条件重建，光靠 active
+        判断抓不到这种静默失效。手动恢复窗口时只做「缺失才补」的软校验。
+
+        重建走 unregister→register，只移除本实例自己的钩子，不碰其它程序；
+        HotkeyManager 内部已保证幂等，重复调用不会累积重复钩子。
+        """
+        from hotkeys import get_hotkeys
+        if self._hotkeys is None:
+            return
+        expected = getattr(self, '_hotkey_expected', 0)
+        if not expected:
+            return
+        registered = len(self._hotkeys.active)
+        if not force and registered >= expected:
+            return
+        if getattr(self, '_hotkey_retries', 0) >= 2:
+            import diagnostics
+            diagnostics.record(
+                'hotkey',
+                f'热键重建已达上限（registered={registered}/'
+                f'expected={expected}），停止重试',
+                source='快捷键自愈')
+            return
+        self._hotkey_retries += 1
+        import diagnostics
+        diagnostics.record(
+            'hotkey',
+            f'会话稳定后重建热键 #{self._hotkey_retries} '
+            f'(registered={registered}/expected={expected}, force={force})',
+            source='快捷键自愈')
+        try:
+            self._hotkeys.reload(get_hotkeys(self.cfg))
+        except Exception as exc:
+            diagnostics.record('hotkey', str(exc), source='快捷键重建异常')
 
     @Slot(str)
     def _on_hotkey_action(self, action):
@@ -907,6 +978,12 @@ class MainWindow(FluentWindow):
         self.showNormal()
         self.activateWindow()
         self.raise_()
+        # 用户从托盘唤出窗口说明会话已就绪，重置计数后再强制校验一次全局
+        # 热键（自启时的两次重建可能已用光计数，用户主动恢复应另算）
+        def _recheck():
+            self._hotkey_retries = 0
+            self._verify_hotkeys(force=True)
+        QTimer.singleShot(0, _recheck)
 
     def _quit_app(self):
         tasks = self._task_center.active()

@@ -107,6 +107,9 @@ class HotKeyInput(QLineEdit):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            # 先备份原值：取消（Esc / 失焦）时必须能恢复，否则用户点一下
+            # 再按 Esc，原快捷键就被清空，保存后永久丢失。
+            self._saved_keys = list(self._keys)
             self._capturing = True
             self._modifiers.clear()
             self._keys.clear()
@@ -163,9 +166,11 @@ class HotKeyInput(QLineEdit):
         self.hotkeyChanged.emit(result)
 
     def _cancel_capture(self):
-        """取消录入，恢复显示原快捷键。"""
+        """取消录入，恢复显示点击前的原快捷键。"""
         self._capturing = False
         self._modifiers.clear()
+        # 用点击时备份的原值恢复，而不是已被 clear() 的 _keys
+        self._keys = list(getattr(self, '_saved_keys', []))
         self.setText(self._format("+".join(self._keys)))
         self.setStyleSheet("")
 

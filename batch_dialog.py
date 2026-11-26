@@ -514,6 +514,11 @@ class BatchTranscribeDialog(QDialog):
     # ── 拖放 ────────────────────────────────────────────────
 
     def dragEnterEvent(self, event):
+        # 任务运行中 runner 已对 jobs 拍过快照，此时再加文件不会被处理，
+        # 却会显示出来并让进度条「假完成」，必须直接拒绝拖入。
+        if getattr(self, '_running', False):
+            event.ignore()
+            return
         urls = event.mimeData().urls() if event.mimeData() else []
         if any(is_supported(u.toLocalFile()) or os.path.isdir(u.toLocalFile())
                for u in urls):
@@ -522,6 +527,10 @@ class BatchTranscribeDialog(QDialog):
             event.ignore()
 
     def dropEvent(self, event):
+        if getattr(self, '_running', False):
+            self.status_label.setText('任务进行中，请先停止再添加文件')
+            event.ignore()
+            return
         paths = []
         for url in event.mimeData().urls():
             local = url.toLocalFile()
@@ -643,6 +652,9 @@ class BatchTranscribeDialog(QDialog):
         retry_mode = self._retry_mode
         self._retry_mode = False
         self._last_summary = ''
+        # 清掉上一轮 _on_all_done 留下的绿色/黄色内联色，避免新一轮
+        # 进行中仍显示「完成」的颜色误导用户。
+        self.status_label.setStyleSheet('')
         self._set_editing_enabled(False)
         self.total_progress.setRange(0, len(self.jobs))
         self.total_progress.setValue(0)

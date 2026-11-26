@@ -37,7 +37,15 @@ def _split_text(text, max_len):
     for line in text.split("\n"):
         # 单行超长时按字符硬切分，否则 API 会拒绝请求
         while len(line) + (1 if cur else 0) > max_len:
+            # cur 已被上一行填满（len(cur)==max_len）时，room 会变成 -1，
+            # line[:-1] 切出约 2×max_len 的块、余下 1 字符，API 直接报长度错误。
+            # 先把满的 cur 单独成块，再按剩余空间切本行。
+            if cur and len(cur) >= max_len:
+                parts.append(cur)
+                cur = ""
+                continue
             room = max_len - len(cur) - 1 if cur else max_len
+            room = max(1, room)
             parts.append(cur + "\n" + line[:room] if cur else line[:room])
             line = line[room:]
             cur = ""
@@ -368,7 +376,16 @@ _free_instances = {}
 
 def get_free_translator(api_type, api_key=None, region=None):
     """获取免费翻译器实例。api_key / region 不为空时优先使用用户配置。"""
-    cache_key = f"{api_type}:{api_key}:{region}"
+    # 实例键只用于区分不同凭证，不落盘、不进日志；但按项目约定不把明文
+    # 密钥塞进键名。有凭证时用摘要避免内存 dump / 异常现场泄露 api_key；
+    # 无凭证时保持 `api_type::` 原格式，兼容按此键注入实例的调用方与测试。
+    if api_key or region:
+        import hashlib
+        cred = hashlib.sha256(
+            f"{api_key or ''}:{region or ''}".encode("utf-8")).hexdigest()
+        cache_key = f"{api_type}:{cred}"
+    else:
+        cache_key = f"{api_type}::"
     if cache_key not in _free_instances:
         mapping = {
             "bing_free": BingFreeTranslator,

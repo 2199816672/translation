@@ -36,23 +36,67 @@ _MAX_KNOWN_DIRS = 12
 _DETECTION_MODEL = "craft_mlt_25k.pth"
 _MODEL_SUFFIXES = (".pth", ".json", ".yaml", ".yml", ".txt", ".zip")
 
-# EasyOCR 的语言模型文件名（与 easyocr 内部 recognizer 约定一致）
+# EasyOCR 官方识别模型文件名，逐项对照 easyocr/config.py 1.7.2 的
+# recognition_models（gen1 / gen2）。以前整张表是按「语言代码 + _g2.pth」
+# 猜出来的，几乎全是错的：英文官方叫 english_g2.pth、日文 japanese_g2.pth，
+# 法/德/西/葡/意/越共用 latin_g2.pth、俄文用 cyrillic_g2.pth、繁中用
+# chinese.pth。用户按官方模型页下好的文件因此被判成「还缺 1 个模型」，
+# 识别器也不会启用对应语言 —— 这正是「明明下了模型却用不了」的根因。
+# 注意 EasyOCR 的 standard 模式一次只加载一个识别模型：['ch_sim','en']
+# 实际只用 zh_sim_g2.pth（本身含英文字母），english_g2.pth 仅纯英文时用。
 _LANG_MODELS = {
     'ch_sim': 'zh_sim_g2.pth',
-    'ch_tra': 'zh_tra_g2.pth',
-    'en': 'en_g2.pth',
-    'ja': 'ja_g2.pth',
-    'ko': 'ko_g2.pth',
-    'fr': 'fr_g2.pth',
-    'de': 'de_g2.pth',
-    'es': 'es_g2.pth',
-    'ru': 'ru_g2.pth',
-    'pt': 'pt_g2.pth',
-    'it': 'it_g2.pth',
-    'ar': 'ar_g2.pth',
-    'th': 'th_g2.pth',
-    'vi': 'vi_g2.pth',
+    'ch_tra': 'chinese.pth',
+    'en': 'english_g2.pth',
+    'ja': 'japanese_g2.pth',
+    'ko': 'korean_g2.pth',
+    'fr': 'latin_g2.pth',
+    'de': 'latin_g2.pth',
+    'es': 'latin_g2.pth',
+    'ru': 'cyrillic_g2.pth',
+    'pt': 'latin_g2.pth',
+    'it': 'latin_g2.pth',
+    'ar': 'arabic.pth',
+    'th': 'thai.pth',
+    'vi': 'latin_g2.pth',
 }
+
+# 历史版本说明里误导用户下载/命名的文件名 → 官方文件名。这些名字
+# EasyOCR 根本不会去读，所以 **不能** 算「已就绪」，否则 Reader 会去
+# 找官方名、找不到又因 download_enabled=False 直接失败。导入时自动
+# 改名成官方名，用户不必重新下载几百 MB。
+_MODEL_ALIASES = {
+    'en_g2.pth': 'english_g2.pth',
+    'zh_tra_g2.pth': 'chinese.pth',
+    'ja_g2.pth': 'japanese_g2.pth',
+    'ko_g2.pth': 'korean_g2.pth',
+    'fr_g2.pth': 'latin_g2.pth',
+    'de_g2.pth': 'latin_g2.pth',
+    'es_g2.pth': 'latin_g2.pth',
+    'pt_g2.pth': 'latin_g2.pth',
+    'it_g2.pth': 'latin_g2.pth',
+    'vi_g2.pth': 'latin_g2.pth',
+    'ru_g2.pth': 'cyrillic_g2.pth',
+    'ar_g2.pth': 'arabic.pth',
+    'th_g2.pth': 'thai.pth',
+}
+
+
+def canonical_model_name(name):
+    """把历史误命名的模型文件映射回 EasyOCR 官方文件名。"""
+    base = os.path.basename(str(name or ''))
+    return _MODEL_ALIASES.get(base, base)
+
+
+def misnamed_model_files(files):
+    """从 ``_model_files`` 结果里挑出「文件名不对、EasyOCR 读不到」的项。
+
+    返回 ``[(旧名, 官方名), ...]``；0 字节的半成品不算，避免把下载中断
+    的垃圾文件也说成「需要改名」。
+    """
+    return [(name, _MODEL_ALIASES[name])
+            for name in sorted(files or {})
+            if name in _MODEL_ALIASES and files.get(name)]
 
 LANGUAGE_NAMES = {
     'ch_sim': '简体中文', 'ch_tra': '繁体中文', 'en': '英文',
@@ -302,7 +346,7 @@ def available_languages(directory, languages=None):
 
     旧逻辑把 ``['ch_sim', 'en']`` 当成硬性要求：用户按说明手动下了
     ``craft_mlt_25k.pth`` + ``zh_sim_g2.pth`` 两个文件，检测仍报「还缺
-    1 个模型文件」，识别器还会为没下的 ``en_g2.pth`` 打开联网下载，国内
+    1 个模型文件」，识别器还会为没下的 ``english_g2.pth`` 打开联网下载，国内
     网络一卡就整个 Reader 初始化失败。EasyOCR 只认 model_storage_directory
     里实际存在的文件，所以这里按目录里齐备的语言返回，识别器只启用它们。
     """
@@ -535,9 +579,12 @@ def detect_local_models(languages=None, root=None, legacy=None, custom=None):
         optional_missing = [name for name in all_missing
                             if name not in missing]
     # easyocr.Reader 只读一个 model_storage_directory。另一个目录里若还有
-    # 有效模型（典型：旧版 ~/.EasyOCR/model 里留了 en_g2.pth），它会被静默
-    # 忽略，用户却以为自己下过了。这里显式标记，让设置页引导合并而不是
-    # 显示「可选再补」把人支使去重下。
+    # 有效模型（典型：旧版 ~/.EasyOCR/model 里留了 english_g2.pth），它会
+    # 被静默忽略，用户却以为自己下过了。这里显式标记，让设置页引导合并
+    # 而不是显示「可选再补」把人支使去重下。
+    # 另有一类「下了但文件名不对」：历史说明误导用户用 en_g2.pth 这种
+    # 官方根本不读的名字。它们不能算成缺文件让用户重下，要提示一键改名。
+    misnamed = misnamed_model_files(resolved_files)
     if custom_active:
         # 用户明确指定了目录：其它目录里的同类文件不该再提示「未合并」，
         # 否则会误导他去把默认目录也塞满一份。
@@ -567,6 +614,7 @@ def detect_local_models(languages=None, root=None, legacy=None, custom=None):
         'other_dir': other_dir,
         'split_dirs': bool(split_files),
         'split_files': split_files,
+        'misnamed_files': misnamed,
         'total_bytes': (_total_bytes(resolved) if custom_active
                         else _total_bytes(root) + _total_bytes(legacy)),
     }
@@ -593,15 +641,20 @@ def model_status_suffix(detect):
     「✅ 已可离线识别 · 还缺 2 个文件」这种同框打架的提示。
     """
     usable = detect.get('available_languages') or []
+    misnamed = detect.get('misnamed_files') or []
+    bad_name_tip = (f"，⚠ {len(misnamed)} 个模型文件名不符合官方命名"
+                    if misnamed else "")
     if usable:
         names = "、".join(language_label(lang) for lang in usable)
         optional = detect.get('optional_missing') or []
         return (f"，已可离线识别（{names}）"
                 + (f"，可选再补 {len(optional)} 个文件支持其它语言"
-                   if optional else "，模型齐全"))
+                   if optional else "，模型齐全")
+                + bad_name_tip)
     missing = detect.get('missing') or []
-    return (f"，还缺 {len(missing)} 个必需文件" if missing
-            else "，模型文件不完整，暂不能离线识别")
+    return ((f"，还缺 {len(missing)} 个必需文件" if missing
+             else "，模型文件不完整，暂不能离线识别")
+            + bad_name_tip)
 
 
 def model_cache_summary(info=None, languages=None, detect=None):
@@ -645,6 +698,28 @@ def model_cache_summary(info=None, languages=None, detect=None):
             f"{human_size(total)}{tail}")
 
 
+def _copy_misnamed_to_official(directory):
+    """把目录里历史错名的模型复制一份成官方名，绝不删除用户原文件。
+
+    老用户的模型常在 ``~/.EasyOCR/model``，而「打开 / 导入目标」与识别器
+    读取目录同源后，这个目录就是 root 本身：不能「复制进自己」，但设置页
+    又提示用户「点导入即可自动改名」。这里就地补一份官方名副本，让那条
+    提示真的点得动。官方名已有有效文件时跳过，避免覆盖正确模型。
+    """
+    found = _model_files(directory)
+    copied = []
+    for old, new in misnamed_model_files(found):
+        if found.get(new):
+            continue
+        try:
+            shutil.copy2(os.path.join(directory, old),
+                         os.path.join(directory, new))
+        except (OSError, shutil.SameFileError):
+            continue
+        copied.append(new)
+    return copied
+
+
 def import_local_model(source, root=None):
     """把手动下载的模型目录 / 单个文件放进统一管理目录。
 
@@ -663,7 +738,13 @@ def import_local_model(source, root=None):
     if not os.path.exists(src):
         raise RuntimeError("所选路径不存在，请重新选择")
     if os.path.isdir(src) and src == root:
-        # 文件对话框默认就停在模型目录，用户直接点「确定」时别谎报导入成功
+        # 文件对话框默认就停在模型目录。老用户的模型若正好在旧版目录
+        # （它本身就是当前读取目录），这里还要顺手把历史错名补成官方名，
+        # 否则设置页「点导入自动改名」的提示点了只会报错。
+        renamed = _copy_misnamed_to_official(root)
+        if renamed:
+            return len(_model_files(root)), sorted(renamed)
+        # 用户直接点「确定」时别谎报导入成功
         raise RuntimeError(
             "所选的就是模型目录本身，文件已经在里面了，无需导入。"
             "请选择手动下载模型所在的另一个文件夹")
@@ -681,11 +762,19 @@ def import_local_model(source, root=None):
     if not candidates:
         raise RuntimeError(
             "所选目录里没有模型文件。EasyOCR 模型是 .pth 文件，"
-            "例如 craft_mlt_25k.pth、zh_sim_g2.pth、en_g2.pth")
-    copied = []
+            "例如 craft_mlt_25k.pth、zh_sim_g2.pth、english_g2.pth")
+    # 历史说明里误导用户用过的错名（en_g2.pth 等）EasyOCR 根本不读：
+    # 导入时直接改成官方名，用户不用重新下载。同一官方名同时存在旧名和
+    # 官方名两份时优先官方名，别让旧的半成品覆盖正确文件。
+    grouped = {}
     for path in candidates:
-        name = os.path.basename(path)
-        target = os.path.join(root, name)
+        target_name = canonical_model_name(os.path.basename(path))
+        if (target_name not in grouped
+                or os.path.basename(path) == target_name):
+            grouped[target_name] = path
+    copied = []
+    for target_name, path in grouped.items():
+        target = os.path.join(root, target_name)
         if (os.path.normcase(os.path.abspath(path))
                 == os.path.normcase(os.path.abspath(target))):
             continue        # 用户直接选了模型目录本身 / 里面已有的文件
@@ -696,7 +785,7 @@ def import_local_model(source, root=None):
             # 符号链接 / 大小写变体仍指向同一文件，跳过即可，交给下面的
             # `if not copied` 给统一的中文提示，别把英文异常漏给用户。
             continue
-        copied.append(name)
+        copied.append(target_name)
     if not copied:
         # 例如选了模型目录本身（路径大小写不同时绕过了上面的 src == root），
         # 或选了目录里已有的单个模型文件：所有候选都被跳过，不能谎报导入完成。
@@ -765,7 +854,15 @@ def manual_download_hint(languages=None):
         "可选（要识别中英混排 / 纯英文再下）：\n"
         "  · " + ("、".join(extra) or "（无）") + "\n"
         "可选补充：" + optional + "\n"
-        "放好后点「检测本地模型」，识别时只启用本地已有的语言并完全离线，"
+        "⚠ 文件名必须和 EasyOCR 官方完全一致：英文是 english_g2.pth、"
+        "日文 japanese_g2.pth、法/德/西/葡/意共用 latin_g2.pth；"
+        "旧版说明里写过的 en_g2.pth 这类名字官方根本不读。"
+        "点「导入本地模型…」会自动改名成官方名，不用重新下载。\n"
+        + ("检测到文件名不对：" + "、".join(
+            f"{old} → {new}"
+            for old, new in (detect.get('misnamed_files') or [])[:4]) + "\n"
+           if detect.get('misnamed_files') else "")
+        + "放好后点「检测本地模型」，识别时只启用本地已有的语言并完全离线，"
         "不再联网下载。\n"
         "若点「识别」提示缺少组件：请先在上方点「安装」把 EasyOCR 引擎"
         "（pip 组件）装好，模型文件不等于引擎，两者都要有。\n"

@@ -181,7 +181,12 @@ def _default_translate(texts, settings, progress_cb, cancel):
             # 取消的请求留在后台自生自灭，绝不能塞进译文列表。
             value = run_cancelable(lambda t=text: translator.translate(t),
                                    cancel, poll=0.1)
-            if value is not None and str(value).strip():
+            # 只判非空不够：引擎降级 / 源=目标语言时会把原文原样回显。
+            # 必须与免费链路 / 字幕链路一致地拦下回显，否则「只导出译文」
+            # 会把原文冒充译文（核心契约红线）。
+            from free_translator import _echoed_source
+            if (value is not None and str(value).strip()
+                    and not _echoed_source(text, value)):
                 translated = str(value)
         except CallCancelled:
             raise Cancelled()

@@ -68,7 +68,7 @@ class InstallerKeepsUserDataTests(unittest.TestCase):
             legacy = os.path.join(tmp, 'legacy')
             os.makedirs(own)
             os.makedirs(legacy)
-            for name in ('craft_mlt_25k.pth', 'en_g2.pth'):
+            for name in ('craft_mlt_25k.pth', 'english_g2.pth'):
                 with open(os.path.join(legacy, name), 'wb') as f:
                     f.write(b'model-data')
             resolved = ocr_models.resolve_model_dir(

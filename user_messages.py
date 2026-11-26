@@ -15,6 +15,16 @@ def friendly_install_error(msg, engine=None):
     把「改用 Windows 自带 OCR」当退路，否则用户被支使回刚失败的那条链路。
     """
     low = str(msg or '').lower()
+    # 冻结版 pip 的 distlib 启动器异常：三个源会报同一个内部 Exception，
+    # 既不是 403 也不是超时。必须先认出来，否则下面全按「检查网络」处理，
+    # 用户会一直重试一个永远好不了的安装。
+    if ('distlibexception' in low or 'unable to locate finder' in low
+            or '_get_launcher' in low):
+        return ("安装程序内部的组件安装器出错（pip 生成命令行启动器失败），"
+                "与网络、镜像、pip.ini 都无关，换源或重试不会解决；"
+                "请更新到修复版安装包。现在可先在设置页把 OCR 引擎切到"
+                "「Windows 系统自带」正常使用（免下载模型，"
+                "若提示缺 winrt 再点「安装 winrt」）。")
     # 403 最常见的原因是本机 pip.ini 把全局源设成了失效镜像（清华源
     # /simple/easyocr/ 实测直接 403）。安装链路已隔离这份配置并换用其它源
     # 重试（首选腾讯云镜像）；能走到这句说明全部源都失败了，要如实说结论

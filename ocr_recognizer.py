@@ -37,22 +37,71 @@ def _silence_third_party_warnings():
 _silence_third_party_warnings()
 
 
+# 最近一次自检的真实异常，供设置页 tooltip / 诊断展示。以前只捕 ImportError，
+# 遇到 OSError(WinError 126，DLL 找不到) 之类会被上层 except Exception 静默
+# 吞成「未安装」，用户完全不知道组件其实已经装好了。
+_LAST_CHECK_ERROR = {}
+
+# 组件是否真的落盘：与「本进程能否 import」分开判定。pip 在子进程里装完
+# 后，主进程可能因 torch 等原生 DLL 半加载状态暂时导不进来；这时候应该提示
+# 重启，而不是谎报「还差引擎」让用户无限重装。
+_ENGINE_MARKERS = {
+    'easy': ('easyocr/__init__.py', 'easyocr-*.dist-info'),
+    # pip 会把 wheel 名里的点和连字符归一化成下划线：实际目录是
+    # winrt_windows_media_ocr-<ver>.dist-info，`winrt-*.dist-info` 恒不命中，
+    # 导致装好后仍误判「未安装」、反复重装。用宽松匹配覆盖 2.x/3.x 命名。
+    'windows': (None, 'winrt*ocr*.dist-info'),
+}
+
+
+def engine_check_error(engine):
+    """返回最近一次 ``check_engine_available`` 捕获到的真实异常文本。"""
+    return _LAST_CHECK_ERROR.get(engine, '')
+
+
+def engine_files_installed(engine):
+    """只查 user_libs 里的包文件，不受本次运行的 import 状态影响。"""
+    marker = _ENGINE_MARKERS.get(engine)
+    if not marker:
+        return False
+    try:
+        from app_paths import user_libs_dir
+        root = Path(str(user_libs_dir()))
+        if not root.is_dir():
+            return False
+        pkg_file, dist_glob = marker
+        if pkg_file and not (root / pkg_file).is_file():
+            return False
+        if dist_glob and not any(p.is_dir() for p in root.glob(dist_glob)):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def check_engine_available(engine):
-    """检查指定OCR引擎是否可用"""
-    # 设置页刚在线装完组件时，主进程的目录缓存可能还没刷新
+    """检查指定 OCR 引擎在**本次进程**能否导入，并记下真实失败原因。
+
+    注意捕获所有 Exception：torch / scipy 的 DLL 加载失败抛的是 OSError，
+    不是 ImportError；漏掉它就会把「已装好但需重启」误报成「未安装」。
+    """
+    # 设置页刚在线装完组件时，主进程的目录缓存 / DLL 目录可能还没刷新
     from app_paths import refresh_user_libs
     refresh_user_libs()
+    _LAST_CHECK_ERROR.pop(engine, None)
     if engine == 'windows':
         try:
             import winrt.windows.media.ocr
             return True
-        except ImportError:
+        except Exception as exc:
+            _LAST_CHECK_ERROR[engine] = f"{type(exc).__name__}: {exc}"
             return False
     elif engine == 'easy':
         try:
             import easyocr
             return True
-        except ImportError:
+        except Exception as exc:
+            _LAST_CHECK_ERROR[engine] = f"{type(exc).__name__}: {exc}"
             return False
     return False
 
@@ -94,8 +143,16 @@ def _cached_scan(recognizer, image_path, compute, kind):
     """
     digest = _image_digest(image_path)
     cache = get_cache("ocr", max_entries=150)
+    # 模型目录必须进 key：切换「本地模型」目录后，同一张图不能命中旧模型的
+    # 识别结果，否则界面显示已切换、输出却纹丝不动。
+    try:
+        from ocr_models import active_model_dir
+        model_dir = str(active_model_dir() or "")
+    except Exception:
+        model_dir = ""
     key = (make_key("o1", type(recognizer).__name__, kind,
-                    tuple(getattr(recognizer, "languages", []) or []), digest)
+                    tuple(getattr(recognizer, "languages", []) or []),
+                    model_dir, digest)
            if digest else None)
     if key is not None:
         hit = cache.get(key)
@@ -390,7 +447,7 @@ class EasyOCRRecognizer:
             import ocr_models
             model_dir = ocr_models.resolve_model_dir(self.languages)
             # 只启用本地已齐备的语言：用户按「手动下载说明」放了检测模型 +
-            # zh_sim_g2.pth 两个文件时，绝不能再为没下的 en_g2.pth 联网，
+            # zh_sim_g2.pth 两个文件时，绝不能再为没下的 english_g2.pth 联网，
             # 否则 Reader 直接初始化失败，看起来就像「模型没识别到」。
             usable = ocr_models.available_languages(
                 model_dir, self.languages)
@@ -539,8 +596,14 @@ def get_ocr_instance(languages=None, engine=None):
 
 
 def reset_ocr_instance():
-    """重置OCR实例（切换引擎 / 语言时调用）"""
+    """重置OCR实例（切换引擎 / 语言 / 模型目录时调用）"""
     global _ocr_instance, _current_engine, _current_languages
     _ocr_instance = None
     _current_engine = None
     _current_languages = None
+    # 清掉旧的扫描缓存：换模型目录后即使 key 已含目录，清一次也能避免
+    # 历史版本的旧 key 残留命中，确保「切换即生效」。
+    try:
+        get_cache("ocr").clear()
+    except Exception:
+        pass

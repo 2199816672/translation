@@ -24,7 +24,7 @@ import ocr_models
 
 DETECTION = "craft_mlt_25k.pth"
 CHINESE = "zh_sim_g2.pth"
-ENGLISH = "en_g2.pth"
+ENGLISH = "english_g2.pth"
 
 
 def _src(rel):

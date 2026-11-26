@@ -50,7 +50,21 @@ HIDDEN_IMPORTS = [
     "tokenizers", "sounddevice", "soundcard", "zhconv",
     "deep_translator", "requests", "PIL.Image", "cv2", "numpy",
     "pdfplumber", "pdfminer", "docx", "pptx", "fitz", "openpyxl",
+    # EasyOCR / torch / scipy 是用户在设置页点「安装」后才装进 user_libs 的，
+    # PyInstaller 分析入口脚本时根本看不到它们，于是这些包运行时才会 import
+    # 的标准库模块不会被收进 PYZ。实测缺 graphlib 时 torch 2.15 直接抛
+    # ModuleNotFoundError，表现就是「组件明明装好了，状态一直说还差引擎」，
+    # 连重启都救不回来。tkinter 在 EXCLUDES 里，组件不会在导入路径上用它。
+    "graphlib", "cProfile", "pstats", "modulefinder", "pickletools",
 ]
+
+# 内置包里被 PyInstaller hook「只收了入口用到的几个子模块」的，必须整包
+# 收集子模块。实测内置 Pillow 收了 81 个却漏了 ImageEnhance / ImageStat /
+# ImageGrab，而在线装进 user_libs 的 torchvision / skimage 恰好要 import
+# 它们；PIL 包已在 PYZ 里抢先加载，user_libs 那份完整 Pillow 完全看不到，
+# 报 "cannot import name 'ImageStat' from 'PIL'"，用户以为组件没装好。
+# 这些全是纯 Python 子模块，体积可忽略。
+COLLECT_SUBMODULES = ("PIL",)
 
 # 体积以 GB 计的可选后端 / 开发依赖
 EXCLUDES = [
@@ -92,6 +106,8 @@ def main() -> int:
     # 依赖解析会失败。体积只有几 MB，换来安装版可在线装组件。
     cmd += ["--collect-all", "pip",
             "--hidden-import", "pip._internal.cli.main"]
+    for module in COLLECT_SUBMODULES:
+        cmd += ["--collect-submodules", module]
     for module in ("certifi", "truststore"):
         cmd += ["--hidden-import", module]
     for module in EXCLUDES:

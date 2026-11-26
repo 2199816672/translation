@@ -400,7 +400,7 @@ def get_cache_settings():
 # 加载保存的配置
 user_config = load_user_config()
 
-APP_VERSION = "1.5.5"
+APP_VERSION = "1.5.7"
 BILIBILI_DYNAMIC_URL = "https://space.bilibili.com/382966397/dynamic"
 GITHUB_REPO = "2199816672/translation"
 

@@ -224,6 +224,12 @@ class ScreenshotOverlay(QWidget):
         self._extract_blocks = []
         self._showing_trans = False
         self._edit_overlay = None
+        # 复用浮层时清掉上一轮编辑模式的文字标注，否则不经过
+        # _exit_edit_mode 直接重开（如外部切换模式）会让旧标注重现。
+        self._edit_text_items = []
+        self._edit_selected_text_idx = -1
+        self._edit_hide_item_idx = -1
+        self._edit_text_replace_idx = -1
         self._popup_close = QRect()
         self._selecting = False
         self._clear_word_selection()

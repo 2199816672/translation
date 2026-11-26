@@ -4,7 +4,7 @@
 
 用户实测场景：按「手动下载说明」把 craft_mlt_25k.pth + zh_sim_g2.pth
 放进模型目录，设置页仍报「还缺 1 个模型文件」、识别也跑不起来——因为代码
-硬性要求 ch_sim+en 三个文件，还为此打开 easyocr 联网下载 en_g2.pth。
+硬性要求 ch_sim+en 三个文件，还为此打开 easyocr 联网下载 english_g2.pth。
 本轮把「本地已有语言即可离线」和「镜像首选腾讯云」两条都锁死。
 """
 import contextlib
@@ -30,7 +30,7 @@ TENCENT = "https://mirrors.cloud.tencent.com/pypi/simple/"
 ALIYUN = "mirrors.aliyun.com"
 DETECTION = "craft_mlt_25k.pth"
 CHINESE = "zh_sim_g2.pth"
-ENGLISH = "en_g2.pth"
+ENGLISH = "english_g2.pth"
 
 
 def _src(name):

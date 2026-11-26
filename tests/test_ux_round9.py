@@ -125,7 +125,7 @@ class OcrModelTests(unittest.TestCase):
         files = ocr_models.required_model_files(['ch_sim', 'en'])
         self.assertEqual(files[0], 'craft_mlt_25k.pth')
         self.assertIn('zh_sim_g2.pth', files)
-        self.assertIn('en_g2.pth', files)
+        self.assertIn('english_g2.pth', files)
 
     def test_catalog_lists_all_engines_with_pros_and_cost(self):
         text = ocr_models.engine_catalog_text()
@@ -141,7 +141,7 @@ class OcrModelTests(unittest.TestCase):
             root = os.path.join(tmp, 'ocr')
             src = os.path.join(tmp, 'downloaded')
             os.makedirs(src)
-            for name in ('craft_mlt_25k.pth', 'zh_sim_g2.pth', 'en_g2.pth'):
+            for name in ('craft_mlt_25k.pth', 'zh_sim_g2.pth', 'english_g2.pth'):
                 with open(os.path.join(src, name), 'wb') as f:
                     f.write(b'model-data')
 

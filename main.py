@@ -73,6 +73,48 @@ def _prepare_worker_stdio():
         setattr(sys, name, stream)
 
 
+def _patch_frozen_pip_launchers():
+    """修掉 PyInstaller 冻结态里 pip 安装「必崩」的 distlib 启动器问题。
+
+    装带 ``console_scripts`` 的包（easyocr / torch / pygments…几乎都有）时，
+    pip 会调 ``pip._vendor.distlib.scripts.ScriptMaker._get_launcher()`` 去
+    找 ``t64.exe``，而它用 ``distlib.resources.finder('pip._vendor.distlib')``
+    按包的 ``__loader__`` 类型查 _finder_registry。冻结后这个 loader 变成
+    PyiFrozenImporter，表里没有对应条目，直接抛::
+
+        pip._vendor.distlib.DistlibException:
+            Unable to locate finder for 'pip._vendor.distlib'
+
+    实测用 ``--no-index --find-links`` 装一个 3KB 本地 wheel 也 100% 复现，
+    **与网络、镜像、pip.ini 完全无关**：换多少个源都是同一条 Exception，
+    用户只会反复看到「三个源均失败 / 请检查网络」。
+
+    组件统一装进 ``--target`` 用户数据目录，程序只用 ``import``，从来不会
+    调用这些命令行脚本。把 add_launchers 关掉后 distlib 改写成普通 .py
+    脚本（shebang + 代码），不再触碰缺失的 finder，安装链路即可恢复；
+    对源码版运行同样安全。
+    """
+    if os.name != 'nt':
+        return
+    try:
+        from pip._vendor.distlib import scripts as _scripts
+        maker = _scripts.ScriptMaker
+        if getattr(maker, '_tt_no_launcher', False):
+            return
+        original_init = maker.__init__
+
+        def _init_without_launchers(self, source_dir, target_dir,
+                                    add_launchers=True, *args, **kwargs):
+            return original_init(self, source_dir, target_dir, False,
+                                 *args, **kwargs)
+
+        maker.__init__ = _init_without_launchers
+        maker._tt_no_launcher = True
+    except Exception as exc:
+        # 不阻断安装：pip 版本不同 / 结构变化时仍按原路径执行，错误照常输出。
+        sys.stderr.write("pip 启动器兼容处理未生效（不阻断安装）：%s\n" % exc)
+
+
 def _run_pip_worker(argv):
     """在子进程里执行 pip，返回进程退出码。"""
     _prepare_worker_stdio()
@@ -87,6 +129,7 @@ def _run_pip_worker(argv):
             "本安装包未内置 pip，无法在线安装可选组件：%s\n"
             "请更新到最新版安装包，或改用源码版运行。\n" % exc)
         return 1
+    _patch_frozen_pip_launchers()
     try:
         return int(pip_main(list(argv)) or 0)
     except SystemExit as exc:

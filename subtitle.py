@@ -354,7 +354,11 @@ def translate_segments(texts, translate, on_progress=None):
             out = translate(text)
         except Exception as exc:  # 单条失败不能丢掉整份已识别的字幕
             last_error = str(exc)
-        if not isinstance(out, str) or not out.strip():
+        # 回显原文不算译文：与 Translator / 免费链路 / 批量链路同口径，
+        # 绝不把原文当译文交给「只导出译文」（核心契约红线）。
+        from free_translator import _echoed_source
+        if (not isinstance(out, str) or not out.strip()
+                or _echoed_source(text, out)):
             failed += 1
             results.append('')
         else:

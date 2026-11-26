@@ -128,6 +128,21 @@ def _report_pending_install_failure(path, exc):
 
 def run():
     smoke = "--smoke-test" in sys.argv
+    # 打包自检：在构造主窗口 / 设置页之前，先在**干净进程**里试一次组件导入。
+    # torch 单进程只能初始化一次，主窗口若先失败过，后面的检查只会报
+    # "can only be initialized once per process"，反而看不到真正的原因。
+    early_ocr = None
+    if smoke:
+        try:
+            from ocr_recognizer import (check_engine_available,
+                                        engine_check_error,
+                                        engine_files_installed)
+            early_ocr = (engine_files_installed('easy'),
+                         check_engine_available('easy'),
+                         engine_check_error('easy')[:300])
+        except Exception as exc:
+            early_ocr = (False, False,
+                         f"{type(exc).__name__}: {exc}"[:300])
     from PySide6.QtWidgets import QApplication, QMessageBox
     from PySide6.QtGui import QIcon
 
@@ -205,12 +220,33 @@ def run():
                        "av", "ctranslate2", "sounddevice", "soundcard",
                        "winrt", "cv2", "PIL", "docx", "pptx", "fitz"]
             available = [m for m in modules if importlib.util.find_spec(m)]
+            # 组件「装进 user_libs 却在冻结版里导不进来」是安装版特有的坑：
+            # 发版自检必须同时记录文件是否落盘、本进程能否 import、真实异常。
+            try:
+                from ocr_recognizer import (check_engine_available,
+                                            engine_check_error,
+                                            engine_files_installed)
+                easy_files = engine_files_installed('easy')
+                easy_import = check_engine_available('easy')
+                easy_error = engine_check_error('easy')[:200]
+            except Exception as exc:
+                easy_files, easy_import = False, False
+                easy_error = f"{type(exc).__name__}: {exc}"[:200]
             Path(tempfile.gettempdir(), "TranslationTool-smoke.log").write_text(
                 "OK\n"
                 f"frozen={getattr(sys, 'frozen', False)}\n"
                 f"app_dir={resource_path('assets').parent}\n"
                 f"config={os.path.abspath(__import__('config').CONFIG_FILE)}\n"
-                f"modules={','.join(available)}\n",
+                f"modules={','.join(available)}\n"
+                "easyocr_first_files="
+                f"{early_ocr[0] if early_ocr else ''}\n"
+                "easyocr_first_import="
+                f"{early_ocr[1] if early_ocr else ''}\n"
+                "easyocr_first_error="
+                f"{early_ocr[2] if early_ocr else ''}\n"
+                f"easyocr_files={easy_files}\n"
+                f"easyocr_import={easy_import}\n"
+                f"easyocr_error={easy_error}\n",
                 encoding="utf-8")
         except Exception as exc:
             print(f"smoke log failed: {exc}", file=sys.stderr)

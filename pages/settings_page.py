@@ -1538,15 +1538,24 @@ class SettingsPage(QWidget):
         # 只要本地有一门语言齐备就算可用：缺的其它语言模型只是「可选增强」，
         # 不能再说「还缺 1 个文件」，否则用户会以为手动下的模型白下了。
         split_files = detect.get('split_files') or []
+        # 历史说明误导用户下成了 en_g2.pth 这类官方不认的名字：这些文件
+        # 不该再算「缺文件」让人重下，明确告诉用户导入时会自动改名。
+        misnamed = detect.get('misnamed_files') or []
+        fixable = {new for _old, new in misnamed}
         if detect['ready']:
             names = "、".join(ocr_models.language_label(lang)
                              for lang in detect['available_languages'])
             prefix = f"✅ 已可离线识别（{names}）· "
             color = ui_theme.COLOR_OK
             optional = [n for n in (detect.get('optional_missing') or [])
-                        if n not in split_files]
+                        if n not in split_files and n not in fixable]
             if optional:
                 prefix += f"可选再补 {len(optional)} 个文件支持其它语言 · "
+            if misnamed:
+                sample = misnamed[0]
+                prefix += (f"⚠ {len(misnamed)} 个文件名不对"
+                           f"（{sample[0]} → {sample[1]}），导入时自动改名 · ")
+                color = ui_theme.COLOR_WARN
             if split_files:
                 prefix += (f"⚠ 另一目录还有 {len(split_files)} 个模型未合并 · ")
                 color = ui_theme.COLOR_WARN
@@ -1564,6 +1573,15 @@ class SettingsPage(QWidget):
                 + "）：" + "、".join(split_files[:6])
                 + "\n识别器一次只能读一个目录，点「导入本地模型」把这些文件"
                   "放进统一目录后即可一并启用，不用重新下载\n")
+        misnamed_tip = ""
+        if misnamed:
+            misnamed_tip = (
+                "\n⚠ 以下模型文件名 EasyOCR 不认（历史说明误导），"
+                "文件本身可能没坏、只是名字不对：\n"
+                + "\n".join(f"  {old} → 应改名为 {new}"
+                            for old, new in misnamed[:8])
+                + "\n点「导入本地模型…」选中这个目录即可自动改名，"
+                  "不用重新下载；也可以自己手动重命名。\n")
         if detect.get('custom_dir'):
             custom_tip = ("当前使用你「直接指定」的模型目录；"
                           "点「导入本地模型… → 恢复默认模型目录」可改回。\n")
@@ -1582,6 +1600,7 @@ class SettingsPage(QWidget):
             "可选补充："
             + ("、".join(detect.get('optional_missing') or []) or "无") + "\n"
             + split_tip
+            + misnamed_tip
             + ocr_models.manual_download_hint())
         return detect
 
@@ -1606,10 +1625,13 @@ class SettingsPage(QWidget):
                           + " 未被读到，点「导入本地模型」合并后即可启用")
             engine = self._get_selected_engine_key()
             try:
-                from ocr_recognizer import check_engine_available
+                from ocr_recognizer import (check_engine_available,
+                                            engine_files_installed)
                 engine_ready = check_engine_available(engine)
+                files_ready = engine_files_installed(engine)
             except Exception:
                 engine_ready = False
+                files_ready = False
             if engine != 'easy':
                 # 当前用 Windows 自带 OCR 时这些 .pth 根本不会被读取：不能
                 # 说「可直接离线识别」，也别把用户支使去装用不到的引擎。
@@ -1625,6 +1647,16 @@ class SettingsPage(QWidget):
                                 f"可直接离线识别、不再联网下载；{extra}",
                                 duration=6000, position=InfoBarPosition.TOP,
                                 parent=self)
+            elif files_ready:
+                # 组件文件已装好、只是本进程还没加载进来：绝不能再说
+                # 「还差引擎」，否则用户会以为刚才那次安装白装了。
+                InfoBar.success(
+                    "模型与组件都已就位",
+                    f"本地已有{names}模型，EasyOCR 组件也已装好，"
+                    "不必重新下载；请以状态栏提示为准，"
+                    "急用可先切到「Windows 自带 OCR」。",
+                    duration=7000, position=InfoBarPosition.TOP,
+                    parent=self)
             else:
                 # 以前只查模型文件就宣称「将直接离线识别」，而引擎组件没装
                 # 时根本识别不了，和下面红字「未安装 EasyOCR」直接打架。
@@ -2005,6 +2037,16 @@ class SettingsPage(QWidget):
         self.ocr_use_windows_btn.clicked.connect(self._switch_to_windows_ocr)
         self.ocr_use_windows_btn.setVisible(False)
         install_layout.addWidget(self.ocr_use_windows_btn)
+        # 组件已装好、但本次进程还没加载进来时给一条明确的出路：重启即可，
+        # 不要让用户以为没装成功又去点一次「安装」。
+        self.ocr_restart_btn = QPushButton("重启程序", install_row)
+        self.ocr_restart_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.ocr_restart_btn.setToolTip(
+            "组件已装好，重启后在干净进程里加载即可离线识别；"
+            "不用重新安装、不会重新下载模型")
+        self.ocr_restart_btn.clicked.connect(self._restart_app)
+        self.ocr_restart_btn.setVisible(False)
+        install_layout.addWidget(self.ocr_restart_btn)
         self.ocr_progress = QProgressBar()
         self.ocr_progress.setVisible(False)
         self.ocr_progress.setTextVisible(True)
@@ -2931,22 +2973,42 @@ class SettingsPage(QWidget):
 
         以前这里只看 ``import easyocr``，而上面「检测本地模型」只看 .pth
         文件：模型齐了、组件没装好时会同时出现「模型已就绪、可直接离线识别」
-        和「未安装 EasyOCR」，用户完全不知道该信哪个。
+        和「未安装 EasyOCR」，用户完全不知道该信哪个。后来又发现另一种相反
+        的误导：pip 已经把组件装进 user_libs，本进程因 DLL 半加载暂时导不
+        进来，状态却退回「还差引擎」，用户以为没装成功而反复重装。这里把
+        「文件是否落盘」与「本进程能否 import」分开判定：装好了就报装好了，
+        只提示重启，绝不再说「还差引擎」。
         """
-        from ocr_recognizer import check_engine_available
+        from ocr_recognizer import (check_engine_available,
+                                    engine_check_error,
+                                    engine_files_installed)
         import ocr_models
         engine = self._get_selected_engine_key()
         try:
             available = check_engine_available(engine)
-        except Exception:
-            available = False
+            detail = engine_check_error(engine)
+        except Exception as exc:
+            available, detail = False, f"{type(exc).__name__}: {exc}"
         try:
             models_ready = bool(ocr_models.detect_local_models()['ready'])
         except Exception:
             models_ready = False
+        files_ready = engine_files_installed(engine)
+        need_restart = bool(files_ready and not available)
+        # 只有 torch「单进程只能初始化一次」这类错误重启才有用；缺模块 /
+        # 版本不兼容重启多少次都不会好，别再让用户白点。
+        restart_helps = need_restart and 'once per process' in detail
+        if hasattr(self, 'ocr_restart_btn'):
+            self.ocr_restart_btn.setVisible(restart_helps)
+        self.ocr_status_label.setToolTip(
+            ("组件已装好，重启后生效；本次自检信息：" + detail)
+            if restart_helps else
+            ("本次自检信息（重启不一定能解决）：" + detail if detail else ""))
         # 装不上时给一条退路，别让用户卡在反复重试里；但退路文案要按这台
         # 机器 winrt 是否真的可用，不能无条件说「零安装、开箱可用」。
-        fallback_ocr = engine == 'easy' and not available
+        # 真没装、或装了却加载失败，都要给「改用 Windows 自带 OCR」这条退路
+        fallback_ocr = engine == 'easy' and (
+            not (available or files_ready) or need_restart)
         self.ocr_use_windows_btn.setVisible(fallback_ocr)
         win_ready = False
         if fallback_ocr:
@@ -2969,6 +3031,20 @@ class SettingsPage(QWidget):
                 text = "✅ 已安装（Windows 系统自带 OCR，开箱可用、零下载）"
             color = "#4ade80"
             self.ocr_install_btn.setVisible(False)
+        elif need_restart:
+            # 「重启就能好」只在 torch 单进程初始化那一种情况下成立；其它
+            # 加载错误（缺模块 / 属性不兼容）重启也未必好，不能乱承诺。
+            if 'once per process' in detail:
+                text = ("✅ 组件已安装完成，点「重启程序」即可离线识别"
+                        "（本次运行还没加载进来，不用重装、不会重新下载模型）")
+                color = "#4ade80"
+            else:
+                text = ("⚠ 组件已装好，但本次加载失败（" + detail[:70]
+                        + "）。这通常是安装版缺依赖，重启不一定能解决；"
+                        "请更新到最新修复版，急用请点「改用 Windows 自带 OCR」，"
+                        "本地模型不会丢")
+                color = "#eab308"
+            self.ocr_install_btn.setVisible(False)
         elif engine == 'windows':
             text = "需要安装 winrt 包，或检查系统是否已安装对应语言包"
             color = "#eab308"
@@ -2989,6 +3065,40 @@ class SettingsPage(QWidget):
             self.ocr_install_btn.setText("安装")
         self.ocr_status_label.setText(text)
         self.ocr_status_label.setStyleSheet(f"color: {color};")
+        return need_restart
+
+    def _restart_app(self):
+        """组件装完后在干净进程里重新加载。
+
+        torch / scipy 这类带原生 DLL 的包，安装前那次失败的 import 可能已经
+        把 DLL 载入了一半；同一进程里再导一次不一定能恢复。重启最可靠。
+        先释放 QLockFile，否则 startDetached 拉起的新进程会被单实例检查拦下，
+        弹出「已经在运行中」。
+        """
+        import sys
+        from PySide6.QtCore import QProcess
+        from PySide6.QtWidgets import QApplication
+        try:
+            import app as _app_mod
+            lock = getattr(_app_mod, '_instance_lock', None)
+            if lock is not None:
+                try:
+                    lock.unlock()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        args = [a for a in sys.argv[1:]
+                if a not in ('--smoke-test', '--tt-pip-worker')]
+        if QProcess.startDetached(sys.executable, args):
+            inst = QApplication.instance()
+            if inst is not None:
+                inst.quit()
+        else:
+            ui_feedback.show_error_bar(
+                self, "无法自动重启",
+                "请从托盘图标退出程序后重新打开；组件已经装好，不必重装",
+                source="重启程序")
 
     def _switch_to_windows_ocr(self):
         """一键切到免模型下载的 Windows OCR，立即保存生效（不用再点保存设置）。"""
@@ -3040,6 +3150,8 @@ class SettingsPage(QWidget):
         # 安装中锁定引擎下拉：切换会刷新状态并把「取消安装」按钮覆盖掉
         self.ocr_engine_combo.setEnabled(False)
         self.ocr_use_windows_btn.setVisible(False)
+        if hasattr(self, 'ocr_restart_btn'):
+            self.ocr_restart_btn.setVisible(False)
         self.ocr_status_label.setText("正在安装，请稍候…（可点左侧按钮取消）")
         self.ocr_status_label.setToolTip("")
         self.ocr_status_label.setStyleSheet("color: #eab308;")
@@ -3077,11 +3189,12 @@ class SettingsPage(QWidget):
             self.ocr_progress.setRange(0, 0)
             self.ocr_status_label.setText(f"正在下载依赖: {line[:80]}")
         elif "Successfully" in line:
-            self.ocr_progress.setRange(0, 100)
-            self.ocr_progress.setValue(100)
-            self.ocr_progress.setFormat("安装完成")
-            self.ocr_status_label.setText("安装完成 ✓")
-            self.ocr_status_label.setStyleSheet("color: #4ade80;")
+            # pip 可能还要装剩余依赖 / 收尾，这里就报「安装完成」会与随后
+            # 的最终判定打架。真正的完成只在 _on_install_result(ok=True)
+            # 里显示，避免用户看到「安装完成」又变回「还差引擎」。
+            self.ocr_progress.setRange(0, 0)
+            self.ocr_progress.setFormat("正在收尾…")
+            self.ocr_status_label.setText("主要组件已装好，正在收尾…")
         elif "ERROR" in line or "Failed" in line:
             self.ocr_progress.setRange(0, 100)
             self.ocr_progress.setValue(0)
@@ -3099,6 +3212,8 @@ class SettingsPage(QWidget):
         self.ocr_progress.setVisible(False)
         from qfluentwidgets import InfoBar, InfoBarPosition
         if cancelled:
+            if hasattr(self, 'ocr_restart_btn'):
+                self.ocr_restart_btn.setVisible(False)
             self.ocr_install_btn.setText("重新安装")
             self.ocr_status_label.setText(
                 "已取消安装 · 可重新点按钮安装，已下载的文件会自动续传")
@@ -3111,11 +3226,25 @@ class SettingsPage(QWidget):
                          parent=self)
             return
         if ok:
-            self._refresh_ocr_status()
-            InfoBar.success("安装成功", "OCR 引擎已安装，可直接切换使用；升级后无需重装",
-                            duration=3000, position=InfoBarPosition.TOP,
-                            parent=self)
+            self.ocr_progress.setRange(0, 100)
+            self.ocr_progress.setValue(100)
+            self.ocr_progress.setFormat("安装完成")
+            need_restart = self._refresh_ocr_status()
+            if need_restart:
+                InfoBar.success(
+                    "组件已安装完成",
+                    "文件已就位，不用重新安装、不会重新下载模型；"
+                    "请以状态栏提示为准，急用可先切到「Windows 自带 OCR」",
+                    duration=6000, position=InfoBarPosition.TOP,
+                    parent=self)
+            else:
+                InfoBar.success(
+                    "安装成功", "OCR 引擎已安装，可直接切换使用；升级后无需重装",
+                    duration=3000, position=InfoBarPosition.TOP,
+                    parent=self)
         else:
+            if hasattr(self, 'ocr_restart_btn'):
+                self.ocr_restart_btn.setVisible(False)
             # pip 英文原始日志不要再直接抛给桌面用户：主界面只留一句
             # 中文可操作提示，原始日志放进 tooltip / 悬停可见。
             friendly = friendly_install_error(

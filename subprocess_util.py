@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -169,14 +170,25 @@ def pip_env():
     return env
 
 
+# pip 把 Python traceback 原样打到日志里，最后那行异常最具体，例如
+#   pip._vendor.distlib.DistlibException: Unable to locate finder for ...
+# 而 pip 自己的汇总行只是没信息量的 "ERROR: Exception:"。先挑异常行，
+# 否则「各源失败摘要」永远是同一句空话，用户和开发者都看不出真因。
+_TRACEBACK_EXC = re.compile(r"^[\w.]+(?:Error|Exception):\s+\S")
+
+
 def _failure_line(tail):
     """从 pip 尾部日志里挑最有信息的一行，别把进度条当失败原因。"""
-    for line in reversed(tail or []):
+    lines = [str(x).strip() for x in (tail or []) if str(x).strip()]
+    for line in reversed(lines):
+        if _TRACEBACK_EXC.match(line):
+            return line[:180]
+    for line in reversed(lines):
         low = line.lower()
         if ('error' in low or 'failed' in low or '403' in low
                 or 'timed out' in low or 'no matching' in low):
-            return line.strip()[:180]
-    return (tail[-1].strip()[:180] if tail else "无输出")
+            return line[:180]
+    return (lines[-1][:180] if lines else "无输出")
 
 
 def pip_install_with_mirrors(packages, on_progress=None, cancel=None,
@@ -245,11 +257,26 @@ def pip_install_with_mirrors(packages, on_progress=None, cancel=None,
             failures.append(f"  {name}：{last}")
     tried = " / ".join(name for name, _ in indexes)
     manual = " ".join(packages)
+    joined = "\n".join(failures).lower()
+    if "unable to locate finder" in joined or "distlibexception" in joined:
+        # 冻结版 pip 的 distlib 启动器异常：三个源会报完全相同的内部错误，
+        # 旧文案让用户一直「检查网络 / 重试安装」，永远好不了。
+        diagnosis = (
+            "⚠ 各源报的是同一个安装程序内部错误（pip 生成命令行启动器失败），"
+            "与网络、镜像、pip.ini 都无关，反复「重试安装」不会变好。"
+            "请更新到修复版安装包；当前可先用「Windows 系统自带」OCR。\n")
+    elif (total > 1 and
+          len({f.split("：", 1)[-1].strip() for f in failures}) == 1):
+        diagnosis = (
+            "⚠ 各源报错完全相同，通常不是镜像或网络问题，"
+            "请把下面的错误输出反馈给开发者。\n")
+    else:
+        diagnosis = ("本机 pip 全局配置已自动忽略，不需要手动改 pip.ini；"
+                     "请点「重试安装」再试一次。\n")
     return False, (
         f"安装失败（已依次尝试：{tried}，共 {total} 个源均失败）。\n"
-        "本机 pip 全局配置已自动忽略，不需要手动改 pip.ini；"
-        "请点「重试安装」再试一次。\n"
-        "安装版请勿用系统 Python 的 pip 手动安装：组件会装到别处，程序读不到。\n"
+        + diagnosis
+        + "安装版请勿用系统 Python 的 pip 手动安装：组件会装到别处，程序读不到。\n"
         "源码版可在命令行手动执行：\n"
         f"  pip install {manual} "
         "-i https://mirrors.cloud.tencent.com/pypi/simple/\n"

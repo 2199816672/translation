@@ -39,6 +39,41 @@ class TranslationError(Exception):
         self.reason = reason
 
 
+# 密钥只能发给对应服务，绝不能随异常文本进日志 / 状态栏 / 诊断报告。
+# HTTPError 的字符串会带完整 URL（Google Cloud / MyMemory 把 key 放在
+# query 里），raise_for_status 抛出的异常被拼进消息就会泄露明文密钥。
+_SECRET_QUERY_KEYS = (
+    'key', 'api_key', 'q', 'token', 'secret', 'password', 'access_token'
+)
+
+
+def _safe_error_text(exc):
+    """把异常文本里 URL query 的密钥参数打码，其余原样保留。"""
+    text = str(exc)
+    try:
+        from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
+        def _scrub(url):
+            parts = urlsplit(url)
+            if not parts.query:
+                return url
+            pairs = []
+            for k, v in parse_qsl(parts.query, keep_blank_values=True):
+                if k.lower() in _SECRET_QUERY_KEYS and v:
+                    pairs.append((k, '***'))
+                else:
+                    pairs.append((k, v))
+            return urlunsplit((parts.scheme, parts.netloc, parts.path,
+                               urlencode(pairs, safe='*'), parts.fragment))
+
+        # 逐个替换文本中出现的 http(s) URL，避免误伤普通中文报错
+        import re as _re
+        text = _re.sub(r'https?://[^\s\'"<>]+', lambda m: _scrub(m.group(0)), text)
+    except Exception:
+        pass
+    return text
+
+
 def _diagnose_network_error(e):
     """诊断网络错误，返回用户友好的提示"""
     if isinstance(e, requests.exceptions.ConnectionError):
@@ -373,31 +408,40 @@ class Translator:
                 raise
             except Exception as e:
                 hint = _diagnose_network_error(e)
-                msg = f"翻译失败: {e}"
+                msg = f"翻译失败: {_safe_error_text(e)}"
                 if hint:
                     msg += f"\n原因: {hint}"
-                raise TranslationError(msg, reason=hint or str(e))
+                raise TranslationError(msg, reason=hint or _safe_error_text(e))
         return '\n'.join(results)
 
     def _translate_paid(self, text):
+        # 付费引擎同样会因密钥失效 / 降级 / 源=目标语言而原样回显。
+        # 免费链路已用 _echoed_source 拦截，这里必须对齐，否则
+        # 「只导出译文」会把原文冒充译文写进字幕（核心契约红线）。
+        from free_translator import _echoed_source
         paragraphs = text.split('\n')
         results = []
         for paragraph in paragraphs:
             if paragraph.strip():
                 try:
-                    results.append(self.translator.translate(paragraph))
+                    translated = self.translator.translate(paragraph)
                 except RequestError as e:
                     hint = _diagnose_network_error(e)
-                    msg = f"翻译请求失败: {e}"
+                    msg = f"翻译请求失败: {_safe_error_text(e)}"
                     if hint:
                         msg += f"\n原因: {hint}"
-                    raise TranslationError(msg, reason=hint or str(e))
+                    raise TranslationError(msg, reason=hint or _safe_error_text(e))
                 except Exception as e:
                     hint = _diagnose_network_error(e)
-                    msg = f"翻译错误: {e}"
+                    msg = f"翻译错误: {_safe_error_text(e)}"
                     if hint:
                         msg += f"\n原因: {hint}"
-                    raise TranslationError(msg, reason=hint or str(e))
+                    raise TranslationError(msg, reason=hint or _safe_error_text(e))
+                if not isinstance(translated, str) or not translated.strip():
+                    raise TranslationError("翻译服务返回空结果")
+                if _echoed_source(paragraph, translated):
+                    raise TranslationError("翻译服务原样返回原文，疑似未翻译")
+                results.append(translated)
             else:
                 results.append("")
         return '\n'.join(results)
